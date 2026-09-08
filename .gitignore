@@ -1,0 +1,21 @@
+node_modules/
+.wrangler/
+.build/
+.dev.vars
+.env
+*.log
+
+# Local Cloudflare resource ids and the single allowed account live here.
+wrangler.jsonc
+
+# Screenshots and sample documents produced by the test suites.
+tests/*.png
+tests/*.pptx
+tests/*.docx
+tests/*.xlsx
+
+# Local secrets: MASTER_KEY, PW_PEPPER and friends never leave this machine.
+.secrets*.json
+*.secrets.json
+secrets.json
+.dev.vars*

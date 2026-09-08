@@ -1,0 +1,86 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "hyperai-chat",
+  "main": "src/index.js",
+  "compatibility_date": "2025-09-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": {
+    "enabled": true
+  },
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*"]
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "<your-d1-database-name>",
+      "database_id": "<your-d1-database-id>"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "BACKUP_BUCKET",
+      "bucket_name": "<your-r2-bucket>"
+    }
+  ],
+  "kv_namespaces": [
+    {
+      "binding": "KV",
+      "id": "<your-kv-namespace-id>"
+    }
+  ],
+  "routes": [
+    {
+      "pattern": "chat.example.com",
+      "custom_domain": true
+    }
+  ],
+  "dev": {
+    "enable_containers": false
+  },
+  "containers": [
+    {
+      "class_name": "Sandbox",
+      "image": "docker.io/cloudflare/sandbox:0.12.9",
+      "instance_type": "standard-1",
+      "max_instances": 8
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "class_name": "Sandbox",
+        "name": "Sandbox"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["Sandbox"]
+    }
+  ],
+  "triggers": {
+    "crons": ["0 * * * *"]
+  },
+  "workflows": [
+    {
+      "name": "hyperai-chat-agent",
+      "binding": "AGENT",
+      "class_name": "AgentWorkflow"
+    }
+  ],
+  "limits": {
+    "cpu_ms": 300000
+  },
+  "browser": {
+    "binding": "BROWSER"
+  },
+  "vars": {
+    "APP_NAME": "chat.example.com",
+    "ALLOWED_EMAIL": "owner@example.com"
+  }
+}

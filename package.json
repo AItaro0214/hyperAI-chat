@@ -1,0 +1,47 @@
+{
+  "name": "hyperai-chat",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "db:init": "wrangler d1 execute DB --remote --file=./migrations/0001_init.sql",
+    "db:init:local": "wrangler d1 execute DB --local --file=./migrations/0001_init.sql",
+    "seed": "node scripts/bootstrap.mjs",
+    "unlock": "wrangler d1 execute DB --remote --command \"UPDATE users SET failed_attempts=0, locked_at=NULL\"",
+    "tail": "wrangler tail",
+    "test:api": "node tests/api.mjs",
+    "test:flows": "node tests/flows.mjs",
+    "test:ui": "node tests/ui.mjs",
+    "test:prod": "node tests/prod.mjs",
+    "test:unit": "node tests/unit.mjs",
+    "test:discount": "node tests/discount.mjs",
+    "test:media": "node tests/media.mjs",
+    "test:docs": "node tests/docs.mjs",
+    "test:office": "node tests/office-unit.mjs",
+    "test:visual": "node tests/visual-unit.mjs",
+    "test:agent": "node tests/agent-unit.mjs",
+    "test:deck": "node tests/deck-probe.mjs",
+    "test:docsunit": "node tests/docs-unit.mjs",
+    "test:tts": "node tests/tts-unit.mjs",
+    "test:msg": "node tests/msg-unit.mjs",
+    "test:video": "node tests/video-unit.mjs",
+    "test:effort": "node tests/effort-unit.mjs",
+    "test:tools": "node tests/servertools-unit.mjs",
+    "test:images": "node tests/images-unit.mjs"
+  },
+  "dependencies": {
+    "@cloudflare/puppeteer": "^1.4.0",
+    "@cloudflare/sandbox": "^0.12.9",
+    "hono": "^4.6.0"
+  },
+  "devDependencies": {
+    "dompurify": "^3.4.14",
+    "marked": "^18.0.11",
+    "puppeteer-core": "^25.10.0",
+    "qrcode": "^1.5.4",
+    "qrcode-generator": "^2.0.4",
+    "wrangler": "^4.129.0"
+  }
+}

@@ -1,0 +1,625 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="color-scheme" content="light" />
+    <meta name="robots" content="noindex, nofollow" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <title>hyperAI-chat</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='13' fill='none' stroke='%23888' stroke-width='2'/%3E%3C/svg%3E" />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="ambient" aria-hidden="true"><span></span><span></span><span></span><span></span></div>
+    <div id="progress" class="progress" hidden><i></i></div>
+
+    <!-- ============================ LOGIN ============================ -->
+    <div id="login-view" class="login" hidden>
+      <div class="login-card glass">
+        <div class="brand">
+          <span class="brand-mark"></span>
+          <div>
+            <h1>hyperAI-chat</h1>
+            <p class="muted xs">OpenRouter / Groq</p>
+          </div>
+        </div>
+
+        <form id="login-form" class="stack">
+          <label class="field">
+            <span>メールアドレス</span>
+            <input id="login-email" type="email" autocomplete="username" inputmode="email" required />
+          </label>
+          <label class="field">
+            <span>パスワード</span>
+            <input id="login-password" type="password" autocomplete="current-password" required />
+          </label>
+          <button class="btn primary lg block" type="submit">ログイン</button>
+          <p class="muted xs">パスワードは端末側で PBKDF2 60万回のハッシュ化を行ってから送信されます。</p>
+        </form>
+
+        <form id="mfa-form" class="stack" hidden>
+          <p class="sm">認証アプリの 6 桁コードを入力してください。</p>
+          <input id="mfa-code" class="code-input" inputmode="numeric" autocomplete="one-time-code" maxlength="6" placeholder="000000" />
+          <button class="btn primary lg block" type="submit">確認</button>
+          <button class="btn quiet block" type="button" id="use-recovery">リカバリコードを使う</button>
+        </form>
+
+        <form id="recovery-form" class="stack" hidden>
+          <p class="sm">リカバリコード（XXXXX-XXXXX）を入力してください。1 回だけ使えます。</p>
+          <input id="recovery-code" class="code-input wide" autocomplete="off" placeholder="ABCDE-12345" />
+          <button class="btn primary lg block" type="submit">確認</button>
+          <button class="btn quiet block" type="button" id="back-to-mfa">認証コード入力に戻る</button>
+        </form>
+
+        <form id="enroll-form" class="stack" hidden>
+          <p class="sm">二要素認証を登録します。認証アプリで QR を読み取り、表示された 6 桁コードを入力してください。</p>
+          <div id="qr-box" class="qr"></div>
+          <details>
+            <summary class="sm muted">QR を読めない場合</summary>
+            <code id="totp-secret" class="secret"></code>
+          </details>
+          <input id="enroll-code" class="code-input" inputmode="numeric" autocomplete="one-time-code" maxlength="6" placeholder="000000" />
+          <button class="btn primary lg block" type="submit">登録して続行</button>
+        </form>
+
+        <div id="recovery-codes-box" class="stack" hidden>
+          <h2 class="sm strong">リカバリコード</h2>
+          <p class="xs warn">認証アプリを失った時の唯一の復旧手段です。この画面でしか表示されません。</p>
+          <pre id="recovery-codes" class="codes"></pre>
+          <div class="row">
+            <button class="btn quiet" type="button" id="copy-recovery">コピー</button>
+            <button class="btn primary" type="button" id="recovery-done">保存したので続行</button>
+          </div>
+        </div>
+
+        <p id="login-error" class="error" hidden></p>
+      </div>
+    </div>
+
+    <!-- ============================= APP ============================= -->
+    <div id="app-view" class="app" hidden>
+      <div class="scrim" id="scrim" hidden></div>
+
+      <aside class="sidebar glass" id="sidebar">
+        <div class="side-top">
+          <button class="btn primary block" id="new-room"><i data-icon="plus" data-size="17"></i>新しいトーク</button>
+          <div class="search-wrap">
+            <i data-icon="search" data-size="16"></i>
+            <input id="room-search" class="input sm" type="search" placeholder="検索" />
+          </div>
+        </div>
+        <div class="rooms" id="room-list"></div>
+        <div class="side-bottom">
+          <button class="link-btn" id="open-pricing">料金一覧</button>
+          <button class="link-btn" id="open-admin">管理コンソール</button>
+          <button class="link-btn" id="logout">ログアウト</button>
+          <p class="xs muted" id="whoami"></p>
+        </div>
+      </aside>
+
+      <main class="main">
+        <header class="topbar glass-bar">
+          <button class="icon-btn menu" id="toggle-sidebar" aria-label="ルーム一覧"><i data-icon="menu"></i></button>
+          <input id="room-title" class="room-title" placeholder="トークルーム" />
+          <button class="chip model" id="model-btn"><span id="model-label">モデル</span><i data-icon="chevron" data-size="15"></i></button>
+          <button class="icon-btn" id="room-settings-btn" aria-label="ルーム設定"><i data-icon="sliders"></i></button>
+        </header>
+
+        <div class="thread" id="messages"></div>
+
+        <div class="composer-wrap">
+          <div id="attachments" class="attachments"></div>
+          <div class="toolbar" id="toolbar">
+            <button class="chip toggle" id="web-search" data-on="false"><i data-icon="globe" data-size="16"></i><span id="web-search-label">Web検索</span></button>
+            <button class="chip toggle" id="image-output" data-on="false"><i data-icon="image" data-size="16"></i><span id="image-output-label">画像生成</span></button>
+            <button class="chip toggle" id="effort-btn" data-on="false" title="推論の深さ">
+              <i data-icon="spark" data-size="16"></i><span id="effort-label">思考 自動</span>
+            </button>
+            <button class="chip" id="record-btn" title="システム音声とマイクを録音"><i data-icon="mic" data-size="16"></i>録音</button>
+            <button class="chip" id="agent-btn" title="サンドボックスで開発"><i data-icon="code" data-size="16"></i>開発</button>
+            <button class="chip" id="imagegen-btn" title="画像をまとめて生成"><i data-icon="image" data-size="16"></i>画像</button>
+            <button class="chip" id="video-btn" title="動画を生成"><i data-icon="video" data-size="16"></i>動画</button>
+          </div>
+          <form class="composer glass" id="composer">
+            <button class="icon-btn flat" type="button" id="attach-btn" aria-label="添付">
+              <i data-icon="clip" data-size="19"></i>
+              <input type="file" id="file-input" multiple accept="image/*,audio/*,.pdf,.xlsx,.xlsm,.docx,.pptx,.csv,.tsv,.txt,.md,.json,.xml,.yaml,.yml,.html,.log,.js,.ts,.py,.rb,.go,.rs,.java,.c,.cpp,.cs,.php,.sh,.sql" hidden />
+            </button>
+            <button class="icon-btn flat" type="button" id="voice-btn" aria-label="音声入力"><i data-icon="mic" data-size="19"></i></button>
+            <textarea id="input" rows="1" placeholder="メッセージを入力"></textarea>
+            <button class="send" type="submit" id="send-btn" aria-label="送信"><i data-icon="send" data-size="19"></i></button>
+            <button class="send stop" type="button" id="stop-btn" hidden aria-label="停止"><i data-icon="stop" data-size="18"></i></button>
+          </form>
+          <p class="xs muted center" id="composer-hint"></p>
+        </div>
+      </main>
+    </div>
+
+    <!-- ========================== MODEL PICKER ======================== -->
+    <div class="sheet" id="model-modal" hidden>
+      <div class="sheet-card lg glass">
+        <header class="sheet-head">
+          <h2>モデル</h2>
+          <div class="row">
+            <button class="link-btn" id="refresh-models">再取得</button>
+            <button class="icon-btn" data-close aria-label="閉じる"><i data-icon="close" data-size="18"></i></button>
+          </div>
+        </header>
+        <div class="filters">
+          <div class="search-wrap">
+            <i data-icon="search" data-size="16"></i>
+            <input id="model-search" class="input sm" type="search" placeholder="モデルを検索" />
+          </div>
+          <div class="filter-row">
+            <select id="model-provider" class="input sm">
+              <option value="">全提供元</option>
+              <option value="openrouter">OpenRouter</option>
+              <option value="groq">Groq</option>
+            </select>
+            <select id="model-family" class="input sm"><option value="">全ファミリー</option></select>
+            <button class="chip toggle sm" id="filter-free" data-on="false">無料</button>
+            <button class="chip toggle sm" id="filter-vision" data-on="false">画像入力</button>
+            <button class="chip toggle sm" id="filter-audio" data-on="false">音声入力</button>
+            <button class="chip toggle sm" id="filter-imageout" data-on="false">画像出力</button>
+            <button class="chip toggle sm" id="filter-tools" data-on="false">ツール</button>
+          </div>
+        </div>
+        <div class="model-list" id="model-list"></div>
+        <footer class="sheet-foot xs muted" id="model-foot"></footer>
+      </div>
+    </div>
+
+    <!-- ============================ PRICING =========================== -->
+    <div class="sheet" id="pricing-modal" hidden>
+      <div class="sheet-card lg glass">
+        <header class="sheet-head">
+          <h2>料金一覧</h2>
+          <button class="icon-btn" data-close aria-label="閉じる"><i data-icon="close" data-size="18"></i></button>
+        </header>
+        <div class="sheet-body" id="pricing-body"></div>
+      </div>
+    </div>
+
+    <!-- ============================= ADMIN ============================ -->
+    <div class="sheet" id="admin-modal" hidden>
+      <div class="sheet-card lg glass">
+        <header class="sheet-head">
+          <h2>管理コンソール</h2>
+          <button class="icon-btn" data-close aria-label="閉じる"><i data-icon="close" data-size="18"></i></button>
+        </header>
+        <nav class="tabs" id="admin-tabs">
+          <button class="tab active" data-tab="keys">API キー</button>
+          <button class="tab" data-tab="defaults">既定設定</button>
+          <button class="tab" data-tab="security">セキュリティ</button>
+          <button class="tab" data-tab="usage">使用状況</button>
+          <button class="tab" data-tab="events">監査ログ</button>
+          <button class="tab" data-tab="groq">Groq 料金表</button>
+        </nav>
+        <div class="sheet-body" id="admin-body"></div>
+      </div>
+    </div>
+
+    <!-- ========================= ROOM SETTINGS ======================== -->
+    <div class="sheet" id="room-modal" hidden>
+      <div class="sheet-card glass">
+        <header class="sheet-head">
+          <h2>ルーム設定</h2>
+          <button class="icon-btn" data-close aria-label="閉じる"><i data-icon="close" data-size="18"></i></button>
+        </header>
+        <div class="sheet-body" id="room-modal-body"></div>
+      </div>
+    </div>
+
+    <!-- ============================== ASR ============================= -->
+    <div class="sheet" id="voice-modal" hidden>
+      <div class="sheet-card glass">
+        <header class="sheet-head">
+          <h2>音声</h2>
+          <button class="icon-btn" data-close aria-label="閉じる"><i data-icon="close" data-size="18"></i></button>
+        </header>
+        <div class="sheet-body stack">
+          <div class="seg" id="voice-mode">
+            <button class="seg-btn active" data-mode="asr">文字起こし</button>
+            <button class="seg-btn" data-mode="tts">読み上げ</button>
+          </div>
+
+          <div id="asr-panel" class="stack">
+          <div class="seg" id="asr-source">
+            <button class="seg-btn active" data-src="mic">マイクで録音</button>
+            <button class="seg-btn" data-src="file">ファイルを選ぶ</button>
+          </div>
+
+          <div id="asr-mic">
+            <button class="btn block lg" id="asr-record"><i data-icon="mic" data-size="18"></i>録音を開始</button>
+            <p class="xs muted center" id="asr-timer"></p>
+          </div>
+
+          <div id="asr-file" hidden>
+            <label class="drop" id="asr-drop">
+              <input type="file" id="asr-file-input" accept="audio/*,video/mp4,.m4a,.mp3,.wav,.webm,.ogg,.flac" hidden />
+              <i data-icon="file" data-size="22"></i>
+              <span id="asr-file-label">音声ファイルを選択（最大 20MB）</span>
+            </label>
+          </div>
+
+          <label class="field">
+            <span>文字起こしモデル</span>
+            <select id="asr-model" class="input sm"></select>
+          </label>
+          <label class="field">
+            <span>言語（空欄で自動判定）</span>
+            <input id="asr-language" class="input sm" placeholder="ja / en / …" />
+          </label>
+          <label class="toggle-row">
+            <input type="checkbox" id="asr-attach" />
+            <span class="sm">音声もメッセージに添付する</span>
+          </label>
+          <button class="btn primary lg block" id="asr-run" disabled>文字起こしを実行</button>
+          <p class="xs muted" id="asr-status"></p>
+          <textarea id="asr-result" rows="4" class="input sm" placeholder="結果がここに表示されます" hidden></textarea>
+          <button class="btn block" id="asr-insert" hidden>入力欄に挿入</button>
+          </div>
+
+          <div id="tts-panel" class="stack" hidden>
+            <label class="field">
+              <span>読み上げモデル</span>
+              <select id="tts-model" class="input sm"></select>
+            </label>
+            <div class="field">
+              <span>ボイス</span>
+              <div class="voice-grid" id="tts-voices"></div>
+            </div>
+            <label class="field">
+              <span>試し読みのテキスト</span>
+              <input id="tts-sample" class="input sm" value="こんにちは。これはテスト音声です。" />
+            </label>
+            <button class="btn block" id="tts-test">この声で試す</button>
+            <p class="xs muted" id="tts-status"></p>
+            <audio id="tts-preview" controls hidden style="width:100%"></audio>
+            <p class="xs muted">ここで選んだ声が、AI の発言の 🔊 ボタンに使われます。1 リクエスト 200 文字が上限のため、長文は自動で分割して合成します。</p>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ============================ VIDEO ============================ -->
+    <div class="sheet" id="video-modal" hidden>
+      <div class="sheet-card glass">
+        <header class="sheet-head">
+          <h2>動画を生成</h2>
+          <button class="icon-btn" data-close aria-label="閉じる"><i data-icon="close" data-size="18"></i></button>
+        </header>
+        <div class="sheet-body stack">
+          <label class="field">
+            <span>モデル</span>
+            <select id="vid-model" class="input sm"></select>
+          </label>
+          <p class="xs muted" id="vid-desc"></p>
+          <label class="field">
+            <span>プロンプト</span>
+            <textarea id="vid-prompt" rows="3" class="input sm" placeholder="生成したい映像を説明してください"></textarea>
+          </label>
+          <div class="grid2">
+            <label class="field"><span>長さ（秒）</span><select id="vid-duration" class="input sm"></select></label>
+            <label class="field"><span>解像度</span><select id="vid-resolution" class="input sm"></select></label>
+            <label class="field"><span>アスペクト比</span><select id="vid-aspect" class="input sm"></select></label>
+            <label class="field"><span>サイズ</span><select id="vid-size" class="input sm"></select></label>
+          </div>
+          <div class="grid2">
+            <label class="toggle-row"><input type="checkbox" id="vid-audio" /><span class="sm">音声も生成</span></label>
+            <label class="field"><span>シード（任意）</span><input id="vid-seed" type="number" class="input sm" placeholder="ランダム" /></label>
+          </div>
+          <label class="field" id="vid-frame-wrap" hidden>
+            <span>開始フレーム画像（添付から選択）</span>
+            <select id="vid-frame" class="input sm"></select>
+          </label>
+          <p class="xs muted" id="vid-cost"></p>
+          <button class="btn primary lg block" id="vid-run">生成する</button>
+          <p class="xs muted" id="vid-status"></p>
+          <video id="vid-result" controls playsinline hidden style="width:100%;border-radius:16px"></video>
+        </div>
+      </div>
+    </div>
+
+    <!-- ========================== ARTIFACT ============================ -->
+    <div class="sheet" id="rec-modal" hidden>
+      <div class="sheet-card glass">
+        <header class="sheet-head">
+          <h2>録音</h2>
+          <button class="icon-btn" data-close aria-label="閉じる"><i data-icon="close" data-size="18"></i></button>
+        </header>
+        <div class="sheet-body stack">
+          <div class="rec-sources">
+            <label class="row switch-row">
+              <input type="checkbox" id="rec-system" checked />
+              <span>システム音声<em class="xs muted">タブや画面の音を取り込みます</em></span>
+            </label>
+            <label class="row switch-row">
+              <input type="checkbox" id="rec-mic" checked />
+              <span>マイク<em class="xs muted">自分の声も一緒に録ります</em></span>
+            </label>
+          </div>
+
+          <div class="rec-meter"><i id="rec-level"></i></div>
+
+          <div class="row space rec-readout">
+            <button class="chip toggle" id="rec-mic-on" data-on="true" type="button">
+              <i data-icon="mic" data-size="16"></i><span>マイク ON</span>
+            </button>
+            <span class="rec-nums"><b id="rec-time">00:00</b><span class="xs muted" id="rec-size">0 KB</span></span>
+          </div>
+
+          <label class="field">
+            <span>音質（低いほど軽い）</span>
+            <select id="rec-bitrate" class="input sm">
+              <option value="48">48 kbps・最軽量</option>
+              <option value="64" selected>64 kbps・標準（1分 ≒ 0.5MB）</option>
+              <option value="96">96 kbps・きれい</option>
+              <option value="128">128 kbps・高音質</option>
+            </select>
+          </label>
+
+          <div class="row space">
+            <span class="xs muted" id="rec-status"></span>
+            <div class="row">
+              <button class="btn primary" id="rec-start" type="button">録音開始</button>
+              <button class="btn danger" id="rec-stop" type="button" hidden>停止</button>
+            </div>
+          </div>
+
+          <div class="stack" id="rec-result" hidden>
+            <audio id="rec-preview" controls preload="metadata"></audio>
+            <div class="row">
+              <button class="btn primary" id="rec-attach" type="button">チャットに添付</button>
+              <button class="btn quiet" id="rec-download" type="button">ダウンロード</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="sheet" id="agent-modal" hidden>
+      <div class="sheet-card xl glass">
+        <header class="sheet-head">
+          <h2>開発サンドボックス</h2>
+          <div class="row">
+            <button class="link-btn" id="agent-skills">スキル</button>
+            <button class="link-btn" id="agent-rules">ルール</button>
+            <button class="link-btn" id="agent-save">保存</button>
+            <button class="link-btn" id="agent-zip">ZIPで保存</button>
+            <button class="link-btn" id="agent-reset">作業を消す</button>
+            <button class="icon-btn" data-close aria-label="閉じる"><i data-icon="close" data-size="18"></i></button>
+          </div>
+        </header>
+
+        <div class="agent-body">
+          <div class="agent-side">
+            <div class="agent-side-head">
+              <span class="xs muted">ファイル</span>
+              <button class="link-btn xs" id="agent-refresh">更新</button>
+            </div>
+            <div class="agent-files" id="agent-files"></div>
+            <div class="agent-side-head">
+              <span class="xs muted">プレビュー</span>
+            </div>
+            <div class="agent-previews" id="agent-previews"></div>
+          </div>
+
+          <div class="agent-main">
+            <div class="agent-log" id="agent-log"></div>
+            <div class="agent-compose">
+              <div class="row gap wrap">
+                <select id="agent-model" class="input sm grow" title="ツール呼び出しに対応したモデルのみ"></select>
+                <select id="agent-imgmodel" class="input sm grow" title="素材の画像生成に使うモデル"></select>
+                <button class="chip" id="agent-opencode" type="button" title="OpenCode をこのワークスペースで起動">OpenCode</button>
+              </div>
+              <textarea id="agent-task" rows="2" placeholder="作ってほしいものを書いてください（例: Vite + React でTodoアプリを作って、テストを通して、画面を確認して）"></textarea>
+              <div class="row space">
+                <span class="xs muted" id="agent-status"></span>
+                <div class="row">
+                  <button class="btn quiet" id="agent-stop" type="button" hidden>停止</button>
+                  <button class="btn primary" id="agent-run" type="button">実行</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="sheet" id="agent-skills-modal" hidden>
+      <div class="sheet-card lg glass">
+        <header class="sheet-head">
+          <h2>スキル</h2>
+          <div class="row">
+            <button class="link-btn" id="agent-skill-reset">既定に戻す</button>
+            <button class="link-btn" id="agent-skill-save">保存</button>
+            <button class="icon-btn" data-close aria-label="閉じる"><i data-icon="close" data-size="18"></i></button>
+          </div>
+        </header>
+        <div class="sheet-body stack">
+          <p class="xs muted">エージェントは <code>AGENTS.md</code> を見て、必要なときだけスキルを読み込みます。モデル一覧は読み込み時に自動で最新のものが付きます。</p>
+          <div class="skill-tabs" id="agent-skill-tabs"></div>
+          <p class="xs muted" id="agent-skill-when"></p>
+          <textarea id="agent-skill-text" class="input rules-editor" rows="16" spellcheck="false"></textarea>
+          <details>
+            <summary class="xs muted">実際に渡される内容を見る</summary>
+            <pre class="agent-file-body" id="agent-skill-preview"></pre>
+          </details>
+        </div>
+      </div>
+    </div>
+
+    <div class="sheet" id="agent-rules-modal" hidden>
+      <div class="sheet-card lg glass">
+        <header class="sheet-head">
+          <h2>プロジェクトのルール（<span id="agent-rules-name">AGENTS.md</span>）</h2>
+          <div class="row">
+            <button class="link-btn" id="agent-rules-template">ひな形</button>
+            <button class="link-btn" id="agent-rules-save">保存</button>
+            <button class="icon-btn" data-close aria-label="閉じる"><i data-icon="close" data-size="18"></i></button>
+          </div>
+        </header>
+        <div class="sheet-body stack">
+          <p class="xs muted">ワークスペース直下のこのファイルは、エージェントが毎回読み込みます。OpenCode など他のツールも同じ規約です。</p>
+          <textarea id="agent-rules-text" class="input rules-editor" rows="18" spellcheck="false"></textarea>
+        </div>
+      </div>
+    </div>
+
+    <div class="sheet" id="agent-file-modal" hidden>
+      <div class="sheet-card lg glass">
+        <header class="sheet-head">
+          <h2 id="agent-file-name">ファイル</h2>
+          <div class="row">
+            <button class="link-btn" id="agent-file-dl">ダウンロード</button>
+            <button class="icon-btn" data-close aria-label="閉じる"><i data-icon="close" data-size="18"></i></button>
+          </div>
+        </header>
+        <pre class="agent-file-body" id="agent-file-body"></pre>
+      </div>
+    </div>
+
+    <div class="sheet" id="export-modal" hidden>
+      <div class="sheet-card glass">
+        <header class="sheet-head">
+          <h2>ファイルに書き出す</h2>
+          <button class="icon-btn" data-close aria-label="閉じる"><i data-icon="close" data-size="18"></i></button>
+        </header>
+        <div class="sheet-body stack">
+          <label class="field">
+            <span>ファイル名</span>
+            <input id="export-title" class="input sm" type="text" maxlength="80" placeholder="無題" />
+          </label>
+          <div class="export-grid" id="export-formats"></div>
+
+          <details class="export-opts" id="export-design">
+            <summary>デザイン（Word / PowerPoint）</summary>
+            <div class="stack">
+              <div class="field">
+                <span>配色</span>
+                <div class="swatches" id="export-themes"></div>
+              </div>
+              <div class="field">
+                <span>フォント</span>
+                <select id="export-font" class="input sm"></select>
+              </div>
+              <div class="row switch-row">
+                <input type="checkbox" id="export-genimg" />
+                <label for="export-genimg">画像を自動生成する<em class="xs muted">本文の <code>![説明](gen)</code> を実際の画像にします</em></label>
+              </div>
+              <div class="field" id="export-imgmodel-field" hidden>
+                <span>画像モデル</span>
+                <select id="export-imgmodel" class="input sm"></select>
+              </div>
+            </div>
+          </details>
+
+          <p class="xs muted" id="export-hint"></p>
+        </div>
+      </div>
+    </div>
+
+    <div class="sheet" id="imagegen-modal" hidden>
+      <div class="sheet-card lg glass">
+        <header class="sheet-head">
+          <h2>画像をまとめて生成</h2>
+          <button class="icon-btn" data-close aria-label="閉じる"><i data-icon="close" data-size="18"></i></button>
+        </header>
+        <div class="sheet-body stack">
+          <label class="field">
+            <span>プロンプト</span>
+            <textarea id="img-prompt" class="input" rows="3" placeholder="生成したい画像の説明"></textarea>
+          </label>
+          <label class="field">
+            <span>モデル</span>
+            <select id="img-model" class="input sm"></select>
+          </label>
+          <p class="xs muted" id="img-desc"></p>
+          <div class="field">
+            <span class="row space">
+              <span>枚数</span>
+              <b id="img-count-label" class="xs">1 枚</b>
+            </span>
+            <input type="range" id="img-count" class="slider" min="1" max="10" step="1" value="1" />
+            <p class="xs muted" id="img-count-note"></p>
+          </div>
+          <div class="row wrap gap">
+            <label class="field grow">
+              <span>アスペクト比</span>
+              <select id="img-aspect" class="input sm"></select>
+            </label>
+            <label class="field grow">
+              <span>品質</span>
+              <select id="img-quality" class="input sm"></select>
+            </label>
+            <label class="field grow">
+              <span>解像度</span>
+              <select id="img-resolution" class="input sm"></select>
+            </label>
+          </div>
+          <label class="field" id="img-ref-wrap" hidden>
+            <span>参照画像（添付から）</span>
+            <select id="img-ref" class="input sm" multiple size="3"></select>
+          </label>
+          <div class="row space">
+            <span class="xs muted" id="img-status"></span>
+            <button class="btn primary" id="img-run" type="button">生成する</button>
+          </div>
+          <div class="img-results" id="img-results" hidden></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="sheet" id="artifact-modal" hidden>
+      <div class="sheet-card lg glass">
+        <header class="sheet-head">
+          <h2 id="artifact-title">プレビュー</h2>
+          <div class="row">
+            <button class="link-btn" id="artifact-open">新しいタブ</button>
+            <button class="link-btn" id="artifact-download">保存</button>
+            <button class="icon-btn" data-close aria-label="閉じる"><i data-icon="close" data-size="18"></i></button>
+          </div>
+        </header>
+        <div class="artifact-frame">
+          <iframe id="artifact-frame" sandbox="allow-scripts allow-modals allow-popups allow-forms" title="artifact preview"></iframe>
+        </div>
+        <footer class="sheet-foot xs muted row space">
+          <span>サンドボックス実行。このアプリのCookieやデータには一切アクセスできません。</span>
+          <label class="row xs"><input type="checkbox" id="artifact-strict" /><span>外部通信を遮断</span></label>
+        </footer>
+      </div>
+    </div>
+
+    <!-- ============================ EFFORT ============================ -->
+    <div class="sheet" id="effort-modal" hidden>
+      <div class="sheet-card glass">
+        <header class="sheet-head">
+          <h2>推論の深さ</h2>
+          <button class="icon-btn" data-close aria-label="閉じる"><i data-icon="close" data-size="18"></i></button>
+        </header>
+        <div class="sheet-body stack">
+          <button type="button" class="chip toggle" id="effort-auto" data-on="true">自動（モデルの既定に任せる）</button>
+          <div class="slider-wrap">
+            <input type="range" id="effort-range" class="slider" min="0" max="6" step="1" value="3" aria-label="推論の深さ" />
+            <div class="ticks" id="effort-options"></div>
+          </div>
+          <p class="sm" id="effort-desc"></p>
+          <p class="xs muted">
+            深くするほど回答の質は上がりますが、思考トークンも課金対象なので費用と待ち時間が増えます。
+            対応していない段階は自動で近い値に調整され、その旨が応答に表示されます。
+          </p>
+        </div>
+      </div>
+    </div>
+
+    <div id="toast" class="toast glass" hidden></div>
+
+    <script src="/vendor/marked.js"></script>
+    <script src="/vendor/purify.min.js"></script>
+    <script src="/vendor/qrcode.js"></script>
+    <script src="/app.js" type="module"></script>
+  </body>
+</html>
