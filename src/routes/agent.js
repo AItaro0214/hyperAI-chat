@@ -258,7 +258,7 @@ agent.post('/agent/zip', async (c) => {
     const bytes = await zipWorkspace(sandbox, body.name || 'project');
     const id = newId('file');
     const name = String(body.name || 'project').replace(/[^\w.-]/g, '_') + '.zip';
-    await c.env.KV.put('file:' + id, bytes, { metadata: { mime: 'application/zip', name } });
+    await c.env.KV.put('file:' + id, bytes, { metadata: { mime: 'application/zip', name, at: now() } });
     await c.env.DB.prepare(
       'INSERT INTO files (id, user_id, room_id, kind, mime, name, size, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
     )

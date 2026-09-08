@@ -240,7 +240,7 @@ exportRoute.post('/export', async (c) => {
   const id = newId('file');
   const name = safeName(body.title, rendered.ext);
   const mime = MIME[rendered.ext] || 'application/octet-stream';
-  await c.env.KV.put('file:' + id, rendered.bytes, { metadata: { mime, name } });
+  await c.env.KV.put('file:' + id, rendered.bytes, { metadata: { mime, name, at: now() } });
   await c.env.DB.prepare(
     'INSERT INTO files (id, user_id, room_id, kind, mime, name, size, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
   )

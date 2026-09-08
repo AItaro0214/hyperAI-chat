@@ -92,7 +92,7 @@ images.post('/images', async (c) => {
     const id = newId('file');
     const mime = img.mime || 'image/png';
     const name = 'generated.' + (mime.split('/')[1] || 'png').replace('jpeg', 'jpg');
-    await c.env.KV.put('file:' + id, img.bytes, { metadata: { mime, name } });
+    await c.env.KV.put('file:' + id, img.bytes, { metadata: { mime, name, at: now() } });
     await c.env.DB.prepare(
       'INSERT INTO files (id, user_id, room_id, kind, mime, name, size, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
     )

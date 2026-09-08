@@ -29,7 +29,8 @@
     "test:video": "node tests/video-unit.mjs",
     "test:effort": "node tests/effort-unit.mjs",
     "test:tools": "node tests/servertools-unit.mjs",
-    "test:images": "node tests/images-unit.mjs"
+    "test:images": "node tests/images-unit.mjs",
+    "test:retention": "node tests/retention-unit.mjs"
   },
   "dependencies": {
     "@cloudflare/puppeteer": "^1.4.0",

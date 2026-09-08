@@ -186,14 +186,20 @@ rooms.patch('/:id', async (c) => {
 
 async function purgeRoomFiles(env, roomId, userId) {
   const { results } = await env.DB.prepare('SELECT id FROM files WHERE room_id = ? AND user_id = ?').bind(roomId, userId).all();
+  const stranded = [];
   for (const f of results || []) {
     try {
       await env.KV.delete('file:' + f.id);
     } catch {
-      /* best effort */
+      // Dropping the row now would strand the blob in KV with nothing pointing
+      // at it. Keep the row so the orphan sweep can retry the delete.
+      stranded.push(f.id);
     }
   }
-  await env.DB.prepare('DELETE FROM files WHERE room_id = ? AND user_id = ?').bind(roomId, userId).run();
+  const keep = stranded.length ? ' AND id NOT IN (' + stranded.map(() => '?').join(',') + ')' : '';
+  await env.DB.prepare('DELETE FROM files WHERE room_id = ? AND user_id = ?' + keep)
+    .bind(roomId, userId, ...stranded)
+    .run();
 }
 
 rooms.delete('/:id', async (c) => {

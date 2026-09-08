@@ -558,6 +558,16 @@ function buildActions(msg) {
   return acts;
 }
 
+/* Generated images and video are reaped after three days, so a transcript
+ * outlives its media. Say that, rather than leaving a broken icon behind. */
+function withExpiry(node, label) {
+  node.addEventListener('error', () => {
+    const ph = el('div', 'expired-media', label + 'は保存期間（3日）を過ぎたため削除されました');
+    node.replaceWith(ph);
+  });
+  return node;
+}
+
 function messageNode(msg) {
   const wrap = el('div', 'msg ' + msg.role);
   wrap.dataset.id = msg.id;
@@ -573,7 +583,7 @@ function messageNode(msg) {
         node.src = img.url;
         node.loading = 'lazy';
         node.addEventListener('click', () => window.open(img.url, '_blank'));
-        box.appendChild(node);
+        box.appendChild(withExpiry(node, '画像'));
       }
       bubble.appendChild(box);
     }
@@ -622,7 +632,7 @@ function messageNode(msg) {
     player.playsInline = true;
     player.preload = 'metadata';
     player.src = v.url;
-    wrap.appendChild(player);
+    wrap.appendChild(withExpiry(player, '動画'));
   }
 
   const images = (msg.attachments || []).filter((a) => a.kind === 'image');
@@ -633,7 +643,7 @@ function messageNode(msg) {
       node.src = img.url;
       node.loading = 'lazy';
       node.addEventListener('click', () => window.open(img.url, '_blank'));
-      box.appendChild(node);
+      box.appendChild(withExpiry(node, '画像'));
     }
     wrap.appendChild(box);
   }

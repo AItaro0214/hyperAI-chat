@@ -251,7 +251,7 @@ async function downloadVideo(c, row, userId, url, apiKey) {
       if (buf.byteLength <= MAX_STORE_BYTES) {
         const fileId = newId('file');
         const mime = res.headers.get('content-type') || 'video/mp4';
-        await c.env.KV.put('file:' + fileId, buf, { metadata: { mime } });
+        await c.env.KV.put('file:' + fileId, buf, { metadata: { mime, at: now() } });
         await c.env.DB.prepare(
           'INSERT INTO files (id, user_id, room_id, kind, mime, name, size, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
         )

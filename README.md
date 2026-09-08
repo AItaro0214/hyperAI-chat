@@ -28,6 +28,10 @@ OpenRouter と Groq のモデルを切り替えながら、チャット・文書
 - **読み上げ**: 18 モデル。日本語対応、ブラウザ内蔵音声へのフォールバックあり
 - **録音**: システム音声とマイクをブラウザで録音し、MP3 に変換して添付
 
+生成した画像と動画は、**3 日、またはトークルーム削除で自動的に消えます**
+（保存量が増え続けるのを防ぐため）。残したいものはダウンロードしてください。
+音声・生成した文書・アップロードしたファイルは対象外で、消えません。
+
 ### 開発エージェント
 Cloudflare Containers 上のサンドボックスで、コードを書いて動かして直します。
 
@@ -105,8 +109,9 @@ cp wrangler.example.jsonc wrangler.jsonc
 npx wrangler d1 create <your-d1-database-name>
 npx wrangler kv namespace create KV
 npx wrangler r2 bucket create <your-r2-bucket>   # 任意
-npx wrangler d1 execute <your-d1-database-name> --remote --file=./migrations/0001_init.sql
-# 0002 以降も同様に順番に適用します
+for f in ./migrations/*.sql; do
+  npx wrangler d1 execute <your-d1-database-name> --remote --file="$f"
+done
 ```
 
 ### 3. シークレット
@@ -151,6 +156,7 @@ npm run test:agent                # エージェント（ツール定義・モ�
 npm run test:office               # OOXML の生成と読み戻し
 npm run test:visual               # グラフ・図解・画像埋め込み
 npm run test:api                  # 認証・ルーム・カタログ
+npm run test:retention            # 画像・動画の自動削除
 npm run test:ui                   # Puppeteer による画面テスト
 ```
 
@@ -169,8 +175,11 @@ CHROME="/path/to/chrome" TEST_EMAIL=you@example.com TEST_PASSWORD=... npm run te
   超過分は `standard-1` で約 $0.074/時。アイドル時は課金されません）
 - モデルの利用料 — OpenRouter / Groq の従量課金。アプリ内に料金表があります
 
+画像・動画は 3 日で自動削除されるため、KV / R2 の保存量が積み上がることはありません。
+
 ---
 
 ## ライセンス
 
-未設定です。フォークして使う場合はご自身でライセンスを追加してください。
+[MIT License](LICENSE) です。改変も再配布も商用利用も自由ですが、
+**著作権表示とライセンス文の同梱は必須**です。

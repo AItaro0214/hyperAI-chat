@@ -113,15 +113,28 @@ export default {
     return app.fetch(request, env, ctx);
   },
 
-  /* Preview environments are deliberately disposable; this is what disposes. */
+  /* Preview environments and generated media are deliberately disposable;
+   * this is what disposes of them. Both run on the same three day window. */
   async scheduled(event, env, ctx) {
     const { reapExpired } = await import('./lib/preview.js');
+    const { reapExpiredMedia, reapOrphanBlobs } = await import('./lib/media-retention.js');
     ctx.waitUntil(
       reapExpired(env)
         .then((rooms) => {
           if (rooms.length) console.log('reaped preview environments', rooms.join(', '));
         })
-        .catch((e) => console.error('reap failed', e))
+        .catch((e) => console.error('preview reap failed', e))
+    );
+    ctx.waitUntil(
+      reapExpiredMedia(env)
+        .then(({ count, bytes }) => {
+          if (count) console.log('reaped media', count, 'files', Math.round(bytes / 1024) + 'KB');
+          return reapOrphanBlobs(env);
+        })
+        .then(({ count }) => {
+          if (count) console.log('reaped orphan blobs', count);
+        })
+        .catch((e) => console.error('media reap failed', e))
     );
   },
 };

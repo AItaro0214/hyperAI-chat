@@ -8,11 +8,25 @@ node_modules/
 # Local Cloudflare resource ids and the single allowed account live here.
 wrangler.jsonc
 
-# Screenshots and sample documents produced by the test suites.
+# Media and documents produced by the test suites and by local runs. The app
+# generates these constantly; none of them belong in the repository. Anything
+# genuinely needed as a fixture can be added with `git add -f`.
 tests/*.png
+tests/*.jpg
+tests/*.jpeg
+tests/*.webp
+tests/*.gif
+tests/*.mp4
+tests/*.webm
+tests/*.mp3
+tests/*.wav
 tests/*.pptx
 tests/*.docx
 tests/*.xlsx
+tests/*.pdf
+tests/out/
+/out/
+/tmp/
 
 # Local secrets: MASTER_KEY, PW_PEPPER and friends never leave this machine.
 .secrets*.json

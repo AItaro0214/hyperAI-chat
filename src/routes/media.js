@@ -6,6 +6,7 @@ import { getSettings, logUsage } from '../lib/store.js';
 import { GROQ_BASE, readProviderError, requireKey } from '../lib/chat.js';
 import { estimateAsrCost, estimateTtsCost, getCatalog, findModel } from '../lib/models.js';
 import { fetchSpeechModels, synthesize, isGroqSpeech, speechMime } from '../lib/speech.js';
+import { isExpired, expiresAt, EXPIRING_KINDS, MEDIA_TTL_DAYS } from '../lib/media-retention.js';
 
 const media = new Hono();
 media.use('/files', requireAuth);
@@ -31,7 +32,7 @@ media.post('/files', async (c) => {
   const id = newId('file');
   const mime = file.type || 'application/octet-stream';
   const name = (file.name || 'upload').slice(0, 200);
-  await c.env.KV.put('file:' + id, buf, { metadata: { mime, name } });
+  await c.env.KV.put('file:' + id, buf, { metadata: { mime, name, at: now() } });
   await c.env.DB.prepare(
     'INSERT INTO files (id, user_id, room_id, kind, mime, name, size, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
   )
@@ -44,12 +45,20 @@ media.get('/files/:id', async (c) => {
   const id = c.req.param('id');
   const row = await c.env.DB.prepare('SELECT * FROM files WHERE id = ? AND user_id = ?').bind(id, c.get('userId')).first();
   if (!row) return c.json({ error: 'not found' }, 404);
+  // Gone rather than missing: the file was here and aged out on a known rule,
+  // which is what the client needs in order to say so.
+  if (isExpired(row)) return c.json({ error: 'expired', expiredAt: row.expired_at || null, ttlDays: MEDIA_TTL_DAYS }, 410);
   const buf = await c.env.KV.get('file:' + id, 'arrayBuffer');
   if (!buf) return c.json({ error: 'blob missing' }, 404);
 
+  // Media that will be reaped must not be cached past its own lifetime.
+  const remaining = EXPIRING_KINDS.includes(row.kind)
+    ? Math.max(0, expiresAt(Number(row.created_at) || 0) - now())
+    : 31536000;
+
   const headers = {
     'content-type': row.mime || 'application/octet-stream',
-    'cache-control': 'private, max-age=31536000, immutable',
+    'cache-control': 'private, max-age=' + remaining + (EXPIRING_KINDS.includes(row.kind) ? '' : ', immutable'),
     // Office documents have no viewer in the browser, so they are offered as a
     // download; media stays inline so it can render in place.
     'content-disposition':
@@ -268,7 +277,7 @@ media.post('/tts', async (c) => {
 
   const id = newId('file');
   const size = buf.byteLength ?? buf.length;
-  await c.env.KV.put('file:' + id, buf, { metadata: { mime } });
+  await c.env.KV.put('file:' + id, buf, { metadata: { mime, at: now() } });
   await c.env.DB.prepare(
     'INSERT INTO files (id, user_id, room_id, kind, mime, name, size, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
   )

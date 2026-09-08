@@ -790,3 +790,13 @@ table.data td.num { text-align: right; font-family: var(--mono); font-size: 12.5
 }
 .tick:hover { color: var(--ink); background: var(--line-soft); }
 .tick[data-on="true"] { color: var(--accent); font-weight: 700; }
+
+/* Stands in for generated media that has passed its three day window. */
+.expired-media {
+  padding: 10px 12px;
+  border: 1px dashed var(--line);
+  border-radius: 10px;
+  color: var(--muted);
+  font-size: 12px;
+  background: var(--glass);
+}

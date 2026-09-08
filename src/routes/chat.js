@@ -173,7 +173,7 @@ async function storeImage(env, userId, roomId, dataUrl) {
     bytes = new TextEncoder().encode(decodeURIComponent(raw));
   }
   const id = newId('file');
-  await env.KV.put('file:' + id, bytes, { metadata: { mime } });
+  await env.KV.put('file:' + id, bytes, { metadata: { mime, at: now() } });
   await env.DB.prepare('INSERT INTO files (id, user_id, room_id, kind, mime, name, size, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
     .bind(id, userId, roomId, 'image', mime, 'generated.' + (mime.split('/')[1] || 'png'), bytes.length, now())
     .run();
