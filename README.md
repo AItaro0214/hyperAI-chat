@@ -40,6 +40,8 @@ Cloudflare Containers 上のサンドボックスで、コードを書いて動�
 - **サブエージェント**に安いモデルで単純作業を任せられます
 - **スキル方式**: `AGENTS.md` に「いつどのスキルを読むか」を書いておくと、
   必要なときだけモデル一覧つきの詳細ガイドが読み込まれます
+- **X（旧Twitter）検索**: xAI の `x_search` で、Xの投稿をリアルタイムに検索して
+  引用元URLつきで受け取ります（`XAI_API_KEY` の登録が必要）
 - **プレビュー環境**: 作ったアプリを固定 URL で操作できます。使い捨ての SQLite 付き。
   3 日、またはトークルーム削除で自動的に消えます
 - Cloudflare Workflows で動くので、**ブラウザを閉じても作業は続きます**
@@ -141,8 +143,13 @@ node scripts/bootstrap.mjs <メールアドレス> <パスワード>
 npx wrangler deploy
 ```
 
-OpenRouter と Groq の API キーは、デプロイ後に**アプリ内の管理コンソール**から登録します
-（暗号化して保存されます）。
+API キーは、デプロイ後に**アプリ内の管理コンソール**から登録します（暗号化して保存されます）。
+
+| キー | 取得先 | 必須 |
+|---|---|---|
+| `OPENROUTER_API_KEY` | [openrouter.ai/keys](https://openrouter.ai/keys) | 必須 |
+| `GROQ_API_KEY` | [console.groq.com/keys](https://console.groq.com/keys) | 任意 |
+| `XAI_API_KEY` | [console.x.ai](https://console.x.ai) | 任意（X検索を使う場合のみ） |
 
 ---
 
@@ -157,6 +164,7 @@ npm run test:office               # OOXML の生成と読み戻し
 npm run test:visual               # グラフ・図解・画像埋め込み
 npm run test:api                  # 認証・ルーム・カタログ
 npm run test:retention            # 画像・動画の自動削除
+npm run test:xai                  # xAI の X 検索
 npm run test:ui                   # Puppeteer による画面テスト
 ```
 
@@ -174,6 +182,7 @@ CHROME="/path/to/chrome" TEST_EMAIL=you@example.com TEST_PASSWORD=... npm run te
 - 開発エージェント — Workers Paid $5/月（月 6 時間ぶんのコンテナ稼働を含む。
   超過分は `standard-1` で約 $0.074/時。アイドル時は課金されません）
 - モデルの利用料 — OpenRouter / Groq の従量課金。アプリ内に料金表があります
+- X 検索 — トークン代に加えて**読んだ投稿数**でも課金されます（1件あたり約 $0.005）
 
 画像・動画は 3 日で自動削除されるため、KV / R2 の保存量が積み上がることはありません。
 

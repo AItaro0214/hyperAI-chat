@@ -23,6 +23,7 @@ import { getCatalog } from './models.js';
 import { resolveModelHint } from './image-purpose.js';
 import { runLoop, subagentTools, SUBAGENT_MAX_STEPS } from './agent-loop.js';
 import { renderSkill, skillPath, SKILL_IDS } from './skills.js';
+import { xaiKey, searchX, formatSearchResult, estimateSearchCost } from './xai.js';
 import { detectServerCommand, checkPreviewPort } from './commands.js';
 import { SYSTEM_PROMPT } from './agent.js';
 
@@ -231,6 +232,40 @@ export async function runTool(env, roomId, name, args, state, onOutput, options 
           'モデル: ' + picked.model.id + '（選定理由: ' + picked.why + '）' +
           (cost ? ' / 概算 $' + cost.toFixed(5) : ''),
         meta: { path: saved.path, model: picked.model.id, purpose: args.purpose || null, cost },
+      };
+    }
+    case 'search_x': {
+      const query = String(args.query || '').trim();
+      if (!query) return { text: 'query が必要です' };
+
+      let apiKey;
+      try {
+        apiKey = await xaiKey(env);
+      } catch (e) {
+        return { text: String(e.message) };
+      }
+
+      let out;
+      try {
+        out = await searchX(apiKey, {
+          query,
+          model: args.model,
+          fromDate: args.from_date,
+          toDate: args.to_date,
+          handles: args.handles,
+          excludeHandles: args.exclude_handles,
+          images: !!args.images,
+          videos: !!args.videos,
+          alsoWeb: !!args.also_web,
+        });
+      } catch (e) {
+        return { text: String(e.message).slice(0, 400) };
+      }
+
+      const cost = estimateSearchCost(out.sourcesUsed);
+      return {
+        text: formatSearchResult(out),
+        meta: { model: out.model, sources: out.sources.length, cost },
       };
     }
     case 'load_skill': {

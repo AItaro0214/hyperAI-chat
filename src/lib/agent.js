@@ -195,6 +195,39 @@ export const TOOLS = [
   {
     type: 'function',
     function: {
+      name: 'search_x',
+      description:
+        'X（旧Twitter）をリアルタイム検索して、要約と引用元の投稿URLを返す。' +
+        '世間の反応・最新の話題・特定アカウントの発言など、Web検索では拾えない一次情報が要るときに使う。' +
+        '検索はxAI側で実行されるので、こちらでURLを組み立てる必要はない。',
+      parameters: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: '知りたいことを文章で書く。キーワードの羅列より質問文のほうが精度が高い' },
+          model: { type: 'string', description: 'Grokのモデルid。省略推奨（既定で十分）' },
+          from_date: { type: 'string', description: '開始日 YYYY-MM-DD' },
+          to_date: { type: 'string', description: '終了日 YYYY-MM-DD' },
+          handles: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'このアカウントだけに絞る（@は不要、最大20）',
+          },
+          exclude_handles: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'このアカウントを除外する（最大20）。handles と同時指定はできない',
+          },
+          images: { type: 'boolean', description: '投稿内の画像も読ませる（遅くなる）' },
+          videos: { type: 'boolean', description: '投稿内の動画も読ませる（さらに遅くなる）' },
+          also_web: { type: 'boolean', description: 'Web検索も併用する' },
+        },
+        required: ['query'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'spawn_subagent',
       description:
         '同じワークスペースで作業する下請けのエージェントを立てて、まとまった作業を任せる。' +

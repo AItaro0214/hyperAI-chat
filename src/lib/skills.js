@@ -12,6 +12,7 @@ import { fetchImageModels } from './images.js';
 import { fetchVideoModels, estimateVideoCost, applyDiscount } from './video.js';
 import { fetchSpeechModels } from './speech.js';
 import { getCatalog } from './models.js';
+import { fetchXaiModels } from './xai.js';
 
 export const SKILL_DIR = '.agent/skills';
 
@@ -84,6 +85,19 @@ async function chatCatalogue(env) {
     '\n\n高価だが強力（難所だけ）:\n' +
     strong.map((m) => '- `' + m.id + '` — 出力 ' + money(m.out, 2) + '/1Mトークン').join('\n')
   );
+}
+
+async function xsearchCatalogue(env) {
+  const models = await fetchXaiModels(env).catch(() => []);
+  if (!models.length) return '（一覧を取得できませんでした。XAI_API_KEY が未登録の可能性があります）';
+  return models
+    .map((m) => {
+      const notes = [];
+      if (m.perMillionIn) notes.push('入力 ' + money(m.perMillionIn, 2) + '/M');
+      if (m.perMillionOut) notes.push('出力 ' + money(m.perMillionOut, 2) + '/M');
+      return '- `' + m.id + '`' + (notes.length ? ' — ' + notes.join('・') : '');
+    })
+    .join('\n');
 }
 
 /* -------------------------------- skills -------------------------------- */
@@ -184,6 +198,36 @@ export const SKILLS = {
     ].join('\n'),
     catalogue: async () => '（このスキルにモデル一覧はありません）',
     catalogueTitle: '補足',
+  },
+
+  xsearch: {
+    title: 'X（旧Twitter）検索',
+    when: '世間の反応・最新の話題・特定アカウントの発言など、Xの一次情報が要るとき',
+    guide: [
+      '`search_x({ query, from_date, to_date, handles, exclude_handles, images, videos, also_web })` で、Xをリアルタイム検索して要約と引用元URLを受け取ります。',
+      '検索はxAI側（Grok）で実行されます。こちらでURLを組み立てたり、スクレイピングしたりする必要はありません。',
+      '',
+      '## いつ使うか',
+      '',
+      '- **通常のWeb検索では届かないとき**に使ってください。Xの投稿は検索エンジンにほとんど載りません',
+      '- 向いていること: 発表直後の反応、不具合の目撃報告、特定の人物・企業アカウントの発言、いま話題になっていること',
+      '- 向いていないこと: 定義や仕様の確認、安定した事実。それはWeb検索のほうが正確です',
+      '',
+      '## 書き方',
+      '',
+      '- `query` はキーワードの羅列ではなく**質問文**にしてください。「Cloudflare Containers 障害」より「Cloudflare Containers で最近報告されている不具合は何か」のほうが精度が上がります',
+      '- 期間を絞ると精度も速度も上がります。「最近」と書くだけでは絞られないので `from_date` を明示してください',
+      '- 特定アカウントを追うなら `handles: ["CloudflareDev"]`（@は不要、最大20）。`exclude_handles` とは同時に使えません',
+      '- 画像や動画の中身まで読ませたいときだけ `images` / `videos` を true に。既定はオフで、有効にすると目に見えて遅くなります',
+      '',
+      '## 注意',
+      '',
+      '- **`XAI_API_KEY` の登録が必要です**（管理コンソール → キー）。未登録ならこのツールは使えません',
+      '- 課金はトークンに加えて**読んだ投稿数**でも発生します（1件あたり約 $0.005）。期間やアカウントで絞るほど安くなります',
+      '- 返ってくるのは要約と引用元URLです。**そのまま事実として扱わないでください** — Xの投稿は裏取りされていません。重要な主張は引用元を開いて確認するか、Web検索で突き合わせること',
+    ].join('\n'),
+    catalogue: xsearchCatalogue,
+    catalogueTitle: '利用できる Grok モデル',
   },
 
   subagent: {

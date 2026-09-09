@@ -13,7 +13,7 @@ export class ProviderError extends Error {
   }
 }
 
-const KEY_NAMES = { groq: 'GROQ_API_KEY', openrouter: 'OPENROUTER_API_KEY' };
+const KEY_NAMES = { groq: 'GROQ_API_KEY', openrouter: 'OPENROUTER_API_KEY', xai: 'XAI_API_KEY' };
 
 export async function requireKey(env, provider) {
   const name = KEY_NAMES[provider] || KEY_NAMES.openrouter;

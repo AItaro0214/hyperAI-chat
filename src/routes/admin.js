@@ -35,6 +35,7 @@ import {
 import { GROQ_PRICING } from '../data/groq-pricing.js';
 import { getGroqPricing } from '../lib/models.js';
 import { GROQ_BASE, OPENROUTER_BASE } from '../lib/chat.js';
+import { XAI_BASE } from '../lib/xai.js';
 
 const admin = new Hono();
 admin.use('*', requireAdmin);
@@ -85,6 +86,15 @@ admin.post('/secrets/test', async (c) => {
           isFreeTier: json.data?.is_free_tier,
         },
       });
+    }
+    if (key === 'XAI_API_KEY') {
+      const res = await fetch(XAI_BASE + '/models', {
+        headers: { authorization: 'Bearer ' + value },
+        signal: AbortSignal.timeout(15000),
+      });
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok) return c.json({ ok: false, error: 'HTTP ' + res.status + ' ' + (json.error?.message || json.error || '') });
+      return c.json({ ok: true, detail: { models: (json.data || []).length } });
     }
     const res = await fetch(GROQ_BASE + '/models', {
       headers: { authorization: 'Bearer ' + value },

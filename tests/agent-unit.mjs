@@ -241,7 +241,13 @@ for (let i = 0; i < 3000; i++) {
 check('  3000件でも衝突なし', collisions === 0);
 
 /* -------------------------------- skills -------------------------------- */
-check('スキルが5種そろっている', SKILL_IDS.join(',') === 'image,video,speech,preview,subagent', SKILL_IDS.join(','));
+// Every skill the system prompt promises must exist; order is not meaningful.
+const EXPECTED_SKILLS = ['image', 'video', 'speech', 'preview', 'xsearch', 'subagent'];
+check(
+  'スキルがひと通りそろっている',
+  EXPECTED_SKILLS.every((id) => SKILL_IDS.includes(id)) && SKILL_IDS.length === EXPECTED_SKILLS.length,
+  SKILL_IDS.join(',')
+);
 check('  プレビューのスキルが使い捨てDBを説明している',
   SKILLS.preview.guide.includes('PREVIEW_DB') && SKILLS.preview.guide.includes('node:sqlite'));
 check('    3日で消えると明記', SKILLS.preview.guide.includes('3日'));

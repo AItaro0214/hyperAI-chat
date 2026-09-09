@@ -1,7 +1,7 @@
 import { seal, unseal } from './crypto.js';
 import { maskSecret, now } from './auth.js';
 
-export const SECRET_KEYS = ['OPENROUTER_API_KEY', 'GROQ_API_KEY'];
+export const SECRET_KEYS = ['OPENROUTER_API_KEY', 'GROQ_API_KEY', 'XAI_API_KEY'];
 
 /* ---------------------------- sealed API keys ---------------------------
  * Keys entered in the admin console are sealed with AES-256-GCM using

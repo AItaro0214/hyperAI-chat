@@ -30,7 +30,8 @@
     "test:effort": "node tests/effort-unit.mjs",
     "test:tools": "node tests/servertools-unit.mjs",
     "test:images": "node tests/images-unit.mjs",
-    "test:retention": "node tests/retention-unit.mjs"
+    "test:retention": "node tests/retention-unit.mjs",
+    "test:xai": "node tests/xai-unit.mjs"
   },
   "dependencies": {
     "@cloudflare/puppeteer": "^1.4.0",

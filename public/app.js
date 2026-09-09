@@ -1615,8 +1615,10 @@ async function renderKeysTab(body) {
           '<p class="xs" data-key-result="' + s.key + '"></p></div>'
       )
       .join('') +
-    '<p class="xs muted"><a href="https://openrouter.ai/keys" target="_blank" rel="noopener">openrouter.ai/keys</a> · ' +
-    '<a href="https://console.groq.com/keys" target="_blank" rel="noopener">console.groq.com/keys</a></p>';
+    '<p class="xs muted">キーの取得先： ' +
+    '<a href="https://openrouter.ai/keys" target="_blank" rel="noopener">openrouter.ai/keys</a> · ' +
+    '<a href="https://console.groq.com/keys" target="_blank" rel="noopener">console.groq.com/keys</a> · ' +
+    '<a href="https://console.x.ai" target="_blank" rel="noopener">console.x.ai</a>（X検索に使用。未設定でも他は動きます）</p>';
 
   $$('[data-key-save]').forEach((btn) =>
     btn.addEventListener('click', async () => {
