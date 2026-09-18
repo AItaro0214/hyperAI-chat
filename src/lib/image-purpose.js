@@ -93,7 +93,8 @@ export const purposeHelp = () =>
  * the family. Order matters: the first hit wins. */
 const ALIASES = [
   [/gpt|openai|チャットgpt|ジーピーティー|dall|ダリ/i, 'openai/gpt'],
-  [/nano\s*banana|ナノバナナ/i, 'google/gemini-3.1-flash-image'],
+  // Version-less on purpose: the nickname follows the family, not a generation.
+  [/nano\s*banana|ナノバナナ/i, 'flash-image'],
   [/veo|ヴェオ|ベオ/i, 'google/veo'],
   [/seedance|シードダンス|シーダンス/i, 'bytedance/seedance'],
   [/hailuo|ハイルオ|海螺/i, 'minimax/hailuo'],
@@ -123,8 +124,19 @@ const GENERIC = new Set([
 
 const squash = (s) => String(s).toLowerCase().replace(/[\s._\-/]/g, '');
 
+/** The version run inside a slug: 3.1, 5-0, v4.1 all match. */
+const VERSION_RE = /\d+(?:[.-]\d+)*/;
+
 /** Digit runs, so "seedance2.5" prefers 2.5 over 1.5. */
 const versionsIn = (s) => String(s).toLowerCase().match(/\d+(?:[.\-_]\d+)*/g) || [];
+
+/** The leading generation number in an id, for "newer is better" tie-breaks. */
+function newness(id) {
+  const first = VERSION_RE.exec(String(id).split(':')[0]);
+  if (!first) return 0;
+  const [major = 0, minor = 0] = first[0].split(/[.-]/).map(Number);
+  return major + Math.min(minor, 9) / 10;
+}
 
 /**
  * Cheap "is this the plain flagship" score, to avoid picking odd variants.
@@ -175,6 +187,10 @@ export function resolveModelHint(catalogue, hint) {
       let s = tierScore(m.id);
       if (wantedVersions.length) {
         s += wantedVersions.some((v) => id.includes(v)) ? 10 : -4;
+      } else {
+        // No version asked for, so prefer the newer generation. Deliberately
+        // fractional: this breaks ties, it never outweighs a tier difference.
+        s += Math.min(newness(m.id), 40) / 100;
       }
       // "seedance mini" should reach the mini, despite the tier penalty.
       for (const mod of modifiers) if (id.includes(mod)) s += 6;
@@ -210,6 +226,63 @@ export function resolveModelHint(catalogue, hint) {
   return null;
 }
 
+/* ------------------------- generation resolution -------------------------
+ *
+ * The preference lists below name a concrete model, which is exactly what goes
+ * stale: when google/gemini-3.8-flash-image ships, an exact-match lookup keeps
+ * handing back 3.1 for as long as it exists, and falls through to a generic
+ * default once it does not.
+ *
+ * So an entry is read as a family rather than an id. The version is the first
+ * numeric run in the slug; everything around it has to match exactly, which is
+ * what keeps -lite from being upgraded into the full model, -pro from standing
+ * in for the base, and a :batch or :free variant from being substituted for the
+ * plain one. Within that family the highest version present wins.
+ * ---------------------------------------------------------------------- */
+
+/** Splits an id into the parts that must match and the version that may move. */
+export function splitVersion(id) {
+  const [base, variant = ''] = String(id || '').split(':');
+  const m = VERSION_RE.exec(base);
+  if (!m) return null;
+  return {
+    prefix: base.slice(0, m.index),
+    suffix: base.slice(m.index + m[0].length),
+    version: m[0].split(/[.-]/).map(Number),
+    variant,
+  };
+}
+
+/** Element-wise numeric compare; a longer run wins a shared prefix (3.1 > 3). */
+export function compareVersion(a, b) {
+  const n = Math.max(a.length, b.length);
+  for (let i = 0; i < n; i++) {
+    const x = a[i] ?? -1;
+    const y = b[i] ?? -1;
+    if (x !== y) return x - y;
+  }
+  return 0;
+}
+
+/** The newest model in the same family as `id`, or null if the family is absent. */
+export function newestInFamily(catalogue, id) {
+  const want = splitVersion(id);
+  if (!want) return (catalogue || []).find((m) => m.id === id) || null;
+
+  let best = null;
+  let bestVersion = null;
+  for (const m of catalogue || []) {
+    const got = splitVersion(m.id);
+    if (!got) continue;
+    if (got.prefix !== want.prefix || got.suffix !== want.suffix || got.variant !== want.variant) continue;
+    if (!bestVersion || compareVersion(got.version, bestVersion) > 0) {
+      best = m;
+      bestVersion = got.version;
+    }
+  }
+  return best;
+}
+
 /**
  * Resolves a request to a concrete model in the live catalogue.
  * @param {{id: string}[]} catalogue
@@ -217,6 +290,9 @@ export function resolveModelHint(catalogue, hint) {
  */
 export function pickModel(catalogue, table, { model, purpose, fallback, defaultId } = {}) {
   const has = (id) => catalogue.find((m) => m.id === id);
+  // The family lookup already returns the named id when nothing newer exists.
+  const resolve = (id) => newestInFamily(catalogue, id) || has(id);
+  const note = (id, found) => (found && found.id !== id ? '（' + id + ' → ' + found.id + '）' : '');
 
   if (model) {
     const matched = resolveModelHint(catalogue, model);
@@ -226,12 +302,12 @@ export function pickModel(catalogue, table, { model, purpose, fallback, defaultI
   const spec = purpose ? table[String(purpose).toLowerCase()] : null;
   if (spec) {
     for (const id of spec.models) {
-      const found = has(id);
-      if (found) return { model: found, format: spec.format || null, why: purpose };
+      const found = resolve(id);
+      if (found) return { model: found, format: spec.format || null, why: purpose + note(id, found) };
     }
   }
 
-  const chosen = (fallback && has(fallback)) || (defaultId && has(defaultId)) || catalogue[0] || null;
+  const chosen = (fallback && resolve(fallback)) || (defaultId && resolve(defaultId)) || catalogue[0] || null;
   return { model: chosen, format: null, why: spec ? purpose + '（候補が見つからず既定）' : '既定' };
 }
 
