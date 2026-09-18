@@ -206,7 +206,10 @@ export class AgentWorkflow extends WorkflowEntrypoint {
         // Only the transcript grows without bound, so old turns are pruned.
         if (messages.length > 60) messages.splice(1, messages.length - 60);
       }
+      // The loop counter runs one past the ceiling on exhaustion; report the
+      // number of turns that actually happened, not the index that ended it.
       stopped = steps > MAX_STEPS;
+      if (stopped) steps = MAX_STEPS;
       if (stopped && !finalText) finalText = '（上限に達したため中断しました。続けるにはもう一度依頼してください）';
     } catch (e) {
       const msg = String(e?.message || e).slice(0, 600);
