@@ -33,7 +33,8 @@
     "test:retention": "node tests/retention-unit.mjs",
     "test:xai": "node tests/xai-unit.mjs",
     "test:history": "node tests/history-unit.mjs",
-    "test:generation": "node tests/generation-unit.mjs"
+    "test:generation": "node tests/generation-unit.mjs",
+    "test:catalogue": "node tests/catalogue-unit.mjs"
   },
   "dependencies": {
     "@cloudflare/puppeteer": "^1.4.0",

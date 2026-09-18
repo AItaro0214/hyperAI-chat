@@ -9,7 +9,7 @@ import {
 import { DEFAULT_RULES, RULES_FILE, RULES_CANDIDATES, rulesBlock } from '../src/lib/rules.js';
 import { subagentTools, SUBAGENT_MAX_STEPS } from '../src/lib/agent-loop.js';
 import { detectServerCommand, checkPreviewPort, RESERVED_PORT } from '../src/lib/commands.js';
-import { SKILLS, SKILL_IDS, skillIndex, skillPath, SKILL_DIR } from '../src/lib/skills.js';
+import { SKILLS, SKILL_IDS, skillIndex, skillPath, SKILL_DIR, renderSkill } from '../src/lib/skills.js';
 
 const results = [];
 const check = (n, ok, extra = '') => {
@@ -254,7 +254,10 @@ check('    3日で消えると明記', SKILLS.preview.guide.includes('3日'));
 for (const id of SKILL_IDS) {
   const skill = SKILLS[id];
   check('  ' + id + ' に説明と使いどころがある', !!skill.title && skill.when.length > 8 && skill.guide.length > 100);
-  check('    モデル一覧を持っている', typeof skill.catalogue === 'function');
+  // Ids live in list_models, never in the skill text; a skill that needs them
+  // has to send the agent there instead of listing them.
+  check('    モデルIDを焼き込んでいない', !/[a-z-]+\/[a-z0-9.-]*\d/.test(skill.guide), id);
+  if (skill.models) check('    list_models へ誘導している', renderSkill({}, id).includes('list_models'));
 }
 const index = skillIndex();
 check('索引は全スキルを並べる', SKILL_IDS.every((id) => index.includes('`' + id + '`')));

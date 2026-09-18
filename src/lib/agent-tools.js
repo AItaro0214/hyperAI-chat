@@ -24,6 +24,7 @@ import { resolveModelHint } from './image-purpose.js';
 import { runLoop, subagentTools, SUBAGENT_MAX_STEPS } from './agent-loop.js';
 import { renderSkill, skillPath, SKILL_IDS } from './skills.js';
 import { xaiKey, searchX, formatSearchResult, estimateSearchCost } from './xai.js';
+import { listModels } from './catalogues.js';
 import { detectServerCommand, checkPreviewPort } from './commands.js';
 import { SYSTEM_PROMPT } from './agent.js';
 
@@ -233,6 +234,14 @@ export async function runTool(env, roomId, name, args, state, onOutput, options 
           (cost ? ' / 概算 $' + cost.toFixed(5) : ''),
         meta: { path: saved.path, model: picked.model.id, purpose: args.purpose || null, cost },
       };
+    }
+    case 'list_models': {
+      try {
+        const out = await listModels(env, args.kind, { query: args.query, limit: args.limit });
+        return { text: out.text, meta: { kind: out.kind, total: out.total, shown: out.shown } };
+      } catch (e) {
+        return { text: String(e.message).slice(0, 300) };
+      }
     }
     case 'search_x': {
       const query = String(args.query || '').trim();

@@ -182,13 +182,40 @@ export const TOOLS = [
     function: {
       name: 'load_skill',
       description:
-        'スキルの説明と、そこで使えるモデルの正確な一覧を読み込む。' +
+        'スキルの進め方・注意点を読み込む。' +
         '画像・動画・音声・サブエージェントを使う前に、対応するスキルを必ず読むこと。' +
-        '一度読めば同じ実行の中で読み直す必要はない。',
+        '一度読めば同じ実行の中で読み直す必要はない。' +
+        'モデルIDはここには入っていないので、必要なら list_models で引くこと。',
       parameters: {
         type: 'object',
         properties: { name: { type: 'string', enum: SKILL_IDS, description: '読み込むスキル' } },
         required: ['name'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'list_models',
+      description:
+        'いま実際に使えるモデルの一覧を、提供元のカタログから引く。' +
+        'モデルIDを書く前に必ずこれで確認すること。記憶や推測で書いたIDは古いことがある。' +
+        'purpose 指定で足りる場合はそちらが簡単だが、特定の性能や価格で選びたいときはここで探す。',
+      parameters: {
+        type: 'object',
+        properties: {
+          kind: {
+            type: 'string',
+            enum: ['image', 'video', 'speech', 'chat', 'xai'],
+            description: '画像 / 動画 / 読み上げ / チャット（サブエージェント用）/ Grok',
+          },
+          query: {
+            type: 'string',
+            description: '絞り込み。空白区切りの語を全部含むものだけ返る（例: "gemini flash", "svg", "無料"）',
+          },
+          limit: { type: 'integer', description: '最大件数。既定 20、上限 60' },
+        },
+        required: ['kind'],
       },
     },
   },
