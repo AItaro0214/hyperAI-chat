@@ -16,6 +16,7 @@ import { snapshotWorkspace, restoreWorkspace } from '../lib/workspace-store.js';
 import { loadRules, rulesBlock } from '../lib/agent-rules.js';
 import { skillIndex } from '../lib/skills.js';
 import { TOOLS, SYSTEM_PROMPT, MAX_STEPS, parseArgs, toolResultMessage } from '../lib/agent.js';
+import { loadAgentHistory, HISTORY_NOTE, DEFAULT_HISTORY_CHARS } from '../lib/agent-history.js';
 import { runTool } from '../lib/agent-tools.js';
 
 /** Appends one progress event; the SSE route replays these to the panel. */
@@ -28,11 +29,25 @@ async function record(env, runId, seq, kind, payload) {
 export class AgentWorkflow extends WorkflowEntrypoint {
   async run(event, step) {
     const env = this.env;
-    const { runId, userId, roomId, task, provider, model, systemExtra, imageModel } = event.payload;
+    const { runId, userId, roomId, task, taskMessageId, provider, model, systemExtra, imageModel } = event.payload;
 
     const state = { touched: new Set(), preview: null };
+
+    // The workspace comes back on its own, but the reasoning behind it does not.
+    // Carrying the room's recent turns is what stops the agent re-deciding
+    // things it already decided and retrying what it already found broken.
+    const settings = await getSettings(env);
+    const history = await loadAgentHistory(env, roomId, {
+      excludeId: taskMessageId,
+      maxChars: Number(settings.agentHistoryChars ?? DEFAULT_HISTORY_CHARS),
+    });
+
     const messages = [
-      { role: 'system', content: SYSTEM_PROMPT + (systemExtra ? '\n\n' + systemExtra : '') },
+      {
+        role: 'system',
+        content: SYSTEM_PROMPT + (systemExtra ? '\n\n' + systemExtra : '') + (history.length ? HISTORY_NOTE : ''),
+      },
+      ...history,
       { role: 'user', content: task },
     ];
     const shots = [];
@@ -48,7 +63,6 @@ export class AgentWorkflow extends WorkflowEntrypoint {
     };
 
     const apiKey = await requireKey(env, provider);
-    const settings = await getSettings(env);
 
     // The container may have slept since the last run and come up with a fresh
     // disk, so the workspace is put back before any tool touches it.

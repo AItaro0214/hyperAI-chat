@@ -70,6 +70,8 @@ export const DEFAULT_SETTINGS = {
   // visit_website so whole pages never enter the context.
   groqSearch: { includeDomains: [], excludeDomains: [], country: '', snippetOnly: false },
   historyLimit: 0, // 0 = 全件（コンテキストに収まる範囲で自動調整）
+  // Agent runs carry this many characters of the room's prior turns. 0 = off.
+  agentHistoryChars: 6000,
   asrModel: 'whisper-large-v3-turbo',
   ttsModel: 'google/gemini-3.1-flash-tts-preview',
   ttsVoice: 'Kore',

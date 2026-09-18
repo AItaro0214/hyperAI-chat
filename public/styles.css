@@ -800,3 +800,25 @@ table.data td.num { text-align: right; font-family: var(--mono); font-size: 12.5
   font-size: 12px;
   background: var(--glass);
 }
+
+/* A run shown in the main thread instead of the narrow sheet. The log element
+   is the same node, moved here, so it has to shed the panel's own scrolling. */
+.agent-run { width: 100%; max-width: 100%; }
+.agent-run-head {
+  display: flex; gap: 7px; align-items: center;
+  font-size: 12.5px; font-weight: 600; color: var(--ink-2);
+  padding-bottom: 8px; margin-bottom: 10px; border-bottom: 1px solid var(--line-soft);
+}
+.agent-run-head svg { flex: none; color: var(--accent); }
+.agent-run-status { margin-left: auto; font-weight: 500; color: var(--muted); font-variant-numeric: tabular-nums; }
+.agent-run .agent-log { overflow: visible; max-height: none; flex: none; padding: 0; }
+.agent-run .agent-line img { max-width: min(560px, 100%); }
+
+.agent-trace > summary {
+  cursor: pointer; font-size: 12px; color: var(--muted);
+  padding: 4px 0; list-style: none; user-select: none;
+}
+.agent-trace > summary::before { content: '▸ '; }
+.agent-trace[open] > summary::before { content: '▾ '; }
+.agent-trace > summary:hover { color: var(--ink-2); }
+.agent-trace[open] > summary { margin-bottom: 8px; }

@@ -13,7 +13,87 @@ let agentModels = [];
 let live = null;
 let ticker = null;
 let currentRun = null;
+let runCard = null;
 const $ = (sel) => document.querySelector(sel);
+
+/* The run is shown in the main thread rather than the panel.
+ *
+ * The panel is a narrow sheet, and a build emits long commands, stack traces
+ * and screenshots that do not fit in it. The thread is full width and already
+ * knows how to render all of that, so the log element is moved into a card
+ * there for the duration of the run. One element, relocated -- every caller
+ * still just looks up #agent-log. */
+function ensureRunCard(task) {
+  const thread = $('#messages');
+  if (!thread) return $('#agent-log');
+
+  const log = $('#agent-log');
+  runCard = ctx.el('div', 'msg assistant agent-run');
+  const head = ctx.el('div', 'agent-run-head');
+  head.innerHTML = icon('code', 14);
+  head.appendChild(ctx.el('span', null, task ? '開発: ' + task : '開発'));
+  head.appendChild(ctx.el('span', 'agent-run-status', ''));
+  runCard.appendChild(head);
+  runCard.appendChild(log);
+  thread.appendChild(runCard);
+
+  const home = $('.agent-main');
+  if (home && !document.getElementById('agent-moved')) {
+    const note = ctx.el('p', 'xs muted', '実行中のログはチャット画面に表示されています。');
+    note.id = 'agent-moved';
+    note.style.padding = '14px 16px';
+    home.insertBefore(note, home.firstChild);
+  }
+
+  scrollThread();
+  return log;
+}
+
+/** Status goes on both the sheet and the in-thread card. */
+function setStatus(text) {
+  const el = $('#agent-status');
+  if (el) el.textContent = text;
+  const onCard = runCard?.querySelector('.agent-run-status');
+  if (onCard) onCard.textContent = text;
+}
+
+/** Collapses the finished trace so a long build does not dominate the thread. */
+function finishRunCard(summary) {
+  if (!runCard) return;
+  const log = runCard.querySelector('.agent-log');
+  if (!log) return;
+  const box = document.createElement('details');
+  box.className = 'agent-trace';
+  const sum = document.createElement('summary');
+  sum.textContent = '作業ログ（' + summary + '）';
+  box.appendChild(sum);
+  runCard.insertBefore(box, log);
+  box.appendChild(log);
+  runCard.classList.add('finished');
+}
+
+function scrollThread() {
+  const thread = $('#messages');
+  if (thread) thread.scrollTop = thread.scrollHeight;
+}
+
+/** Puts the log element back in the sheet so the next run can move it again. */
+function releaseRunCard() {
+  document.getElementById('agent-moved')?.remove();
+  if (!runCard) return;
+  // The finished trace belongs to the thread now, so it keeps the element and
+  // gives up the id; the sheet gets an empty one for the next run. Moving the
+  // original back would tear the log the user just finished reading out of the
+  // conversation.
+  runCard.querySelector('.agent-log')?.removeAttribute('id');
+  const home = $('.agent-main');
+  if (home && !document.getElementById('agent-log')) {
+    const fresh = ctx.el('div', 'agent-log');
+    fresh.id = 'agent-log';
+    home.insertBefore(fresh, home.firstChild);
+  }
+  runCard = null;
+}
 
 const TOOL_LABELS = {
   generate_image: '画像生成',
@@ -67,7 +147,8 @@ function line(kind, head, body, { icon: iconName, url } = {}) {
   }
   const log = $('#agent-log');
   log.appendChild(row);
-  log.scrollTop = log.scrollHeight;
+  if (runCard) scrollThread();
+  else log.scrollTop = log.scrollHeight;
   return row;
 }
 
@@ -228,6 +309,9 @@ async function run() {
 
   $('#agent-run').disabled = true;
   $('#agent-status').textContent = '開始しています…';
+  // The sheet closes so the run is watched in the thread, at full width.
+  ensureRunCard(task);
+  $('#agent-modal').hidden = true;
   line('task', task, null, { icon: 'send' });
 
   try {
@@ -310,7 +394,7 @@ function handleEvent(event, data) {
     return;
   }
   if (event === 'step') {
-    $('#agent-status').textContent = 'ステップ ' + data.step + ' / ' + data.of;
+    setStatus('ステップ ' + data.step + ' / ' + data.of);
   } else if (event === 'tool') {
     const row = line('tool', (TOOL_LABELS[data.name] || data.name) + ' · ' + describe(data.name, data.args || {}), null, {
       icon: TOOL_ICONS[data.name] || 'code',
@@ -321,8 +405,11 @@ function handleEvent(event, data) {
       // Only the tail is kept; a build can emit megabytes.
       live.text = (live.text + data.data).slice(-8000);
       live.body.textContent = live.text;
-      const log = $('#agent-log');
-      log.scrollTop = log.scrollHeight;
+      if (runCard) scrollThread();
+      else {
+        const log = $('#agent-log');
+        log.scrollTop = log.scrollHeight;
+      }
     }
   } else if (event === 'result') {
     stopLive();
@@ -347,13 +434,32 @@ function handleEvent(event, data) {
     stopLive();
   } else if (event === 'done') {
     stopLive();
-    $('#agent-status').textContent =
+    const summary =
       data.error
         ? '中断しました'
         : (data.stopped ? '上限で中断（' : '完了（') + data.steps + 'ステップ' +
           (data.cost ? ' / ' + ctx.usd(data.cost) : '') + '）';
+    setStatus(summary);
     if (data.preview) line('say', 'プレビュー: ' + data.preview, null, { icon: 'external' });
-    if (ctx.state.roomId) ctx.openRoom(ctx.state.roomId).catch(() => {});
+    // Reopening the room rebuilds the thread from the database, which would
+    // throw the trace away. It is detached first and put back underneath the
+    // reply, collapsed, so the work stays inspectable.
+    const keep = runCard;
+    if (keep) keep.remove();
+    finishRunCard(summary);
+    if (ctx.state.roomId) {
+      ctx.openRoom(ctx.state.roomId)
+        .then(() => {
+          if (keep) {
+            $('#messages')?.appendChild(keep);
+            scrollThread();
+          }
+          releaseRunCard();
+        })
+        .catch(() => releaseRunCard());
+    } else {
+      releaseRunCard();
+    }
   }
 }
 
@@ -446,8 +552,9 @@ async function reattach() {
     const active = (runs || []).find((r) => r.status === 'running');
     if (!active) return;
     $('#agent-log').innerHTML = '';
+    ensureRunCard(active.task);
     line('task', active.task, null, { icon: 'send' });
-    $('#agent-status').textContent = '進行中の作業に再接続しました';
+    setStatus('進行中の作業に再接続しました');
     follow(active.id, 0);
   } catch {
     /* nothing to resume */

@@ -413,10 +413,11 @@ agent.post('/agent', async (c) => {
   )
     .bind(runId, userId, room.id, task, provider, modelId, t, t)
     .run();
+  const taskMessageId = newId('msg');
   await c.env.DB.prepare(
     'INSERT INTO messages (id, room_id, user_id, role, content, attachments, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
   )
-    .bind(newId('msg'), room.id, userId, 'user', '🛠 ' + task, '[]', t)
+    .bind(taskMessageId, room.id, userId, 'user', '🛠 ' + task, '[]', t)
     .run();
 
   const instance = await c.env.AGENT.create({
@@ -425,6 +426,7 @@ agent.post('/agent', async (c) => {
       userId,
       roomId: room.id,
       task,
+      taskMessageId,
       provider,
       model: modelId,
       imageModel: body.imageModel || settings.imageModel || undefined,
