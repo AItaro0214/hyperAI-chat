@@ -209,11 +209,23 @@ export function findModel(catalog, ref) {
 }
 
 /* --------------------------- cost calculation --------------------------- */
+/* Reasoning tokens are billed as output, and the OpenAI-compatible schema
+ * already counts them inside completion_tokens — completion_tokens_details is
+ * a breakdown, not an addition. A provider that reports them separately gives
+ * itself away by returning fewer completion tokens than the reasoning it claims
+ * to contain; add them in that case rather than let a thinking-heavy turn read
+ * as nearly free. */
+export function outputTokens(usage) {
+  const completion = Number(usage?.completion_tokens) || 0;
+  const reasoning = Number(usage?.completion_tokens_details?.reasoning_tokens) || 0;
+  return reasoning > completion ? completion + reasoning : completion;
+}
+
 export function estimateChatCost(model, usage) {
   if (!model?.pricing || !usage) return null;
   const p = model.pricing;
   const inTok = usage.prompt_tokens || 0;
-  const outTok = usage.completion_tokens || 0;
+  const outTok = outputTokens(usage);
   if (model.provider === 'openrouter') {
     return (inTok / 1e6) * (p.input_per_m || 0) + (outTok / 1e6) * (p.output_per_m || 0);
   }
@@ -221,6 +233,20 @@ export function estimateChatCost(model, usage) {
     return (inTok / 1e6) * p.input_per_m + (outTok / 1e6) * (p.output_per_m || 0);
   }
   return null;
+}
+
+/**
+ * What one model turn cost.
+ *
+ * OpenRouter returns the real charge in usage.cost, which already includes
+ * reasoning. Groq returns no cost at all, so it has to be priced from the
+ * token counts against the local table — without this an agent run on Groq
+ * reports nothing spent.
+ */
+export function turnCost(modelMeta, usage) {
+  const billed = Number(usage?.cost);
+  if (Number.isFinite(billed) && billed > 0) return billed;
+  return Number(estimateChatCost(modelMeta, usage)) || 0;
 }
 
 export function estimateAsrCost(model, seconds) {

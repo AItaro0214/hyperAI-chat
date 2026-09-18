@@ -9,6 +9,7 @@ import { WorkflowEntrypoint } from 'cloudflare:workers';
 import { newId } from '../lib/crypto.js';
 import { now } from '../lib/auth.js';
 import { getSettings, logUsage } from '../lib/store.js';
+import { getCatalog, findModel, turnCost } from '../lib/models.js';
 import { requireKey } from '../lib/chat.js';
 import { callProvider } from '../lib/agent-loop.js';
 import { listFiles, sandboxFor } from '../lib/sandbox.js';
@@ -63,6 +64,7 @@ export class AgentWorkflow extends WorkflowEntrypoint {
     };
 
     const apiKey = await requireKey(env, provider);
+    const modelMeta = findModel(await getCatalog(env).catch(() => ({ models: [] })), provider + ':' + model);
 
     // The container may have slept since the last run and come up with a fresh
     // disk, so the workspace is put back before any tool touches it.
@@ -113,7 +115,8 @@ export class AgentWorkflow extends WorkflowEntrypoint {
         );
 
         const message = reply?.choices?.[0]?.message || {};
-        cost += Number(reply?.usage?.cost) || 0;
+        // Groq returns no usage.cost, so the turn is priced from its tokens.
+        cost += turnCost(modelMeta, reply?.usage);
         const calls = message.tool_calls || [];
 
         if (message.content) {

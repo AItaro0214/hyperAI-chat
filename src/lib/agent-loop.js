@@ -6,6 +6,7 @@
  * tool output into the expensive model's context. */
 
 import { postJson, OPENROUTER_BASE, GROQ_BASE, readProviderError } from './chat.js';
+import { getCatalog, findModel, turnCost } from './models.js';
 import { attribution } from './branding.js';
 import { TOOLS, parseArgs, toolResultMessage } from './agent.js';
 
@@ -45,6 +46,7 @@ export async function callProvider(provider, model, messages, apiKey, { temperat
  * @returns {Promise<{text: string, steps: number, cost: number, calls: string[]}>}
  */
 export async function runLoop({
+  env,
   provider,
   model,
   apiKey,
@@ -65,10 +67,13 @@ export async function runLoop({
   let text = '';
   let steps = 0;
 
+  // Priced locally when the provider does not bill us directly (Groq).
+  const modelMeta = findModel(await getCatalog(env).catch(() => ({ models: [] })), provider + ':' + model);
+
   for (steps = 1; steps <= maxSteps; steps++) {
     const reply = await callProvider(provider, model, messages, apiKey, { temperature, tools });
     const message = reply?.choices?.[0]?.message || {};
-    cost += Number(reply?.usage?.cost) || 0;
+    cost += turnCost(modelMeta, reply?.usage);
 
     if (message.content) text = message.content;
     const toolCalls = message.tool_calls || [];

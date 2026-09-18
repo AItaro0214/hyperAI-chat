@@ -314,6 +314,7 @@ export async function runTool(env, roomId, name, args, state, onOutput, options 
         'さらに下請けを立てることはできません。';
 
       const out = await runLoop({
+        env,
         provider,
         model: modelId,
         apiKey,
