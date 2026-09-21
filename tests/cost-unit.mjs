@@ -50,6 +50,13 @@ check('  usage ごとなくても 0', turnCost(groqModel, undefined) === 0);
 const before = Number({ prompt_tokens: 1e6, completion_tokens: 1e6 }.cost) || 0;
 check('以前は Groq が 0 円になっていた', before === 0 && turnCost(groqModel, usage) > 0, '0 → $5');
 
+/* ------------------------- router sentinel prices ----------------------- */
+// openrouter/auto and friends advertise -1000000 until they pick a model.
+const router = { provider: 'openrouter', pricing: { kind: 'chat', input_per_m: -1000000, output_per_m: -1000000 } };
+check('ルーターの番兵価格は見積もらない', estimateChatCost(router, usage) === null, String(estimateChatCost(router, usage)));
+check('  合計をマイナスにしない', turnCost(router, usage) === 0, String(turnCost(router, usage)));
+check('  請求額があればそれは使う', turnCost(router, { cost: 0.4, ...usage }) === 0.4);
+
 const passed = results.filter(([ok]) => ok).length;
 console.log('\n' + passed + '/' + results.length + ' passed');
 process.exit(passed === results.length ? 0 : 1);

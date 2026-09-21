@@ -9,6 +9,7 @@ import { postJson, OPENROUTER_BASE, GROQ_BASE, readProviderError } from './chat.
 import { getCatalog, findModel, turnCost } from './models.js';
 import { attribution } from './branding.js';
 import { TOOLS, parseArgs, toolResultMessage } from './agent.js';
+import { withCacheBreakpoints } from './cache.js';
 
 export const SUBAGENT_MAX_STEPS = 12;
 
@@ -17,7 +18,15 @@ export const subagentTools = () => TOOLS.filter((t) => t.function.name !== 'spaw
 
 export async function callProvider(provider, model, messages, apiKey, { temperature, tools } = {}) {
   const base = provider === 'groq' ? GROQ_BASE : OPENROUTER_BASE;
-  const body = { model, messages, tools: tools || TOOLS, tool_choice: 'auto', stream: false };
+  // Anthropic and Qwen only cache what a breakpoint marks; an agent loop
+  // re-sends its whole transcript every step, so this is most of the bill.
+  const body = {
+    model,
+    messages: withCacheBreakpoints(messages, { provider, model }),
+    tools: tools || TOOLS,
+    tool_choice: 'auto',
+    stream: false,
+  };
   if (temperature !== null && temperature !== undefined && temperature !== '') body.temperature = Number(temperature);
   if (provider === 'openrouter') body.usage = { include: true };
 

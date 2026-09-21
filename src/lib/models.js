@@ -224,6 +224,11 @@ export function outputTokens(usage) {
 export function estimateChatCost(model, usage) {
   if (!model?.pricing || !usage) return null;
   const p = model.pricing;
+  // Router models (openrouter/auto and friends) carry a sentinel price of
+  // -1000000 because the real rate depends on where they route. Estimating
+  // from it produces a large negative number that silently corrupts a run's
+  // total, so an unknown rate has to stay unknown.
+  if ((p.input_per_m || 0) < 0 || (p.output_per_m || 0) < 0) return null;
   const inTok = usage.prompt_tokens || 0;
   const outTok = outputTokens(usage);
   if (model.provider === 'openrouter') {

@@ -1,6 +1,7 @@
 import { getApiKey } from './store.js';
 import { attribution } from './branding.js';
 import { extractDocument, documentBlock, docKindOf } from './docs.js';
+import { withCacheBreakpoints } from './cache.js';
 
 export const OPENROUTER_BASE = 'https://openrouter.ai/api/v1';
 export const GROQ_BASE = 'https://api.groq.com/openai/v1';
@@ -267,7 +268,9 @@ export function clampEffort(provider, modelId, effort) {
 export function buildRequest({ provider, model, messages, options = {}, apiKey, stream = true, modelMeta }) {
   const notices = [];
   let effectiveModel = model;
-  const body = { model: effectiveModel, messages, stream };
+  // Long chats re-send the whole history; Claude and Qwen need to be told to
+  // cache it, everyone else already does.
+  const body = { model: effectiveModel, messages: withCacheBreakpoints(messages, { provider, model }), stream };
 
   // Unset temperature / token caps are simply omitted so the provider applies
   // its own defaults rather than our guesses.

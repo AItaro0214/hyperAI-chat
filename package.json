@@ -35,7 +35,8 @@
     "test:history": "node tests/history-unit.mjs",
     "test:generation": "node tests/generation-unit.mjs",
     "test:catalogue": "node tests/catalogue-unit.mjs",
-    "test:cost": "node tests/cost-unit.mjs"
+    "test:cost": "node tests/cost-unit.mjs",
+    "test:cache": "node tests/cache-unit.mjs"
   },
   "dependencies": {
     "@cloudflare/puppeteer": "^1.4.0",
