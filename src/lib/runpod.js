@@ -169,41 +169,62 @@ export async function health(apiKey, endpointId) {
 }
 
 /**
- * Sends one trivial completion to force a worker up, so the first real request
- * does not also pay for pulling the image and loading 16GB of weights.
+ * Brings a worker up, once.
  *
- * Reports progress rather than blocking silently: a cold start is minutes, and
- * a spinner with no numbers is indistinguishable from a hang.
+ * The obvious loop — send a request, give up, send another — piles jobs onto
+ * the queue: aborting the fetch does not cancel the job RunPod already
+ * accepted, and with one worker allowed each redundant "hi" is served in turn,
+ * spending GPU time on nothing. Loading 16GB takes minutes, which is longer
+ * than any sensible client timeout, so a retry is always the wrong move here.
+ *
+ * So exactly one request is sent and left to finish, and progress is reported
+ * from RunPod's health in parallel. Whichever settles first decides: the reply
+ * arriving means it is warm, and a worker reaching ready means the same.
  */
 export async function warm(apiKey, endpointId, { onProgress, timeoutMs = 900000 } = {}) {
   const started = Date.now();
   const base = openaiBase(endpointId);
-  let attempt = 0;
+  let done = false;
 
-  while (Date.now() - started < timeoutMs) {
-    attempt++;
-    const elapsed = Math.round((Date.now() - started) / 1000);
-    const workers = await health(apiKey, endpointId).catch(() => null);
-    onProgress?.({ elapsed, attempt, workers: workers?.workers || null });
-
-    const res = await fetch(base + '/chat/completions', {
-      method: 'POST',
-      headers: { authorization: 'Bearer ' + apiKey, 'content-type': 'application/json' },
-      body: JSON.stringify({ model: 'breakthrough', messages: [{ role: 'user', content: 'hi' }], max_tokens: 1 }),
-      signal: AbortSignal.timeout(Math.min(180000, timeoutMs)),
-    }).catch(() => null);
-
-    if (res?.ok) return { ready: true, seconds: Math.round((Date.now() - started) / 1000) };
-
-    // 4xx that is not a queue problem means the configuration is wrong, and
-    // waiting will not fix it.
-    if (res && res.status >= 400 && res.status < 500 && res.status !== 429) {
-      const detail = await res.text().catch(() => '');
+  const probe = fetch(base + '/chat/completions', {
+    method: 'POST',
+    headers: { authorization: 'Bearer ' + apiKey, 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'breakthrough', messages: [{ role: 'user', content: 'hi' }], max_tokens: 1 }),
+    signal: AbortSignal.timeout(timeoutMs),
+  }).then(async (res) => {
+    if (res.ok) return { ok: true };
+    const detail = await res.text().catch(() => '');
+    // A 4xx that is not a queue problem is a configuration error; waiting
+    // cannot fix it, so it is raised rather than retried.
+    if (res.status >= 400 && res.status < 500 && res.status !== 429) {
       throw new Error('エンドポイントが ' + res.status + ' を返しました。設定を確認してください: ' + detail.slice(0, 300));
     }
-    await new Promise((r) => setTimeout(r, 10000));
+    return { ok: false, status: res.status, detail };
+  });
+
+  const watch = (async () => {
+    while (!done && Date.now() - started < timeoutMs) {
+      const elapsed = Math.round((Date.now() - started) / 1000);
+      const h = await health(apiKey, endpointId).catch(() => null);
+      onProgress?.({ elapsed, workers: h?.workers || null, jobs: h?.jobs || null });
+      if (Number(h?.workers?.ready) > 0) return { ok: true };
+      await new Promise((r) => setTimeout(r, 10000));
+    }
+    return { ok: false, timedOut: true };
+  })();
+
+  try {
+    const result = await Promise.race([probe, watch]);
+    if (result.ok) return { ready: true, seconds: Math.round((Date.now() - started) / 1000) };
+    if (result.timedOut) {
+      throw new Error(
+        '起動が ' + Math.round(timeoutMs / 60000) + ' 分以内に完了しませんでした。GPU の在庫切れか、モデルが大きすぎる可能性があります。'
+      );
+    }
+    throw new Error('エンドポイントが ' + result.status + ' を返しました: ' + String(result.detail).slice(0, 300));
+  } finally {
+    done = true;
   }
-  throw new Error('起動が ' + Math.round(timeoutMs / 60000) + ' 分以内に完了しませんでした。GPU の在庫切れか、モデルが大きすぎる可能性があります。');
 }
 
 /** Sanity checks that would otherwise surface as a puzzling 400 minutes later. */
