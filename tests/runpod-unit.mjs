@@ -50,6 +50,8 @@ check('  ネットワークボリュームを付けない', !('networkVolumeId' 
 check('FlashBoot を有効化', e.flashboot === true, 'コールドスタート短縮');
 check('GPU を指定', e.gpuTypeIds[0] === 'NVIDIA GeForce RTX 4090');
 check('実行タイムアウトに余裕', e.executionTimeoutMs >= 600000, String(e.executionTimeoutMs) + 'ms');
+// A short idle timeout spends minutes of GPU re-loading 16GB to save cents.
+check('アイドル待機が短すぎない', e.idleTimeout >= 120, e.idleTimeout + '秒');
 check('  重み読み込み分を見込む', e.executionTimeoutMs / 60000 >= 10, Math.round(e.executionTimeoutMs / 60000) + '分');
 
 /* ------------------------------ validation ------------------------------- */

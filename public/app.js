@@ -1924,6 +1924,7 @@ async function renderBreakthroughTab(body) {
         '<label class="row" style="gap:6px"><input type="checkbox" id="bt-on"' + (bt.on ? ' checked' : '') + '>' +
         '<span class="sm">チャット・エージェントでこのモデルを使う</span></label>' +
         '<button class="btn" id="bt-warm">いま起動する</button>' +
+        '<button class="btn" id="bt-reset">キューを空にする</button>' +
         '<button class="btn danger" id="bt-destroy">破棄</button></div>' +
         '<p class="xs muted">初回は重みの読み込みで<b>5〜10分</b>かかります。' +
         'ここで起動を済ませておくと、チャットは待たずに応答します。</p>'
@@ -1965,6 +1966,19 @@ async function renderBreakthroughTab(body) {
     try {
       await api('/api/admin/breakthrough/warm', { method: 'POST', body: '{}' });
       pollBreakthrough(body);
+    } catch (err) {
+      msg(err.message, 'warn');
+      e.target.disabled = false;
+    }
+  });
+
+  $('#bt-reset')?.addEventListener('click', async (e) => {
+    e.target.disabled = true;
+    msg('溜まったジョブを破棄しています…');
+    try {
+      const r = await api('/api/admin/breakthrough/reset', { method: 'POST', body: '{}' });
+      msg('キューを空にしました（アイドル待機: ' + (r.idleTimeout || '?') + '秒）', 'ok');
+      setTimeout(() => renderBreakthroughTab(body), 1500);
     } catch (err) {
       msg(err.message, 'warn');
       e.target.disabled = false;

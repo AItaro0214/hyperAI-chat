@@ -33,7 +33,16 @@ export const DEFAULT_SPEC = {
   reasoningParser: 'qwen3',
   gpuMemoryUtilization: 0.95,
   workersMax: 1,
-  idleTimeout: 30,
+  /* Five minutes, not thirty seconds.
+   *
+   * A short idle timeout is right when a worker restarts in seconds. This one
+   * loads 16GB, so scaling down between two messages of the same conversation
+   * buys a few cents of idle and spends minutes of GPU re-initialising — and
+   * the endpoint visibly flaps between "ready" and "running" while a queue
+   * builds behind it. Holding the worker through a conversation is both faster
+   * and cheaper; it still scales to zero once the conversation is actually
+   * over. */
+  idleTimeout: 300,
   executionTimeoutMs: 900000,
 };
 
@@ -156,6 +165,27 @@ export async function destroy(apiKey, { endpointId, templateId } = {}) {
     removed.template = true;
   }
   return removed;
+}
+
+/** Drops queued jobs. Used to clear a backlog that is only costing GPU time. */
+export async function purgeQueue(apiKey, endpointId) {
+  const res = await fetch(RUN + '/' + endpointId + '/purge-queue', {
+    method: 'POST',
+    headers: { authorization: 'Bearer ' + apiKey, 'content-type': 'application/json' },
+    signal: AbortSignal.timeout(30000),
+  });
+  const text = await res.text();
+  if (!res.ok) throw new Error('RunPod purge-queue → ' + res.status + ': ' + text.slice(0, 200));
+  try {
+    return JSON.parse(text);
+  } catch {
+    return { status: 'ok' };
+  }
+}
+
+/** Changes a live endpoint's settings without recreating it. */
+export async function updateEndpoint(apiKey, endpointId, patch) {
+  return call(apiKey, '/endpoints/' + endpointId, { method: 'PATCH', body: patch });
 }
 
 /** Worker counts, as the platform sees them. */

@@ -37,7 +37,17 @@ import { GROQ_PRICING } from '../data/groq-pricing.js';
 import { getGroqPricing } from '../lib/models.js';
 import { GROQ_BASE, OPENROUTER_BASE } from '../lib/chat.js';
 import { XAI_BASE } from '../lib/xai.js';
-import { provision, destroy, warm, health, validateSpec, DEFAULT_SPEC, VLLM_IMAGE } from '../lib/runpod.js';
+import {
+  provision,
+  destroy,
+  warm,
+  health,
+  purgeQueue,
+  updateEndpoint,
+  validateSpec,
+  DEFAULT_SPEC,
+  VLLM_IMAGE,
+} from '../lib/runpod.js';
 import { BACKENDS, BACKEND_NOTES } from '../lib/search.js';
 
 const admin = new Hono();
@@ -330,6 +340,31 @@ admin.post('/breakthrough/warm', async (c) => {
   await writeWarming(c.env, started);
   c.executionCtx.waitUntil(runWarm(c.env, key, settings.runpodEndpointId));
   return c.json({ ok: true, warming: started }, 202);
+});
+
+/* The queue outlives the thing that filled it, so it needs a way out. Also
+ * applies the current idleTimeout, so an endpoint created with the old
+ * thirty-second value can be corrected without being rebuilt. */
+admin.post('/breakthrough/reset', async (c) => {
+  const settings = await getSettings(c.env);
+  const key = await getApiKey(c.env, 'RUNPOD_API_KEY');
+  if (!key) return c.json({ error: 'RUNPOD_API_KEY が未登録です' }, 400);
+  if (!settings.runpodEndpointId) return c.json({ error: 'エンドポイントがありません' }, 400);
+
+  const done = {};
+  try {
+    done.purged = await purgeQueue(key, settings.runpodEndpointId);
+  } catch (e) {
+    done.purgeError = e.message;
+  }
+  try {
+    await updateEndpoint(key, settings.runpodEndpointId, { idleTimeout: DEFAULT_SPEC.idleTimeout });
+    done.idleTimeout = DEFAULT_SPEC.idleTimeout;
+  } catch (e) {
+    done.patchError = e.message;
+  }
+  await writeWarming(c.env, null);
+  return c.json({ ok: true, ...done });
 });
 
 admin.post('/breakthrough/destroy', async (c) => {
