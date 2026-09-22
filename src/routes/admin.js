@@ -44,6 +44,7 @@ import {
   health,
   purgeQueue,
   updateEndpoint,
+  diagnose,
   validateSpec,
   DEFAULT_SPEC,
   VLLM_IMAGE,
@@ -366,6 +367,18 @@ admin.post('/breakthrough/reset', async (c) => {
   }
   await writeWarming(c.env, null);
   return c.json({ ok: true, ...done });
+});
+
+admin.post('/breakthrough/diagnose', async (c) => {
+  const settings = await getSettings(c.env);
+  const key = await getApiKey(c.env, 'RUNPOD_API_KEY');
+  if (!key) return c.json({ error: 'RUNPOD_API_KEY が未登録です' }, 400);
+  if (!settings.runpodEndpointId) return c.json({ error: 'エンドポイントがありません' }, 400);
+  try {
+    return c.json(await diagnose(key, settings.runpodEndpointId));
+  } catch (e) {
+    return c.json({ error: e.message }, 502);
+  }
 });
 
 admin.post('/breakthrough/destroy', async (c) => {

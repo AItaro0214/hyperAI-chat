@@ -257,6 +257,66 @@ export async function warm(apiKey, endpointId, { onProgress, timeoutMs = 900000 
   }
 }
 
+/**
+ * Everything knowable about an endpoint from outside it.
+ *
+ * A 500 from the OpenAI path says nothing about why, and the reason is almost
+ * always that vLLM refused to start — a parser name it does not recognise, a
+ * quantisation that does not match the weights. What that leaves behind is an
+ * unhealthy worker count and, usually, a detail string in the raw body. Both
+ * are collected here rather than guessed at.
+ */
+export async function diagnose(apiKey, endpointId) {
+  const out = { endpointId };
+
+  out.endpoint = await call(apiKey, '/endpoints/' + endpointId).catch((e) => ({ error: e.message }));
+  if (out.endpoint?.templateId) {
+    const t = await call(apiKey, '/templates/' + out.endpoint.templateId).catch((e) => ({ error: e.message }));
+    out.template = t?.error
+      ? t
+      : {
+          imageName: t?.imageName,
+          // A token would be a secret; the rest is configuration.
+          env: Object.fromEntries(
+            Object.entries(t?.env || {}).map(([k, v]) => [k, /TOKEN|KEY/i.test(k) ? '（設定あり）' : v])
+          ),
+        };
+    if (out.template.env) {
+      const expected = templateBody().env;
+      out.drift = Object.keys(expected).filter((k) => String(out.template.env[k]) !== String(expected[k]));
+    }
+  }
+
+  out.health = await health(apiKey, endpointId).catch((e) => ({ error: e.message }));
+
+  // The decisive part: what the endpoint actually says when asked.
+  const started = Date.now();
+  try {
+    const res = await fetch(openaiBase(endpointId) + '/chat/completions', {
+      method: 'POST',
+      headers: { authorization: 'Bearer ' + apiKey, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'breakthrough',
+        messages: [{ role: 'user', content: 'ping' }],
+        max_tokens: 8,
+        stream: false,
+        chat_template_kwargs: { enable_thinking: false },
+      }),
+      signal: AbortSignal.timeout(180000),
+    });
+    out.probe = {
+      status: res.status,
+      seconds: Math.round((Date.now() - started) / 1000),
+      body: (await res.text()).slice(0, 3000),
+    };
+  } catch (e) {
+    out.probe = { error: String(e.message).slice(0, 400), seconds: Math.round((Date.now() - started) / 1000) };
+  }
+
+  out.expected = DEFAULT_SPEC;
+  return out;
+}
+
 /** Sanity checks that would otherwise surface as a puzzling 400 minutes later. */
 export function validateSpec(spec = {}) {
   const s = { ...DEFAULT_SPEC, ...spec };

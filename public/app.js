@@ -1927,6 +1927,7 @@ async function renderBreakthroughTab(body) {
         '<span class="sm">チャット・エージェントでこのモデルを使う</span></label>' +
         '<button class="btn" id="bt-warm">いま起動する</button>' +
         '<button class="btn" id="bt-reset">キューを空にする</button>' +
+        '<button class="btn" id="bt-diag">診断</button>' +
         '<button class="btn danger" id="bt-destroy">破棄</button></div>' +
         '<p class="xs muted">初回は重みの読み込みで<b>5〜10分</b>かかります。' +
         'ここで起動を済ませておくと、チャットは待たずに応答します。</p>'
@@ -1985,6 +1986,31 @@ async function renderBreakthroughTab(body) {
       msg(err.message, 'warn');
       e.target.disabled = false;
     }
+  });
+
+  $('#bt-diag')?.addEventListener('click', async (e) => {
+    e.target.disabled = true;
+    msg('調べています（最大3分）…');
+    let out;
+    try {
+      out = await api('/api/admin/breakthrough/diagnose', { method: 'POST', body: '{}' });
+    } catch (err) {
+      msg(err.message, 'warn');
+      e.target.disabled = false;
+      return;
+    }
+    e.target.disabled = false;
+    msg('');
+    // Shown raw and copyable: the useful part is whatever was not expected.
+    const pre = el('pre', 'diag');
+    pre.textContent = JSON.stringify(out, null, 2);
+    const old = $('#bt-diag-out');
+    if (old) old.remove();
+    const box = el('div', null);
+    box.id = 'bt-diag-out';
+    const hint = el('p', 'xs muted', 'この内容をそのまま貼ってもらえれば原因を特定できます。');
+    box.append(hint, pre);
+    body.appendChild(box);
   });
 
   $('#bt-destroy')?.addEventListener('click', async (e) => {

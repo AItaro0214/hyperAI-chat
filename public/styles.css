@@ -829,3 +829,18 @@ table.data td.num { text-align: right; font-family: var(--mono); font-size: 12.5
   background-color: color-mix(in srgb, #7b61ff 12%, var(--glass-strong));
   color: var(--ink);
 }
+
+/* Diagnostic output: dense, copyable, and not pretending to be prose. */
+pre.diag {
+  margin: 8px 0 0;
+  padding: 12px 14px;
+  background: rgba(20, 22, 34, .04);
+  border: 1px solid var(--line-soft);
+  border-radius: 12px;
+  font: 11.5px/1.6 var(--mono);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 460px;
+  overflow: auto;
+  user-select: all;
+}
