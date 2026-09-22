@@ -2001,8 +2001,8 @@ async function renderBreakthroughTab(body) {
     searchRows +
     '<div class="field" style="margin-top:10px"><label for="bt-rounds">検索の往復回数（1〜10）</label>' +
     '<input class="input" id="bt-rounds" type="number" min="1" max="10" value="' + (bt.search.rounds ?? 2) + '"></div>' +
-    '<p class="xs muted">回答の長さは既定で 4096 トークンに制限しています（設定の「最大トークン」で変更可）。' +
-    '自前モデルは上限がないと文脈を使い切るまで書き続けることがあり、応答が届かなくなります。</p>' +
+    '<p class="xs muted">回答は既定で 16384 トークンまで。応答は逐次表示されるので、長い回答も書かれていく様子が見えます。' +
+    '上限は設定の「最大トークン」で変更できます。</p>' +
     '<p class="xs muted">モデルが納得するまで調べさせたい場合は増やします。' +
     '1往復ごとにモデルへの問い合わせと検索が走るので、<b>自前GPUでは1回あたり数十秒</b>かかります。' +
     '同じ検索を繰り返した時点、または4分経過した時点で自動的に打ち切ります。</p>' +

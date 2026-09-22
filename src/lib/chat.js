@@ -282,14 +282,14 @@ export function buildRequest({ provider, model, messages, options = {}, apiKey, 
    * OpenRouter features, and sending them to vLLM is at best ignored and at
    * worst a 400. Search is handled before the request instead, by xAI. */
   if (breakthrough?.baseUrl) {
-    /* Not streamed.
+    /* Streamed, like everything else.
      *
-     * RunPod Serverless is job-based, and its OpenAI-compatible path did not
-     * deliver SSE the way a plain vLLM server does: a request that returned
-     * 200 after 164 seconds produced no deltas at all — no content, no
-     * reasoning, no token counts. One JSON body is slower to appear and
-     * actually arrives. */
-    const btBody = { model: breakthrough.model || 'breakthrough', messages, stream: false };
+     * This was briefly switched off after a request returned 200 with no
+     * deltas — but the endpoint was failing to start at the time, so there
+     * was no output to deliver rather than any problem reading it. Checked
+     * against a working worker, the OpenAI path returns ordinary SSE: first
+     * chunk under a second, standard framing. */
+    const btBody = { model: breakthrough.model || 'breakthrough', messages, stream };
     if (options.temperature !== null && options.temperature !== undefined && options.temperature !== '') {
       btBody.temperature = Number(options.temperature);
     }
@@ -300,9 +300,11 @@ export function buildRequest({ provider, model, messages, options = {}, apiKey, 
      * it runs out of context — 32K minus a long prompt is some eighteen
      * thousand tokens, and at twenty a second that is a quarter of an hour of
      * GPU spent on a reply nobody asked to be that long. Worse here than
-     * elsewhere because the request is not streamed: nothing appears at all
-     * until it finishes. */
-    btBody.max_tokens = Number(options.maxTokens) > 0 ? Number(options.maxTokens) : 4096;
+     * Generous rather than tight: with the reply streaming, a long answer is
+     * watchable and can be stopped, so the cap only has to prevent the runaway
+     * case. */
+    if (stream) btBody.stream_options = { include_usage: true };
+    btBody.max_tokens = Number(options.maxTokens) > 0 ? Number(options.maxTokens) : 16384;
     /* The one reasoning control a self-hosted Qwen has: thinking on or off,
      * passed through the chat template rather than as a top-level field. */
     /* Off unless asked for. Qwen thinks by default, and on a 27B model on one

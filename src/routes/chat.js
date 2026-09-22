@@ -540,8 +540,8 @@ chat.post('/chat', async (c) => {
            * a hang. */
           const what =
             secs < 60
-              ? 'GPU が応答を生成しています… ' + secs + '秒'
-              : '生成中… ' + Math.floor(secs / 60) + '分' + (secs % 60) + '秒（起動直後は重みの読み込みで数分かかります）';
+              ? 'GPU の応答を待っています… ' + secs + '秒'
+              : '起動中… ' + Math.floor(secs / 60) + '分' + (secs % 60) + '秒（重みの読み込みに数分かかります）';
           emit('meta', { notices: [what] }).catch(() => {});
         }, 10000);
       }
@@ -589,43 +589,6 @@ chat.post('/chat', async (c) => {
         await emit('error', { message: failed });
       }
       if (!failed) {
-        /* Breakthrough replies come back whole, so they are handed to the
-         * same callbacks as one piece rather than parsed as a stream. */
-        if (breakthroughOn) {
-          const whole = await upstream.json().catch(() => null);
-          const msg = whole?.choices?.[0]?.message || {};
-          usage = whole?.usage || null;
-          const think = msg.reasoning_content || msg.reasoning || '';
-          if (think) {
-            reasoning += think;
-            await setPhase('thinking');
-            await emit('reasoning', { text: think });
-          }
-          if (msg.content) {
-            text += msg.content;
-            await setPhase('writing');
-            await emit('delta', { text: msg.content });
-          }
-          /* A tool call on the final turn is parsed out of content and, with
-           * no tools offered, has nowhere to go — so the reply arrives empty
-           * with the tokens already spent. Render it rather than lose it. */
-          if (!msg.content && !think && msg.tool_calls?.length) {
-            const asked = msg.tool_calls
-              .map((t) => t.function?.name + '(' + String(t.function?.arguments || '').slice(0, 120) + ')')
-              .join(', ');
-            const note = 'モデルはさらに ' + asked + ' を実行しようとしましたが、検索は既に打ち切られています。';
-            text += note;
-            await emit('delta', { text: note });
-          } else if (!msg.content && !think) {
-            failed =
-              'モデルが空の応答を返しました（出力 ' +
-              (whole?.usage?.completion_tokens ?? '?') +
-              ' トークン）: ' +
-              JSON.stringify(whole || {}).slice(0, 500);
-            await emit('error', { message: failed });
-          }
-          await savePartial(false);
-        } else
         await consumeChatStream(upstream, {
           onText: async (t) => {
             text += t;
