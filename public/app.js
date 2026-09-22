@@ -1914,9 +1914,11 @@ async function renderBreakthroughTab(body) {
           ? '<span class="warn">起動失敗: ' + esc(bt.warming.error) + '</span>'
           : bt.warming?.ready
             ? '<span class="ok">起動済み（' + bt.warming.seconds + '秒）</span>'
-            : bt.warming
-              ? '起動中… ' + (bt.warming.elapsed || 0) + '秒'
-              : '待機中（次のリクエストで起動します）') +
+            : bt.warming?.stalled
+              ? '<span class="warn">開始から ' + bt.warming.elapsed + '秒。ワーカーが動いていません — もう一度押してください</span>'
+              : bt.warming
+                ? '起動中… ' + bt.warming.elapsed + '秒（上のワーカー行が実際の状態です）'
+                : '待機中（次のリクエストで起動します）') +
         '</dd></div>' +
         '<div class="row" style="margin-top:12px;flex-wrap:wrap">' +
         '<label class="row" style="gap:6px"><input type="checkbox" id="bt-on"' + (bt.on ? ' checked' : '') + '>' +

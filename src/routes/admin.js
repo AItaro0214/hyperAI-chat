@@ -203,6 +203,35 @@ const WARM_KEY = 'runpodWarming';
 const readWarming = (env) => getJsonSetting(env, WARM_KEY, null);
 const writeWarming = (env, value) => setJsonSetting(env, WARM_KEY, value);
 
+/**
+ * The warm-up as it can honestly be described.
+ *
+ * The polling loop runs inside waitUntil, which lives for seconds after the
+ * response rather than the minutes a cold start takes — so the elapsed value
+ * it writes stops updating almost immediately and the console sat at "0秒"
+ * while a worker was in fact loading. The start time is written once and is
+ * reliable, so elapsed is computed from it here instead of being trusted from
+ * the record, and RunPod's live worker counts decide whether it is still
+ * happening at all.
+ */
+async function describeWarming(env, live) {
+  const record = await readWarming(env);
+  if (!record) return null;
+
+  const elapsed = Math.round((Date.now() - record.started) / 1000);
+  if (record.error) return { ...record, elapsed };
+  if (record.ready || Number(live?.ready) > 0) {
+    return { ...record, elapsed, ready: true, seconds: record.seconds ?? elapsed };
+  }
+
+  // No worker, no queue and no error: whatever was started is not running.
+  const busy = Number(live?.starting) + Number(live?.running) + Number(live?.inQueue);
+  if (live && !busy) {
+    return { ...record, elapsed, stalled: true };
+  }
+  return { ...record, elapsed };
+}
+
 /** Drives the warm-up, recording progress where any instance can read it. */
 async function runWarm(env, key, endpointId) {
   const base = await readWarming(env);
@@ -249,7 +278,7 @@ admin.get('/breakthrough', async (c) => {
     search: { backend: settings.searchBackend || 'ollama', searxngUrl: settings.searxngUrl || '', backends: BACKENDS, notes: BACKEND_NOTES },
     spec: DEFAULT_SPEC,
     image: VLLM_IMAGE,
-    warming: await readWarming(c.env),
+    warming: await describeWarming(c.env, live),
   });
 });
 
