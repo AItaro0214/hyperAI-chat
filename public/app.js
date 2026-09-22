@@ -1898,7 +1898,18 @@ async function renderBreakthroughTab(body) {
     (bt.endpointId
       ? '<div class="kv"><dt>エンドポイント</dt><dd><code>' + esc(bt.endpointId) + '</code></dd>' +
         '<dt>モデル名</dt><dd><code>' + esc(bt.model || '') + '</code></dd>' +
-        '<dt>状態</dt><dd id="bt-state">' +
+        '<dt>ワーカー</dt><dd>' +
+        (bt.live?.error
+          ? '<span class="warn">確認できません: ' + esc(bt.live.error) + '</span>'
+          : bt.live
+            ? (bt.live.ready ? '<span class="ok">応答可能 ' + bt.live.ready + '台</span>' : '') +
+              (bt.live.starting ? ' <span class="warn">起動中 ' + bt.live.starting + '台</span>' : '') +
+              (bt.live.running ? ' 実行中 ' + bt.live.running + '台' : '') +
+              (bt.live.inQueue ? ' / 待ち ' + bt.live.inQueue + '件' : '') +
+              (!bt.live.ready && !bt.live.starting && !bt.live.running ? '停止中（次のリクエストで起動）' : '')
+            : '—') +
+        '</dd>' +
+        '<dt>起動処理</dt><dd id="bt-state">' +
         (bt.warming?.error
           ? '<span class="warn">起動失敗: ' + esc(bt.warming.error) + '</span>'
           : bt.warming?.ready

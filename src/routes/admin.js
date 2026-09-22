@@ -36,7 +36,7 @@ import { GROQ_PRICING } from '../data/groq-pricing.js';
 import { getGroqPricing } from '../lib/models.js';
 import { GROQ_BASE, OPENROUTER_BASE } from '../lib/chat.js';
 import { XAI_BASE } from '../lib/xai.js';
-import { provision, destroy, warm, validateSpec, DEFAULT_SPEC, VLLM_IMAGE } from '../lib/runpod.js';
+import { provision, destroy, warm, health, validateSpec, DEFAULT_SPEC, VLLM_IMAGE } from '../lib/runpod.js';
 import { BACKENDS, BACKEND_NOTES } from '../lib/search.js';
 
 const admin = new Hono();
@@ -190,7 +190,31 @@ let warming = null;
 
 admin.get('/breakthrough', async (c) => {
   const settings = await getSettings(c.env);
+
+  /* The warm-up progress above lives in module memory, which does not survive
+   * a Worker eviction — so on its own it will happily report "idle" while a
+   * worker is in fact starting. RunPod knows the truth; ask it. */
+  let live = null;
+  if (settings.runpodEndpointId) {
+    const key = await getApiKey(c.env, 'RUNPOD_API_KEY');
+    if (key) {
+      live = await health(key, settings.runpodEndpointId)
+        .then((h) => ({
+          workers: h.workers || null,
+          jobs: h.jobs || null,
+          // "ready" is a worker that can answer now; "initializing" is one
+          // still pulling the image or loading weights.
+          ready: Number(h.workers?.ready) || 0,
+          starting: (Number(h.workers?.initializing) || 0) + (Number(h.workers?.throttled) || 0),
+          running: Number(h.workers?.running) || 0,
+          inQueue: Number(h.jobs?.inQueue) || 0,
+        }))
+        .catch((e) => ({ error: String(e.message).slice(0, 200) }));
+    }
+  }
+
   return c.json({
+    live,
     on: !!settings.breakthrough,
     endpointId: settings.runpodEndpointId || null,
     model: settings.runpodModel || null,
