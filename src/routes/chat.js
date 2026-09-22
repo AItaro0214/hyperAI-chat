@@ -507,7 +507,12 @@ chat.post('/chat', async (c) => {
         }, 10000);
       }
 
-      let upstream = await postJson(req.url, req.headers, req.body).finally(() => clearInterval(keepalive));
+      // Matches the endpoint's own executionTimeoutMs; anything shorter gives
+      // up on a cold start that the endpoint was still allowed to finish.
+      const upstreamTimeout = breakthroughOn ? 900000 : undefined;
+      let upstream = await postJson(req.url, req.headers, req.body, upstreamTimeout).finally(() =>
+        clearInterval(keepalive)
+      );
       if (!upstream.ok) {
         const detail = await readProviderError(upstream);
         // Fetched web pages can blow past the window; one retry with just the
@@ -528,7 +533,7 @@ chat.post('/chat', async (c) => {
             notices: req.notices,
             title: roomTitle,
           });
-          upstream = await postJson(req.url, req.headers, req.body);
+          upstream = await postJson(req.url, req.headers, req.body, upstreamTimeout);
         }
         if (!upstream.ok) {
           const body = isContextError(detail) ? await readProviderError(upstream) : detail;

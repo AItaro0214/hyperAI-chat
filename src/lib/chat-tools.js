@@ -65,7 +65,7 @@ export function thinkingFor(effort) {
  * @param {(phase: string, detail?: object) => Promise<void>|void} [config.onPhase]
  * @returns {Promise<{messages: object[], calls: string[], rounds: number}>}
  */
-export async function resolveTools({ url, headers, body, execute, onPhase, maxRounds = MAX_ROUNDS }) {
+export async function resolveTools({ url, headers, body, execute, onPhase, maxRounds = MAX_ROUNDS, timeoutMs = 900000 }) {
   const messages = body.messages.slice();
   const calls = [];
   let rounds = 0;
@@ -85,7 +85,8 @@ export async function resolveTools({ url, headers, body, execute, onPhase, maxRo
       method: 'POST',
       headers,
       body: JSON.stringify(probe),
-      signal: AbortSignal.timeout(300000),
+      // A cold GPU answers the first request in minutes, not seconds.
+      signal: AbortSignal.timeout(timeoutMs),
     });
     // A model or endpoint that cannot do tools should still be able to answer,
     // so a failure here is not fatal: fall through with what we have.

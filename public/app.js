@@ -1910,7 +1910,10 @@ async function renderBreakthroughTab(body) {
         '<div class="row" style="margin-top:12px;flex-wrap:wrap">' +
         '<label class="row" style="gap:6px"><input type="checkbox" id="bt-on"' + (bt.on ? ' checked' : '') + '>' +
         '<span class="sm">チャット・エージェントでこのモデルを使う</span></label>' +
-        '<button class="btn danger" id="bt-destroy">破棄</button></div>'
+        '<button class="btn" id="bt-warm">いま起動する</button>' +
+        '<button class="btn danger" id="bt-destroy">破棄</button></div>' +
+        '<p class="xs muted">初回は重みの読み込みで<b>5〜10分</b>かかります。' +
+        'ここで起動を済ませておくと、チャットは待たずに応答します。</p>'
       : '<div class="kv"><dt>モデル</dt><dd><code>' + esc(bt.spec.model) + '</code></dd>' +
         '<dt>GPU</dt><dd>' + esc(bt.spec.gpu) + ' / ' + esc(bt.spec.quantization.toUpperCase()) + '</dd>' +
         '<dt>イメージ</dt><dd><code>' + esc(bt.image) + '</code></dd></div>' +
@@ -1936,6 +1939,18 @@ async function renderBreakthroughTab(body) {
     msg('作成中…');
     try {
       await api('/api/admin/breakthrough/provision', { method: 'POST', body: '{}' });
+      pollBreakthrough(body);
+    } catch (err) {
+      msg(err.message, 'warn');
+      e.target.disabled = false;
+    }
+  });
+
+  $('#bt-warm')?.addEventListener('click', async (e) => {
+    e.target.disabled = true;
+    msg('起動を開始しました。数分かかります…');
+    try {
+      await api('/api/admin/breakthrough/warm', { method: 'POST', body: '{}' });
       pollBreakthrough(body);
     } catch (err) {
       msg(err.message, 'warn');

@@ -240,6 +240,22 @@ admin.post('/breakthrough/provision', async (c) => {
   return c.json({ ...created, spec }, 202);
 });
 
+admin.post('/breakthrough/warm', async (c) => {
+  const settings = await getSettings(c.env);
+  const key = await getApiKey(c.env, 'RUNPOD_API_KEY');
+  if (!key) return c.json({ error: 'RUNPOD_API_KEY が未登録です' }, 400);
+  if (!settings.runpodEndpointId) return c.json({ error: 'エンドポイントがありません' }, 400);
+  if (warming && !warming.ready && !warming.error) return c.json({ ok: true, already: true, warming });
+
+  warming = { started: Date.now(), elapsed: 0, ready: false, error: null };
+  c.executionCtx.waitUntil(
+    warm(key, settings.runpodEndpointId, { onProgress: (p) => { warming = { ...warming, ...p }; } })
+      .then((r) => { warming = { ...warming, ready: true, seconds: r.seconds }; })
+      .catch((e) => { warming = { ...warming, error: e.message }; })
+  );
+  return c.json({ ok: true, warming }, 202);
+});
+
 admin.post('/breakthrough/destroy', async (c) => {
   const settings = await getSettings(c.env);
   const key = await getApiKey(c.env, 'RUNPOD_API_KEY');
