@@ -2024,14 +2024,13 @@ function pollBreakthrough(body) {
   btTimer = setInterval(async () => {
     const bt = await api('/api/admin/breakthrough').catch(() => null);
     if (!bt) return;
-    if (!bt.warming || bt.warming.ready || bt.warming.error) {
+    // A full re-render, because the worker counts are part of the answer and
+    // patching one cell would leave them stale.
+    if (!bt.warming?.starting) {
       clearInterval(btTimer);
-      renderBreakthroughTab(body);
-      return;
     }
-    const cell = $('#bt-state');
-    if (cell) cell.textContent = '起動中… ' + (bt.warming.elapsed || 0) + '秒（重みの読み込みに数分かかります）';
-  }, 5000);
+    renderBreakthroughTab(body);
+  }, 8000);
 }
 
 async function renderGroqTab(body) {
