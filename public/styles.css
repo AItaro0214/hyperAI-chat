@@ -822,3 +822,10 @@ table.data td.num { text-align: right; font-family: var(--mono); font-size: 12.5
 .agent-trace[open] > summary::before { content: '▾ '; }
 .agent-trace > summary:hover { color: var(--ink-2); }
 .agent-trace[open] > summary { margin-bottom: 8px; }
+
+/* The model chip while a self-hosted model is in charge: the picker is inert. */
+.chip.model.breakthrough {
+  border-color: color-mix(in srgb, #7b61ff 55%, transparent);
+  background-color: color-mix(in srgb, #7b61ff 12%, var(--glass-strong));
+  color: var(--ink);
+}

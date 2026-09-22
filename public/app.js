@@ -264,6 +264,10 @@ async function boot() {
   $('#login-view').hidden = true;
   $('#app-view').hidden = false;
   $('#whoami').textContent = state.me.email;
+  // Whether the self-hosted model is in charge decides what the picker shows.
+  state.breakthrough = await api('/api/admin/breakthrough')
+    .then((bt) => !!bt.on && !!bt.endpointId)
+    .catch(() => false);
   await Promise.all([loadRooms(), loadModels()]);
   const first = state.rooms[0];
   if (first) await openRoom(first.id);
@@ -1163,6 +1167,15 @@ async function loadModels(force = false) {
 const modelByRef = (ref) => state.catalog.find((m) => m.ref === ref) || null;
 
 function setModelLabel(provider, model) {
+  /* Breakthrough mode overrides the room's model, so showing the room's choice
+   * would be a lie: the picker is inert until it is switched off. */
+  if (state.breakthrough) {
+    $('#model-label').textContent = '自前GPU（ブレイクスルー）';
+    $('#model-btn').title = 'ブレイクスルーモード中はモデル選択が無効です（管理コンソールで切り替えられます）';
+    $('#model-btn').classList.add('breakthrough');
+    return;
+  }
+  $('#model-btn').classList.remove('breakthrough');
   const meta = modelByRef(provider + ':' + model);
   $('#model-label').textContent = meta ? meta.name.replace(/^[^:]+:\s*/, '') : (model || '').split('/').pop() || 'モデル';
   $('#model-btn').title = (provider || '') + ' / ' + (model || '');
@@ -1945,6 +1958,8 @@ async function renderBreakthroughTab(body) {
 
   $('#bt-on')?.addEventListener('change', async (e) => {
     await api('/api/admin/settings', { method: 'POST', body: JSON.stringify({ breakthrough: e.target.checked }) });
+    state.breakthrough = e.target.checked;
+    setModelLabel(state.room?.provider, state.room?.model);
     msg(e.target.checked ? 'ブレイクスルーモードを有効にしました' : '通常のモデルに戻しました', 'ok');
   });
 
