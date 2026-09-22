@@ -474,17 +474,39 @@ chat.post('/chat', async (c) => {
             return emit('meta', { notices: [text] }).catch(() => {});
           },
           execute: async (name, args) => {
+            /* A failed search is reported to the reader as well as to the
+             * model. Left to the tool result alone it is invisible: the model
+             * quietly answers from memory and the reply reads as merely wrong
+             * rather than uninformed. */
             if (name === 'web_search') {
-              const found = await webSearch2(c.env, {
-                query: args.query,
-                maxResults: args.max_results || Number(settings.webSearchMaxResults) || 5,
-                backend: settings.searchBackend || 'ollama',
-              });
-              return formatResults(found);
+              try {
+                const found = await webSearch2(c.env, {
+                  query: args.query,
+                  maxResults: args.max_results || Number(settings.webSearchMaxResults) || 5,
+                  backend: settings.searchBackend || 'ollama',
+                });
+                await emit('meta', {
+                  notices: [
+                    '検索（' + found.backend + '）: ' + found.results.length + '件 — ' + String(args.query).slice(0, 60),
+                  ],
+                });
+                return formatResults(found);
+              } catch (err) {
+                const why =
+                  '検索に失敗しました（' + (settings.searchBackend || 'ollama') + '）: ' + String(err.message).slice(0, 200);
+                await emit('meta', { notices: [why] });
+                return why + ' 検索結果は得られませんでした。分かる範囲で答えるか、分からないと伝えてください。';
+              }
             }
             if (name === 'web_fetch') {
-              const page = await webFetch2(c.env, { url: args.url });
-              return [page.title, page.url, '', page.content].join('\n');
+              try {
+                const page = await webFetch2(c.env, { url: args.url });
+                return [page.title, page.url, '', page.content].join('\n');
+              } catch (err) {
+                const why = 'ページを取得できませんでした: ' + String(err.message).slice(0, 200);
+                await emit('meta', { notices: [why] });
+                return why;
+              }
             }
             return '未知のツールです: ' + name;
           },

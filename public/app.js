@@ -1005,6 +1005,43 @@ function createStreamView(model) {
   });
 }
 
+/**
+ * Waits for a reply the connection dropped in the middle of.
+ *
+ * Generation continues server-side in waitUntil and the row is written as it
+ * goes, so the answer is already being paid for whether or not anything is
+ * watching. This watches: it polls the row until it stops being marked
+ * partial, then lets the caller re-render.
+ */
+async function followUnfinished(roomId, messageId, { tries = 120, everyMs = 3000 } = {}) {
+  toast('接続が切れましたが、応答は続いています。取得しています…');
+  for (let i = 0; i < tries; i++) {
+    await new Promise((r) => setTimeout(r, everyMs));
+    let res;
+    try {
+      res = await api('/api/rooms/' + roomId);
+    } catch {
+      continue; // a transient failure should not abandon a live reply
+    }
+    const row = (res.messages || []).find((m) => m.id === messageId);
+    if (!row) continue;
+
+    // Render what has arrived so far, so a long reply is visible while it lands.
+    state.room = res.room;
+    state.messages = res.messages;
+    renderMessages();
+
+    const partial = row.meta?.partial === true;
+    if (!partial) {
+      if (row.error) toast(row.error, 'err');
+      else if (row.content) toast('応答を取得しました');
+      return true;
+    }
+  }
+  toast('応答の取得を諦めました。ルームを開き直すと続きが見られることがあります。', 'err');
+  return false;
+}
+
 async function send({ content = '', attachments = [], regenerate = false }) {
   if (state.streaming) return;
   state.streaming = true;
@@ -1061,6 +1098,15 @@ async function send({ content = '', attachments = [], regenerate = false }) {
   let aborted = false;
   let metaNotices = [];
   let streamError = null;
+  /* The server finishes on its own.
+   *
+   * Generation runs inside waitUntil and writes the row as it goes, so a
+   * dropped connection — a closed tab, a backgrounded phone — costs nothing
+   * but the view of it. What used to happen is that the reload in `finally`
+   * arrived while the row was still being written, found it empty, and left
+   * the reply on the floor even though it was paid for and arriving. */
+  let pendingMessageId = null;
+  let sawDone = false;
   try {
     const res = await fetch('/api/chat', {
       method: 'POST',
@@ -1093,6 +1139,7 @@ async function send({ content = '', attachments = [], regenerate = false }) {
         const p = JSON.parse(data);
         if (event === 'meta') {
           metaNotices = p.notices || [];
+          if (p.messageId) pendingMessageId = p.messageId;
           view.setModel(p.model);
           if (!state.roomId) state.roomId = p.roomId;
           if (p.title && p.title !== $('#room-title').value) {
@@ -1114,6 +1161,7 @@ async function send({ content = '', attachments = [], regenerate = false }) {
           // cover the thread.
           streamError = p.message;
         } else if (event === 'done') {
+          sawDone = true;
           const extra = (p.notices || []).filter((n) => !metaNotices.includes(n));
           if (extra.length) toast(extra.join(' / '), 'err');
         }
@@ -1132,6 +1180,10 @@ async function send({ content = '', attachments = [], regenerate = false }) {
     $('#send-btn').hidden = false;
     $('#stop-btn').hidden = true;
     $('#progress').hidden = true;
+    // Cut off mid-reply: the server is still writing, so follow the row.
+    if (state.roomId && pendingMessageId && !sawDone && !aborted) {
+      await followUnfinished(state.roomId, pendingMessageId);
+    }
     if (state.roomId) {
       try {
         const res = await api('/api/rooms/' + state.roomId);
