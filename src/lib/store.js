@@ -87,6 +87,8 @@ export const DEFAULT_SETTINGS = {
   runpodEndpointId: '',
   runpodTemplateId: '',
   runpodModel: '',
+  // The endpoint's MAX_MODEL_LEN; context trimming reads it.
+  runpodMaxLen: 0,
   // A self-hosted model has no built-in search; xAI runs it as a tool instead.
   breakthroughSearch: true,
   // Raw results, not another model's summary — see search.js.

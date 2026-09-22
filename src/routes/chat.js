@@ -244,7 +244,13 @@ chat.post('/chat', async (c) => {
   }
 
   const catalog = await getCatalog(c.env).catch(() => ({ models: [] }));
-  const modelMeta = findModel(catalog, provider + ':' + modelId);
+  /* A self-hosted endpoint is not in any catalogue, so findModel returns
+   * nothing and fitToContext would fall back to its 128k default — several
+   * times the window vLLM was actually started with, which shows up as a
+   * rejected request once the conversation is long enough. */
+  const modelMeta = breakthroughOn
+    ? { context: Number(settings.runpodMaxLen) || 32768, maxOutput: null, input: ['text'], output: ['text'], pricing: null }
+    : findModel(catalog, provider + ':' + modelId);
 
   // Persist the user turn (skipped when regenerating).
   const attachments = Array.isArray(body.attachments) ? body.attachments : [];

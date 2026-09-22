@@ -225,6 +225,8 @@ admin.post('/breakthrough/provision', async (c) => {
     runpodEndpointId: created.endpointId,
     runpodTemplateId: created.templateId,
     runpodModel: created.model,
+    // Remembered because context trimming needs the real window, not a guess.
+    runpodMaxLen: spec.maxModelLen,
     breakthrough: true,
   });
 
@@ -249,7 +251,7 @@ admin.post('/breakthrough/destroy', async (c) => {
     return c.json({ error: e.message }, 502);
   }
   warming = null;
-  await saveSettings(c.env, { runpodEndpointId: '', runpodTemplateId: '', runpodModel: '', breakthrough: false });
+  await saveSettings(c.env, { runpodEndpointId: '', runpodTemplateId: '', runpodModel: '', runpodMaxLen: 0, breakthrough: false });
   return c.json({ ok: true });
 });
 
