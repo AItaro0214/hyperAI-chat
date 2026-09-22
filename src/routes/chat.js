@@ -5,7 +5,8 @@ import { requireAuth } from '../lib/guard.js';
 import { getSettings, logUsage } from '../lib/store.js';
 import { getCatalog, findModel, estimateChatCost } from '../lib/models.js';
 import { openaiBase as runpodBase } from '../lib/runpod.js';
-import { webSearch as webSearch2, formatResults } from '../lib/search.js';
+import { webSearch as webSearch2, webFetch as webFetch2, formatResults } from '../lib/search.js';
+import { resolveTools, thinkingFor } from '../lib/chat-tools.js';
 import {
   buildMessages,
   buildRequest,
@@ -18,20 +19,6 @@ import {
   GROQ_BASE,
   OPENROUTER_BASE,
 } from '../lib/chat.js';
-
-/** The question a pre-search should answer: the newest user turn. */
-function lastUserText(messages) {
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const m = messages[i];
-    if (m.role !== 'user') continue;
-    if (typeof m.content === 'string') return m.content.slice(0, 400);
-    if (Array.isArray(m.content)) {
-      const text = m.content.find((b) => b?.type === 'text' || typeof b?.text === 'string');
-      if (text?.text) return String(text.text).slice(0, 400);
-    }
-  }
-  return '';
-}
 
 const chat = new Hono();
 chat.use('/chat', requireAuth);
@@ -464,26 +451,39 @@ chat.post('/chat', async (c) => {
         reasoningEffort,
         title: roomTitle,
       });
-      /* A self-hosted model has no search of its own, so it is done here and
-       * the results are put in front of the question. Raw links and snippets,
-       * not a summary: the whole point of this mode is that no other model's
-       * judgement sits in the middle. */
+      /* The model decides whether to search, rather than searching always.
+       * One non-streaming round trip with the tools offered; if it asks for
+       * none, nothing is spent and the reply streams as usual. */
       if (breakthroughOn && webSearch) {
         await setPhase('searching');
-        try {
-          const found = await webSearch2(c.env, {
-            query: lastUserText(req.body.messages),
-            maxResults: Number(settings.webSearchMaxResults) || 5,
-            backend: settings.searchBackend || 'ollama',
-          });
-          const block = formatResults(found);
-          req.body.messages.splice(req.body.messages.length - 1, 0, {
-            role: 'user',
-            content: ['以下はいまウェブを検索した生の結果です。', '内容は裏取りされていません。', '', block].join('\n'),
-          });
-          await emit('meta', { notices: ['ウェブ検索: ' + found.backend + ' / ' + found.results.length + '件'] });
-        } catch (e) {
-          await emit('meta', { notices: ['ウェブ検索に失敗しました: ' + String(e.message).slice(0, 200)] });
+        const phase = await resolveTools({
+          url: req.url,
+          headers: req.headers,
+          body: req.body,
+          onPhase: (_kind, detail) =>
+            emit('meta', { notices: ['検索: ' + (detail?.args?.query || detail?.args?.url || '')] }).catch(() => {}),
+          execute: async (name, args) => {
+            if (name === 'web_search') {
+              const found = await webSearch2(c.env, {
+                query: args.query,
+                maxResults: args.max_results || Number(settings.webSearchMaxResults) || 5,
+                backend: settings.searchBackend || 'ollama',
+              });
+              return formatResults(found);
+            }
+            if (name === 'web_fetch') {
+              const page = await webFetch2(c.env, { url: args.url });
+              return [page.title, page.url, '', page.content].join('\n');
+            }
+            return '未知のツールです: ' + name;
+          },
+        });
+        req.body.messages = phase.messages;
+        if (phase.calls.length) {
+          await emit('meta', { notices: ['ウェブを ' + phase.calls.length + ' 回調べました'] });
+        }
+        if (phase.failed) {
+          await emit('meta', { notices: ['ツール呼び出しに対応していないため、検索は行いませんでした'] });
         }
       }
 

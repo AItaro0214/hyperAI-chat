@@ -30,6 +30,7 @@ export const DEFAULT_SPEC = {
   // Qwen emits Hermes-style tool calls; without a parser the agent gets prose
   // where it expects tool_calls and cannot do anything at all.
   toolParser: 'hermes',
+  reasoningParser: 'qwen3',
   gpuMemoryUtilization: 0.95,
   workersMax: 1,
   idleTimeout: 30,
@@ -79,6 +80,8 @@ export function templateBody(spec = {}) {
     // Tool calling is what makes agent mode possible at all.
     ENABLE_AUTO_TOOL_CHOICE: 'true',
     TOOL_CALL_PARSER: s.toolParser,
+    // Separates the thinking from the answer instead of inlining <think> tags.
+    REASONING_PARSER: s.reasoningParser,
     // A stable name, so the app does not have to send a long HF path as `model`.
     OPENAI_SERVED_MODEL_NAME_OVERRIDE: 'breakthrough',
   };

@@ -2,6 +2,7 @@ import { getApiKey } from './store.js';
 import { attribution } from './branding.js';
 import { extractDocument, documentBlock, docKindOf } from './docs.js';
 import { withCacheBreakpoints } from './cache.js';
+import { thinkingFor } from './chat-tools.js';
 
 export const OPENROUTER_BASE = 'https://openrouter.ai/api/v1';
 export const GROQ_BASE = 'https://api.groq.com/openai/v1';
@@ -287,6 +288,13 @@ export function buildRequest({ provider, model, messages, options = {}, apiKey, 
     }
     if (Number(options.maxTokens) > 0) btBody.max_tokens = Number(options.maxTokens);
     if (stream) btBody.stream_options = { include_usage: true };
+    /* The one reasoning control a self-hosted Qwen has: thinking on or off,
+     * passed through the chat template rather than as a top-level field. */
+    const thinking = thinkingFor(options.reasoning);
+    if (thinking !== null) {
+      btBody.chat_template_kwargs = { enable_thinking: thinking };
+      notices.push(thinking ? '思考モードを有効にしました' : '思考モードを切りました（高速）');
+    }
     notices.push('ブレイクスルーモード（自前GPU）で実行します');
     return {
       url: breakthrough.baseUrl + '/chat/completions',
