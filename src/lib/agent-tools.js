@@ -20,6 +20,8 @@ import { pickImageModel, pickVideoModel, pickSpeechModel, fixExtension } from '.
 import { fetchVideoModels, submitVideoJob, pollVideoJob, videoUrlFrom, jobStatusOf, estimateVideoCost, applyDiscount } from './video.js';
 import { fetchSpeechModels, synthesize, isGroqSpeech } from './speech.js';
 import { getCatalog } from './models.js';
+import { getSettings } from './store.js';
+import { webSearch, webFetch, formatResults } from './search.js';
 import { resolveModelHint } from './image-purpose.js';
 import { runLoop, subagentTools, SUBAGENT_MAX_STEPS } from './agent-loop.js';
 import { renderSkill, skillPath, SKILL_IDS } from './skills.js';
@@ -241,6 +243,28 @@ export async function runTool(env, roomId, name, args, state, onOutput, options 
         return { text: out.text, meta: { kind: out.kind, total: out.total, shown: out.shown } };
       } catch (e) {
         return { text: String(e.message).slice(0, 300) };
+      }
+    }
+    case 'web_search': {
+      const settings = await getSettings(env).catch(() => ({}));
+      try {
+        const out = await webSearch(env, {
+          query: args.query,
+          maxResults: args.max_results,
+          backend: settings.searchBackend || 'ollama',
+        });
+        return { text: formatResults(out), meta: { backend: out.backend, count: out.results.length } };
+      } catch (e) {
+        return { text: '検索に失敗しました: ' + String(e.message).slice(0, 300) };
+      }
+    }
+    case 'web_fetch': {
+      try {
+        const page = await webFetch(env, { url: args.url });
+        const head = [page.title, page.url, ''].join('\n');
+        return { text: head + '\n' + page.content, meta: { url: page.url } };
+      } catch (e) {
+        return { text: '取得に失敗しました: ' + String(e.message).slice(0, 300) };
       }
     }
     case 'search_x': {

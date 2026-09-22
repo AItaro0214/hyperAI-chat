@@ -1,7 +1,15 @@
 import { seal, unseal } from './crypto.js';
 import { maskSecret, now } from './auth.js';
 
-export const SECRET_KEYS = ['OPENROUTER_API_KEY', 'GROQ_API_KEY', 'XAI_API_KEY'];
+export const SECRET_KEYS = [
+  'OPENROUTER_API_KEY',
+  'GROQ_API_KEY',
+  'XAI_API_KEY',
+  'RUNPOD_API_KEY',
+  // Raw web search, for the self-hosted model that has none of its own.
+  'OLLAMA_API_KEY',
+  'BRAVE_API_KEY',
+];
 
 /* ---------------------------- sealed API keys ---------------------------
  * Keys entered in the admin console are sealed with AES-256-GCM using
@@ -72,6 +80,18 @@ export const DEFAULT_SETTINGS = {
   historyLimit: 0, // 0 = 全件（コンテキストに収まる範囲で自動調整）
   // Agent runs carry this many characters of the room's prior turns. 0 = off.
   agentHistoryChars: 6000,
+
+  /* Breakthrough mode: a self-hosted model on a rented GPU. Serverless with
+   * no volume, so an idle endpoint costs nothing and is kept between uses. */
+  breakthrough: false,
+  runpodEndpointId: '',
+  runpodTemplateId: '',
+  runpodModel: '',
+  // A self-hosted model has no built-in search; xAI runs it as a tool instead.
+  breakthroughSearch: true,
+  // Raw results, not another model's summary — see search.js.
+  searchBackend: 'ollama',
+  searxngUrl: '',
   asrModel: 'whisper-large-v3-turbo',
   ttsModel: 'google/gemini-3.1-flash-tts-preview',
   ttsVoice: 'Kore',

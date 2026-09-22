@@ -14,7 +14,12 @@ export class ProviderError extends Error {
   }
 }
 
-const KEY_NAMES = { groq: 'GROQ_API_KEY', openrouter: 'OPENROUTER_API_KEY', xai: 'XAI_API_KEY' };
+const KEY_NAMES = {
+  groq: 'GROQ_API_KEY',
+  openrouter: 'OPENROUTER_API_KEY',
+  xai: 'XAI_API_KEY',
+  runpod: 'RUNPOD_API_KEY',
+};
 
 export async function requireKey(env, provider) {
   const name = KEY_NAMES[provider] || KEY_NAMES.openrouter;
@@ -265,9 +270,33 @@ export function clampEffort(provider, modelId, effort) {
   return { effort, notice: null };
 }
 
-export function buildRequest({ provider, model, messages, options = {}, apiKey, stream = true, modelMeta }) {
+export function buildRequest({ provider, model, messages, options = {}, apiKey, stream = true, modelMeta, breakthrough }) {
   const notices = [];
   let effectiveModel = model;
+
+  /* Breakthrough mode short-circuits everything below.
+   *
+   * A model on a rented GPU speaks plain OpenAI and nothing else: the server
+   * tools, the web plugin, the usage block and the attribution headers are all
+   * OpenRouter features, and sending them to vLLM is at best ignored and at
+   * worst a 400. Search is handled before the request instead, by xAI. */
+  if (breakthrough?.baseUrl) {
+    const btBody = { model: breakthrough.model || 'breakthrough', messages, stream };
+    if (options.temperature !== null && options.temperature !== undefined && options.temperature !== '') {
+      btBody.temperature = Number(options.temperature);
+    }
+    if (Number(options.maxTokens) > 0) btBody.max_tokens = Number(options.maxTokens);
+    if (stream) btBody.stream_options = { include_usage: true };
+    notices.push('ブレイクスルーモード（自前GPU）で実行します');
+    return {
+      url: breakthrough.baseUrl + '/chat/completions',
+      headers: { authorization: 'Bearer ' + apiKey, 'content-type': 'application/json' },
+      body: btBody,
+      notices,
+      effectiveModel: btBody.model,
+    };
+  }
+
   // Long chats re-send the whole history; Claude and Qwen need to be told to
   // cache it, everyone else already does.
   const body = { model: effectiveModel, messages: withCacheBreakpoints(messages, { provider, model }), stream };

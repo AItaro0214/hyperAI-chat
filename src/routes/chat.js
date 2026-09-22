@@ -4,6 +4,8 @@ import { now } from '../lib/auth.js';
 import { requireAuth } from '../lib/guard.js';
 import { getSettings, logUsage } from '../lib/store.js';
 import { getCatalog, findModel, estimateChatCost } from '../lib/models.js';
+import { openaiBase as runpodBase } from '../lib/runpod.js';
+import { webSearch as webSearch2, formatResults } from '../lib/search.js';
 import {
   buildMessages,
   buildRequest,
@@ -16,6 +18,20 @@ import {
   GROQ_BASE,
   OPENROUTER_BASE,
 } from '../lib/chat.js';
+
+/** The question a pre-search should answer: the newest user turn. */
+function lastUserText(messages) {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m.role !== 'user') continue;
+    if (typeof m.content === 'string') return m.content.slice(0, 400);
+    if (Array.isArray(m.content)) {
+      const text = m.content.find((b) => b?.type === 'text' || typeof b?.text === 'string');
+      if (text?.text) return String(text.text).slice(0, 400);
+    }
+  }
+  return '';
+}
 
 const chat = new Hono();
 chat.use('/chat', requireAuth);
@@ -188,8 +204,16 @@ chat.post('/chat', async (c) => {
   let room = await ownedRoom(c.env, body.roomId, userId);
   if (!room) room = await createRoom(c.env, userId, settings, body);
 
-  const provider = body.provider || room.provider || settings.defaultProvider;
-  const modelId = body.model || room.model || settings.defaultModel;
+  /* Breakthrough mode overrides the room's model entirely: a self-hosted
+   * endpoint has exactly one model on it. */
+  const breakthroughOn = !!settings.breakthrough && !!settings.runpodEndpointId;
+  const provider = breakthroughOn ? 'runpod' : body.provider || room.provider || settings.defaultProvider;
+  const modelId = breakthroughOn
+    ? settings.runpodModel || 'breakthrough'
+    : body.model || room.model || settings.defaultModel;
+  const breakthrough = breakthroughOn
+    ? { baseUrl: runpodBase(settings.runpodEndpointId), model: modelId }
+    : null;
   // The mode is authoritative; the booleans only mirror it for the UI.
   const webSearchEngineRaw = body.webSearchEngine || room.web_search_engine || settings.webSearchEngine || 'server';
   const imageModeRaw = body.imageMode || room.image_mode || settings.imageMode || 'server';
@@ -303,7 +327,7 @@ chat.post('/chat', async (c) => {
     groqSearch,
     usedPdf,
   };
-  const req = buildRequest({ provider, model: modelId, messages, options, apiKey, stream: true, modelMeta });
+  const req = buildRequest({ provider, model: modelId, messages, options, apiKey, stream: true, modelMeta, breakthrough });
   const skipNotes = {
     image: 'このモデルは画像入力に対応していないため、画像は送信されませんでした',
     audio: 'このモデルは音声入力に対応していないため、音声は送信されませんでした（🎙️ の文字起こしを使ってください）',
@@ -440,9 +464,44 @@ chat.post('/chat', async (c) => {
         reasoningEffort,
         title: roomTitle,
       });
+      /* A self-hosted model has no search of its own, so it is done here and
+       * the results are put in front of the question. Raw links and snippets,
+       * not a summary: the whole point of this mode is that no other model's
+       * judgement sits in the middle. */
+      if (breakthroughOn && webSearch) {
+        await setPhase('searching');
+        try {
+          const found = await webSearch2(c.env, {
+            query: lastUserText(req.body.messages),
+            maxResults: Number(settings.webSearchMaxResults) || 5,
+            backend: settings.searchBackend || 'ollama',
+          });
+          const block = formatResults(found);
+          req.body.messages.splice(req.body.messages.length - 1, 0, {
+            role: 'user',
+            content: ['以下はいまウェブを検索した生の結果です。', '内容は裏取りされていません。', '', block].join('\n'),
+          });
+          await emit('meta', { notices: ['ウェブ検索: ' + found.backend + ' / ' + found.results.length + '件'] });
+        } catch (e) {
+          await emit('meta', { notices: ['ウェブ検索に失敗しました: ' + String(e.message).slice(0, 200)] });
+        }
+      }
+
       await setPhase(webSearch ? 'searching' : 'connecting');
 
-      let upstream = await postJson(req.url, req.headers, req.body);
+      /* A cold GPU takes minutes to answer the first request. The stream is
+       * kept alive with phase updates so the browser does not give up and the
+       * user can see that something is still happening. */
+      let keepalive = null;
+      if (breakthroughOn) {
+        const started = Date.now();
+        keepalive = setInterval(() => {
+          const secs = Math.round((Date.now() - started) / 1000);
+          emit('meta', { notices: ['GPU の起動待ち… ' + secs + '秒（初回は重みの読み込みに数分かかります）'] }).catch(() => {});
+        }, 10000);
+      }
+
+      let upstream = await postJson(req.url, req.headers, req.body).finally(() => clearInterval(keepalive));
       if (!upstream.ok) {
         const detail = await readProviderError(upstream);
         // Fetched web pages can blow past the window; one retry with just the

@@ -222,6 +222,36 @@ export const TOOLS = [
   {
     type: 'function',
     function: {
+      name: 'web_search',
+      description:
+        'ウェブを検索して、タイトル・URL・抜粋を返す。要約ではなく検索エンジンの生の結果が返るので、' +
+        '内容の判断は自分で行うこと。仕様や事実の確認、最新情報の調査に使う。' +
+        '中身を読む必要があれば web_fetch でページ本文を取得する。',
+      parameters: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: '検索語' },
+          max_results: { type: 'integer', description: '最大件数。既定 5、上限 10' },
+        },
+        required: ['query'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'web_fetch',
+      description: '指定した URL のページ本文を取得する。検索結果の中身を確かめるために使う。',
+      parameters: {
+        type: 'object',
+        properties: { url: { type: 'string', description: 'http(s) の URL' } },
+        required: ['url'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'search_x',
       description:
         'X（旧Twitter）をリアルタイム検索して、要約と引用元の投稿URLを返す。' +

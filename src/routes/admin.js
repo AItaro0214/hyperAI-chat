@@ -36,6 +36,8 @@ import { GROQ_PRICING } from '../data/groq-pricing.js';
 import { getGroqPricing } from '../lib/models.js';
 import { GROQ_BASE, OPENROUTER_BASE } from '../lib/chat.js';
 import { XAI_BASE } from '../lib/xai.js';
+import { provision, destroy, warm, validateSpec, DEFAULT_SPEC, VLLM_IMAGE } from '../lib/runpod.js';
+import { BACKENDS, BACKEND_NOTES } from '../lib/search.js';
 
 const admin = new Hono();
 admin.use('*', requireAdmin);
@@ -106,6 +108,76 @@ admin.post('/secrets/test', async (c) => {
   } catch (e) {
     return c.json({ ok: false, error: e.message });
   }
+});
+
+/* ----------------------------- breakthrough ------------------------------
+ * Provisioning is minutes, so the POST returns immediately and the console
+ * polls the warm-up state kept here. */
+let warming = null;
+
+admin.get('/breakthrough', async (c) => {
+  const settings = await getSettings(c.env);
+  return c.json({
+    on: !!settings.breakthrough,
+    endpointId: settings.runpodEndpointId || null,
+    model: settings.runpodModel || null,
+    search: { backend: settings.searchBackend || 'ollama', searxngUrl: settings.searxngUrl || '', backends: BACKENDS, notes: BACKEND_NOTES },
+    spec: DEFAULT_SPEC,
+    image: VLLM_IMAGE,
+    warming,
+  });
+});
+
+admin.post('/breakthrough/provision', async (c) => {
+  const body = await c.req.json().catch(() => ({}));
+  const spec = { ...DEFAULT_SPEC, ...(body.spec || {}) };
+  const problems = validateSpec(spec);
+  if (problems.length) return c.json({ error: problems.join(' / ') }, 400);
+
+  const key = await getApiKey(c.env, 'RUNPOD_API_KEY');
+  if (!key) return c.json({ error: 'RUNPOD_API_KEY が未登録です' }, 400);
+
+  const settings = await getSettings(c.env);
+  if (settings.runpodEndpointId) {
+    return c.json({ error: '既にエンドポイントがあります（' + settings.runpodEndpointId + '）。作り直すなら先に破棄してください。' }, 409);
+  }
+
+  let created;
+  try {
+    created = await provision(key, spec);
+  } catch (e) {
+    return c.json({ error: e.message }, 502);
+  }
+  await saveSettings(c.env, {
+    runpodEndpointId: created.endpointId,
+    runpodTemplateId: created.templateId,
+    runpodModel: created.model,
+    breakthrough: true,
+  });
+
+  warming = { started: Date.now(), elapsed: 0, ready: false, error: null };
+  // Survives the response, but not a Worker eviction; the console can retry.
+  c.executionCtx.waitUntil(
+    warm(key, created.endpointId, { onProgress: (p) => { warming = { ...warming, ...p }; } })
+      .then((r) => { warming = { ...warming, ready: true, seconds: r.seconds }; })
+      .catch((e) => { warming = { ...warming, error: e.message }; })
+  );
+  return c.json({ ...created, spec }, 202);
+});
+
+admin.post('/breakthrough/destroy', async (c) => {
+  const settings = await getSettings(c.env);
+  const key = await getApiKey(c.env, 'RUNPOD_API_KEY');
+  if (!key) return c.json({ error: 'RUNPOD_API_KEY が未登録です' }, 400);
+  if (!settings.runpodEndpointId) return c.json({ ok: true, nothing: true });
+  try {
+    await destroy(key, { endpointId: settings.runpodEndpointId, templateId: settings.runpodTemplateId });
+  } catch (e) {
+    return c.json({ error: e.message }, 502);
+  }
+  warming = null;
+  await saveSettings(c.env, { runpodEndpointId: '', runpodTemplateId: '', runpodModel: '', breakthrough: false });
+  return c.json({ ok: true });
 });
 
 /* ------------------------------- settings ------------------------------- */

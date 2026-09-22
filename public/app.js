@@ -1591,6 +1591,7 @@ async function showAdminTab(name) {
     else if (name === 'security') await renderSecurityTab(body);
     else if (name === 'usage') await renderUsageTab(body);
     else if (name === 'events') await renderEventsTab(body);
+    else if (name === 'breakthrough') await renderBreakthroughTab(body);
     else if (name === 'groq') await renderGroqTab(body);
   } catch (e) {
     body.innerHTML = '<p class="error">' + esc(e.message) + '</p>';
@@ -1860,6 +1861,116 @@ async function renderEventsTab(body) {
       )
       .join('') +
     '</tbody></table></div>';
+}
+
+let btTimer = null;
+
+/* Breakthrough mode: a self-hosted model on a rented GPU, plus the search it
+ * needs. Provisioning takes minutes, so this polls rather than blocks. */
+async function renderBreakthroughTab(body) {
+  const bt = await api('/api/admin/breakthrough');
+  const searchRows = bt.search.backends
+    .map(
+      (b) =>
+        '<label class="row" style="gap:8px;align-items:flex-start;margin-bottom:8px">' +
+        '<input type="radio" name="sb" value="' + b + '"' + (bt.search.backend === b ? ' checked' : '') + '>' +
+        '<span><b>' + b + '</b><br><span class="xs muted">' + esc(bt.search.notes[b] || '') + '</span></span></label>'
+    )
+    .join('');
+
+  body.innerHTML =
+    '<div class="card"><h3>自前モデル（RunPod Serverless）</h3>' +
+    '<p class="sm muted">ワーカー最小0・ボリュームなしで作るので、<b>待機中の課金はありません</b>。' +
+    'エンドポイントは置いたままでも無料で、次回の起動が速くなります。</p>' +
+    (bt.endpointId
+      ? '<div class="kv"><dt>エンドポイント</dt><dd><code>' + esc(bt.endpointId) + '</code></dd>' +
+        '<dt>モデル名</dt><dd><code>' + esc(bt.model || '') + '</code></dd>' +
+        '<dt>状態</dt><dd id="bt-state">' +
+        (bt.warming?.error
+          ? '<span class="warn">起動失敗: ' + esc(bt.warming.error) + '</span>'
+          : bt.warming?.ready
+            ? '<span class="ok">起動済み（' + bt.warming.seconds + '秒）</span>'
+            : bt.warming
+              ? '起動中… ' + (bt.warming.elapsed || 0) + '秒'
+              : '待機中（次のリクエストで起動します）') +
+        '</dd></div>' +
+        '<div class="row" style="margin-top:12px;flex-wrap:wrap">' +
+        '<label class="row" style="gap:6px"><input type="checkbox" id="bt-on"' + (bt.on ? ' checked' : '') + '>' +
+        '<span class="sm">チャット・エージェントでこのモデルを使う</span></label>' +
+        '<button class="btn danger" id="bt-destroy">破棄</button></div>'
+      : '<div class="kv"><dt>モデル</dt><dd><code>' + esc(bt.spec.model) + '</code></dd>' +
+        '<dt>GPU</dt><dd>' + esc(bt.spec.gpu) + ' / ' + esc(bt.spec.quantization.toUpperCase()) + '</dd>' +
+        '<dt>イメージ</dt><dd><code>' + esc(bt.image) + '</code></dd></div>' +
+        '<p class="xs muted">RunPod の API キーは「キー」タブで <code>RUNPOD_API_KEY</code> として登録してください。</p>' +
+        '<button class="btn primary" id="bt-create" style="margin-top:12px">エンドポイントを作成して起動</button>') +
+    '<p class="xs" id="bt-msg"></p></div>' +
+    '<div class="card"><h3>ウェブ検索</h3>' +
+    '<p class="sm muted">自前モデルには内蔵検索がないので、ここで選んだ方式を使います。' +
+    '<b>xai 以外は生の検索結果</b>が返ります（要約する仲介モデルが入りません）。</p>' +
+    searchRows +
+    '<div class="field" style="margin-top:10px"><label for="bt-searxng">SearXNG の URL</label>' +
+    '<input class="input" id="bt-searxng" value="' + esc(bt.search.searxngUrl || '') + '" placeholder="https://searx.example.com"></div>' +
+    '<p class="xs muted">インスタンスの <code>settings.yml</code> で <code>search.formats</code> に <code>json</code> を追加しておく必要があります。</p>' +
+    '<div class="row" style="justify-content:flex-end;margin-top:10px">' +
+    '<button class="btn primary" id="bt-search-save">検索設定を保存</button></div></div>';
+
+  const msg = (text, cls = 'muted') => ($('#bt-msg').innerHTML = '<span class="' + cls + '">' + esc(text) + '</span>');
+
+  $('#bt-create')?.addEventListener('click', async (e) => {
+    e.target.disabled = true;
+    msg('作成中…');
+    try {
+      await api('/api/admin/breakthrough/provision', { method: 'POST', body: '{}' });
+      pollBreakthrough(body);
+    } catch (err) {
+      msg(err.message, 'warn');
+      e.target.disabled = false;
+    }
+  });
+
+  $('#bt-destroy')?.addEventListener('click', async (e) => {
+    e.target.disabled = true;
+    msg('破棄中…');
+    try {
+      await api('/api/admin/breakthrough/destroy', { method: 'POST', body: '{}' });
+      clearInterval(btTimer);
+      renderBreakthroughTab(body);
+    } catch (err) {
+      msg(err.message, 'warn');
+      e.target.disabled = false;
+    }
+  });
+
+  $('#bt-on')?.addEventListener('change', async (e) => {
+    await api('/api/admin/settings', { method: 'POST', body: JSON.stringify({ breakthrough: e.target.checked }) });
+    msg(e.target.checked ? 'ブレイクスルーモードを有効にしました' : '通常のモデルに戻しました', 'ok');
+  });
+
+  $('#bt-search-save')?.addEventListener('click', async () => {
+    const backend = document.querySelector('input[name="sb"]:checked')?.value || 'ollama';
+    await api('/api/admin/settings', {
+      method: 'POST',
+      body: JSON.stringify({ searchBackend: backend, searxngUrl: $('#bt-searxng').value.trim() }),
+    });
+    msg('保存しました（' + backend + '）', 'ok');
+  });
+
+  if (bt.warming && !bt.warming.ready && !bt.warming.error) pollBreakthrough(body);
+}
+
+function pollBreakthrough(body) {
+  clearInterval(btTimer);
+  btTimer = setInterval(async () => {
+    const bt = await api('/api/admin/breakthrough').catch(() => null);
+    if (!bt) return;
+    if (!bt.warming || bt.warming.ready || bt.warming.error) {
+      clearInterval(btTimer);
+      renderBreakthroughTab(body);
+      return;
+    }
+    const cell = $('#bt-state');
+    if (cell) cell.textContent = '起動中… ' + (bt.warming.elapsed || 0) + '秒（重みの読み込みに数分かかります）';
+  }, 5000);
 }
 
 async function renderGroqTab(body) {

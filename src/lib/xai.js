@@ -214,6 +214,59 @@ export async function searchX(apiKey, options = {}) {
   return { ...parsed, model: body.model };
 }
 
+/**
+ * Plain web search, same endpoint and same parsing.
+ *
+ * This exists for the self-hosted path: OpenRouter's server tools and its web
+ * plugin are OpenRouter features, and a model running on a rented GPU has
+ * neither. xAI will run the search and hand back an answer with citations,
+ * which is all that is actually needed.
+ */
+export async function searchWeb(apiKey, { query, model, fromDate, toDate, allowedDomains, excludedDomains } = {}) {
+  const tool = { type: 'web_search' };
+  const allow = (Array.isArray(allowedDomains) ? allowedDomains : String(allowedDomains || '').split(','))
+    .map((d) => d.trim())
+    .filter(Boolean)
+    .slice(0, 20);
+  const deny = (Array.isArray(excludedDomains) ? excludedDomains : String(excludedDomains || '').split(','))
+    .map((d) => d.trim())
+    .filter(Boolean)
+    .slice(0, 20);
+  if (allow.length) tool.allowed_domains = allow;
+  else if (deny.length) tool.excluded_domains = deny;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(String(fromDate || ''))) tool.from_date = fromDate;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(String(toDate || ''))) tool.to_date = toDate;
+
+  const body = {
+    model: model || DEFAULT_MODEL,
+    input: [{ role: 'user', content: String(query || '').trim() }],
+    tools: [tool],
+  };
+
+  const res = await fetch(XAI_BASE + '/responses', {
+    method: 'POST',
+    headers: { authorization: 'Bearer ' + apiKey, 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(120000),
+  });
+  const raw = await res.text();
+  let json = null;
+  try {
+    json = raw ? JSON.parse(raw) : null;
+  } catch {
+    json = null;
+  }
+  if (!res.ok) {
+    const err = json?.error?.message || json?.error || raw || ('HTTP ' + res.status);
+    throw new Error('Web検索に失敗 (' + res.status + '): ' + String(err).slice(0, 300));
+  }
+  const parsed = parseSearchResponse(json);
+  if (!parsed.text && !parsed.sources.length) {
+    throw new Error('Web検索の応答を解釈できませんでした: ' + raw.slice(0, 300));
+  }
+  return { ...parsed, model: body.model };
+}
+
 /** Formats a result for a tool message. */
 export function formatSearchResult({ text, sources }) {
   const lines = [text];
