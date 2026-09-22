@@ -1910,15 +1910,17 @@ async function renderBreakthroughTab(body) {
             : '—') +
         '</dd>' +
         '<dt>起動処理</dt><dd id="bt-state">' +
-        (bt.warming?.error
-          ? '<span class="warn">起動失敗: ' + esc(bt.warming.error) + '</span>'
-          : bt.warming?.ready
-            ? '<span class="ok">起動済み（' + bt.warming.seconds + '秒）</span>'
-            : bt.warming?.stalled
-              ? '<span class="warn">開始から ' + bt.warming.elapsed + '秒。ワーカーが動いていません — もう一度押してください</span>'
-              : bt.warming
-                ? '起動中… ' + bt.warming.elapsed + '秒（上のワーカー行が実際の状態です）'
-                : '待機中（次のリクエストで起動します）') +
+        (bt.warming?.ready
+          ? '<span class="ok">完了</span>'
+          : bt.warming?.starting
+            ? '起動中（' + bt.warming.since + '秒前に開始' + (bt.warming.queued ? ' / 待ち ' + bt.warming.queued + '件' : '') + '）'
+            : bt.warming?.error
+              ? '<span class="warn">失敗: ' + esc(bt.warming.error) + '</span>'
+              : bt.warming?.unknown
+                ? '<span class="warn">RunPod に問い合わせできません</span>'
+                : bt.warming?.stalled
+                  ? '<span class="warn">' + bt.warming.since + '秒前に開始したが動いていません — もう一度押してください</span>'
+                  : '未実行') +
         '</dd></div>' +
         '<div class="row" style="margin-top:12px;flex-wrap:wrap">' +
         '<label class="row" style="gap:6px"><input type="checkbox" id="bt-on"' + (bt.on ? ' checked' : '') + '>' +

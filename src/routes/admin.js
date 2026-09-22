@@ -214,32 +214,31 @@ const readWarming = (env) => getJsonSetting(env, WARM_KEY, null);
 const writeWarming = (env, value) => setJsonSetting(env, WARM_KEY, value);
 
 /**
- * The warm-up as it can honestly be described.
+ * The warm-up, described from what can actually be known.
  *
- * The polling loop runs inside waitUntil, which lives for seconds after the
- * response rather than the minutes a cold start takes — so the elapsed value
- * it writes stops updating almost immediately and the console sat at "0秒"
- * while a worker was in fact loading. The start time is written once and is
- * reliable, so elapsed is computed from it here instead of being trusted from
- * the record, and RunPod's live worker counts decide whether it is still
- * happening at all.
+ * The elapsed counter used to be the headline, and it lied in both directions:
+ * the loop that maintained it lives inside waitUntil and dies within a minute,
+ * so the number either froze or — computed from the start time instead — kept
+ * climbing long after anything was happening, right up to the fifteen-minute
+ * ceiling. Either way it described a process that was no longer running.
+ *
+ * RunPod knows whether a worker is starting. That is the answer; the timestamp
+ * is only kept to tell "pressed and nothing happened" from "never pressed".
  */
 async function describeWarming(env, live) {
   const record = await readWarming(env);
   if (!record) return null;
 
-  const elapsed = Math.round((Date.now() - record.started) / 1000);
-  if (record.error) return { ...record, elapsed };
-  if (record.ready || Number(live?.ready) > 0) {
-    return { ...record, elapsed, ready: true, seconds: record.seconds ?? elapsed };
-  }
+  const since = Math.round((Date.now() - record.started) / 1000);
+  if (live?.error) return { since, unknown: true, error: live.error };
+  if (Number(live?.ready) > 0) return { since, ready: true };
 
-  // No worker, no queue and no error: whatever was started is not running.
-  const busy = Number(live?.starting) + Number(live?.running) + Number(live?.inQueue);
-  if (live && !busy) {
-    return { ...record, elapsed, stalled: true };
-  }
-  return { ...record, elapsed };
+  const busy = (Number(live?.starting) || 0) + (Number(live?.running) || 0);
+  if (busy) return { since, starting: true, queued: Number(live?.inQueue) || 0 };
+
+  // Nothing running and nothing queued: whatever was started is not.
+  if (record.error) return { since, error: record.error };
+  return { since, stalled: true };
 }
 
 /** Drives the warm-up, recording progress where any instance can read it. */
@@ -331,10 +330,12 @@ admin.post('/breakthrough/warm', async (c) => {
   const key = await getApiKey(c.env, 'RUNPOD_API_KEY');
   if (!key) return c.json({ error: 'RUNPOD_API_KEY が未登録です' }, 400);
   if (!settings.runpodEndpointId) return c.json({ error: 'エンドポイントがありません' }, 400);
-  const current = await readWarming(c.env);
-  // A stale record from an evicted run must not block a fresh attempt.
-  const fresh = current && Date.now() - current.started < 20 * 60 * 1000;
-  if (fresh && !current.ready && !current.error) return c.json({ ok: true, already: true, warming: current });
+  /* Only an actually-running worker blocks a retry. A time window would also
+   * block the case this exists for: a warm-up whose loop was evicted, where
+   * the record looks in-progress and nothing is. */
+  const live = await health(key, settings.runpodEndpointId).catch(() => null);
+  const busy = (Number(live?.workers?.initializing) || 0) + (Number(live?.workers?.running) || 0);
+  if (busy) return c.json({ ok: true, already: true, workers: live.workers });
 
   const started = { started: Date.now(), elapsed: 0, ready: false, error: null };
   await writeWarming(c.env, started);
