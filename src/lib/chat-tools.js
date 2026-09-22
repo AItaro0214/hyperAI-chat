@@ -14,9 +14,19 @@
  * The tools here are read-only on purpose. Chat is not the agent: it can look
  * things up, and that is all. */
 
-/* Two, not three. Each round is a full round trip to a 27B model on a single
- * GPU; the third rarely changes the answer and always costs the wait. */
+/* How many times the model may go back for more.
+ *
+ * Each round is a full round trip to the model plus a search, so this is tens
+ * of seconds apiece on a self-hosted 27B. Two is enough for "look it up and
+ * answer"; more is for questions that genuinely need following a trail. The
+ * ceiling exists because a model that is not getting what it wants will ask
+ * forever, and every attempt costs GPU time whether or not it helps. */
 export const MAX_ROUNDS = 2;
+export const ROUND_CEILING = 10;
+
+/* A wall clock as well as a count: ten rounds of a slow model is minutes of
+ * someone watching a spinner. */
+const DEFAULT_BUDGET_MS = 240000;
 
 export const CHAT_TOOLS = [
   {
@@ -67,13 +77,30 @@ export function thinkingFor(effort) {
  * @param {(phase: string, detail?: object) => Promise<void>|void} [config.onPhase]
  * @returns {Promise<{messages: object[], calls: string[], rounds: number}>}
  */
-export async function resolveTools({ url, headers, body, execute, onPhase, maxRounds = MAX_ROUNDS, timeoutMs = 900000 }) {
+export async function resolveTools({
+  url,
+  headers,
+  body,
+  execute,
+  onPhase,
+  maxRounds = MAX_ROUNDS,
+  timeoutMs = 900000,
+  budgetMs = DEFAULT_BUDGET_MS,
+}) {
   const messages = body.messages.slice();
   const calls = [];
+  const asked = new Set();
+  const limit = Math.max(1, Math.min(Number(maxRounds) || MAX_ROUNDS, ROUND_CEILING));
+  const started = Date.now();
   let rounds = 0;
+  let stoppedBecause = null;
 
-  for (rounds = 1; rounds <= maxRounds; rounds++) {
-    await onPhase?.('deciding', { round: rounds, of: maxRounds });
+  for (rounds = 1; rounds <= limit; rounds++) {
+    if (Date.now() - started > budgetMs) {
+      stoppedBecause = '時間切れ';
+      break;
+    }
+    await onPhase?.('deciding', { round: rounds, of: limit });
     const probe = {
       ...body,
       messages,
@@ -119,6 +146,24 @@ export async function resolveTools({ url, headers, body, execute, onPhase, maxRo
         args = {};
       }
       calls.push(name);
+
+      /* The same query twice means it is not going to get anywhere.
+       *
+       * This is what an unbounded loop actually looks like in practice: not
+       * novel searches forever, but the identical one repeated because the
+       * results did not answer the question. Saying so is more useful than
+       * running it again. */
+      const signature = name + ':' + JSON.stringify(args);
+      if (asked.has(signature)) {
+        messages.push({
+          role: 'tool',
+          tool_call_id: call.id,
+          content: 'この検索は既に実行済みで、結果は上にあります。同じ検索を繰り返さず、得られた情報で回答してください。',
+        });
+        stoppedBecause = '同じ検索の繰り返し';
+        continue;
+      }
+      asked.add(signature);
       await onPhase?.('tool', { name, args });
 
       let text;
@@ -133,6 +178,8 @@ export async function resolveTools({ url, headers, body, execute, onPhase, maxRo
         content: String(text ?? '').slice(0, 20000),
       });
     }
+
+    if (stoppedBecause) break;
   }
 
   /* Out of rounds, and the model does not know that.
@@ -146,5 +193,5 @@ export async function resolveTools({ url, headers, body, execute, onPhase, maxRo
     role: 'user',
     content: 'これ以上は検索できません。ここまでに得られた情報だけで回答してください。分からない部分は分からないと述べてください。',
   });
-  return { messages, calls, rounds: maxRounds, exhausted: true };
+  return { messages, calls, rounds: Math.min(rounds, limit), exhausted: true, stoppedBecause };
 }

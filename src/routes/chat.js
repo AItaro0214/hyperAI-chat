@@ -466,6 +466,7 @@ chat.post('/chat', async (c) => {
           url: req.url,
           headers: req.headers,
           body: req.body,
+          maxRounds: Number(settings.searchRounds) || 2,
           onPhase: (kind, detail) => {
             const text =
               kind === 'deciding'
@@ -514,6 +515,9 @@ chat.post('/chat', async (c) => {
         req.body.messages = phase.messages;
         if (phase.calls.length) {
           await emit('meta', { notices: ['ウェブを ' + phase.calls.length + ' 回調べました'] });
+        }
+        if (phase.stoppedBecause) {
+          await emit('meta', { notices: ['検索を打ち切りました（' + phase.stoppedBecause + '）'] });
         }
         if (phase.failed) {
           await emit('meta', { notices: ['ツール呼び出しに対応していないため、検索は行いませんでした'] });

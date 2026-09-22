@@ -93,6 +93,8 @@ export const DEFAULT_SETTINGS = {
   breakthroughSearch: true,
   // Raw results, not another model's summary — see search.js.
   searchBackend: 'ollama',
+  // How many times the model may go back for more. Each is a round trip.
+  searchRounds: 2,
   searxngUrl: '',
   asrModel: 'whisper-large-v3-turbo',
   ttsModel: 'google/gemini-3.1-flash-tts-preview',

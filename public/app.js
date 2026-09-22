@@ -1999,6 +1999,11 @@ async function renderBreakthroughTab(body) {
     '<p class="sm muted">自前モデルには内蔵検索がないので、ここで選んだ方式を使います。' +
     '<b>xai 以外は生の検索結果</b>が返ります（要約する仲介モデルが入りません）。</p>' +
     searchRows +
+    '<div class="field" style="margin-top:10px"><label for="bt-rounds">検索の往復回数（1〜10）</label>' +
+    '<input class="input" id="bt-rounds" type="number" min="1" max="10" value="' + (bt.search.rounds ?? 2) + '"></div>' +
+    '<p class="xs muted">モデルが納得するまで調べさせたい場合は増やします。' +
+    '1往復ごとにモデルへの問い合わせと検索が走るので、<b>自前GPUでは1回あたり数十秒</b>かかります。' +
+    '同じ検索を繰り返した時点、または4分経過した時点で自動的に打ち切ります。</p>' +
     '<div class="field" style="margin-top:10px"><label for="bt-searxng">SearXNG の URL</label>' +
     '<input class="input" id="bt-searxng" value="' + esc(bt.search.searxngUrl || '') + '" placeholder="https://searx.example.com"></div>' +
     '<p class="xs muted"><b>このアプリは Cloudflare 上で動くので、<code>localhost</code> は使えません</b>（Worker からあなたのPCには到達できません）。' +
@@ -2114,7 +2119,11 @@ async function renderBreakthroughTab(body) {
     const backend = document.querySelector('input[name="sb"]:checked')?.value || 'ollama';
     await api('/api/admin/settings', {
       method: 'POST',
-      body: JSON.stringify({ searchBackend: backend, searxngUrl: $('#bt-searxng').value.trim() }),
+      body: JSON.stringify({
+        searchBackend: backend,
+        searxngUrl: $('#bt-searxng').value.trim(),
+        searchRounds: Math.max(1, Math.min(Number($('#bt-rounds').value) || 2, 10)),
+      }),
     });
     msg('保存しました（' + backend + '）', 'ok');
   });

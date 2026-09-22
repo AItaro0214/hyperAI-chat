@@ -1,4 +1,4 @@
-import { CHAT_TOOLS, thinkingFor, resolveTools, MAX_ROUNDS } from '../src/lib/chat-tools.js';
+import { CHAT_TOOLS, thinkingFor, resolveTools, MAX_ROUNDS, ROUND_CEILING } from '../src/lib/chat-tools.js';
 
 const results = [];
 const check = (name, ok, extra = '') => {
@@ -72,6 +72,53 @@ check('  ツール呼び出しに足る枠がある', sentBody.max_tokens >= 512
 check('  ストリーミングしない', sentBody.stream === false);
 
 globalThis.fetch = realFetch;
+/* --------------------- searching until satisfied ------------------------ */
+// More rounds when asked, but never past the ceiling.
+let turns = 0;
+globalThis.fetch = async () => {
+  turns++;
+  return turns <= 6
+    ? reply({ content: null, tool_calls: [{ id: 'c' + turns, function: { name: 'web_search', arguments: JSON.stringify({ query: 'q' + turns }) } }] })
+    : reply({ content: '結論' });
+};
+out = await resolveTools({
+  url: 'u', headers: {}, body: { messages: [{ role: 'user', content: 'x' }] },
+  maxRounds: 6, execute: async () => 'r',
+});
+check('往復回数を増やせる', out.rounds === 6, 'rounds=' + out.rounds);
+
+turns = 0;
+out = await resolveTools({
+  url: 'u', headers: {}, body: { messages: [{ role: 'user', content: 'x' }] },
+  maxRounds: 999, execute: async () => 'r',
+});
+check('  上限を超えさせない', out.rounds <= ROUND_CEILING, 'rounds=' + out.rounds + ' / 上限 ' + ROUND_CEILING);
+
+// The real shape of a runaway loop: the same query, over and over.
+globalThis.fetch = async () =>
+  reply({ content: null, tool_calls: [{ id: 'same', function: { name: 'web_search', arguments: '{"query":"同じ"}' } }] });
+const ran = [];
+out = await resolveTools({
+  url: 'u', headers: {}, body: { messages: [{ role: 'user', content: 'x' }] },
+  maxRounds: 10, execute: async (n, a) => { ran.push(a.query); return 'r'; },
+});
+check('同じ検索の繰り返しで止める', out.stoppedBecause === '同じ検索の繰り返し', String(out.stoppedBecause));
+check('  同じ検索を二度実行しない', ran.length === 1, ran.join(', '));
+check('  打ち切っても回答には進む', out.messages.at(-1).content.includes('これ以上は検索できません'));
+
+// A slow model must not hold the request open indefinitely.
+globalThis.fetch = async () => {
+  await new Promise((r) => setTimeout(r, 40));
+  return reply({ content: null, tool_calls: [{ id: 'x' + Math.random(), function: { name: 'web_search', arguments: JSON.stringify({ query: Math.random() }) } }] });
+};
+out = await resolveTools({
+  url: 'u', headers: {}, body: { messages: [{ role: 'user', content: 'x' }] },
+  maxRounds: 10, budgetMs: 120, execute: async () => 'r',
+});
+check('時間予算で打ち切る', out.stoppedBecause === '時間切れ' || out.rounds < 10, 'rounds=' + out.rounds + ' / ' + out.stoppedBecause);
+
+globalThis.fetch = realFetch;
+
 const passed = results.filter(([ok]) => ok).length;
 console.log('\n' + passed + '/' + results.length + ' passed');
 process.exitCode = passed === results.length ? 0 : 1;
