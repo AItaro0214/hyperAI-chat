@@ -47,6 +47,14 @@ async function viaOllama(env, query, limit) {
 async function viaSearxng(env, query, limit) {
   const base = String((await getJsonSetting(env, 'searxngUrl', '')) || '').replace(/\/+$/, '');
   if (!base) throw new Error('SearXNG の URL が未設定です（管理コンソールで登録してください）');
+  /* A localhost URL works from the local app and never from a Worker, which
+   * has no route to the user's machine. Failing here with the reason beats a
+   * connection error the caller cannot interpret. */
+  if (!env.LOCAL && /^https?:\/\/(localhost|127\.|0\.0\.0\.0|\[::1\])/i.test(base)) {
+    throw new Error(
+      'クラウド版から localhost の SearXNG には到達できません。公開URLを設定するか、検索方式を ollama / brave に変えてください。'
+    );
+  }
   // The JSON format has to be enabled in the instance's settings.yml.
   const url = base + '/search?format=json&language=auto&q=' + encodeURIComponent(query);
   const res = await fetch(url, { headers: { accept: 'application/json' }, signal: AbortSignal.timeout(45000) });

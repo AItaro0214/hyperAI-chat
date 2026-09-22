@@ -1910,7 +1910,9 @@ async function renderBreakthroughTab(body) {
     searchRows +
     '<div class="field" style="margin-top:10px"><label for="bt-searxng">SearXNG の URL</label>' +
     '<input class="input" id="bt-searxng" value="' + esc(bt.search.searxngUrl || '') + '" placeholder="https://searx.example.com"></div>' +
-    '<p class="xs muted">インスタンスの <code>settings.yml</code> で <code>search.formats</code> に <code>json</code> を追加しておく必要があります。</p>' +
+    '<p class="xs muted"><b>このアプリは Cloudflare 上で動くので、<code>localhost</code> は使えません</b>（Worker からあなたのPCには到達できません）。' +
+    '公開されている URL が必要です。手元の SearXNG を使いたい場合は hyperdev 側で設定してください。<br>' +
+    'インスタンスの <code>settings.yml</code> で <code>search.formats</code> に <code>json</code> を追加しておく必要があります。</p>' +
     '<div class="row" style="justify-content:flex-end;margin-top:10px">' +
     '<button class="btn primary" id="bt-search-save">検索設定を保存</button></div></div>';
 
