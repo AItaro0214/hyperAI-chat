@@ -65,46 +65,119 @@ admin.delete('/secrets/:key', async (c) => {
   return c.json({ ok: true, secrets: await listApiKeys(c.env) });
 });
 
-admin.post('/secrets/test', async (c) => {
-  const { key } = await c.req.json().catch(() => ({}));
-  if (!SECRET_KEYS.includes(key)) return c.json({ error: '未知のキーです' }, 400);
-  const value = await getApiKey(c.env, key);
-  if (!value) return c.json({ ok: false, error: '未設定です' });
-  try {
-    if (key === 'OPENROUTER_API_KEY') {
-      const res = await fetch(OPENROUTER_BASE + '/key', {
-        headers: { authorization: 'Bearer ' + value },
-        signal: AbortSignal.timeout(15000),
-      });
-      const json = await res.json().catch(() => ({}));
-      if (!res.ok) return c.json({ ok: false, error: 'HTTP ' + res.status + ' ' + (json.error?.message || '') });
-      return c.json({
-        ok: true,
-        detail: {
-          label: json.data?.label,
-          usage: json.data?.usage,
-          limit: json.data?.limit,
-          limitRemaining: json.data?.limit_remaining,
-          isFreeTier: json.data?.is_free_tier,
-        },
-      });
-    }
-    if (key === 'XAI_API_KEY') {
-      const res = await fetch(XAI_BASE + '/models', {
-        headers: { authorization: 'Bearer ' + value },
-        signal: AbortSignal.timeout(15000),
-      });
-      const json = await res.json().catch(() => ({}));
-      if (!res.ok) return c.json({ ok: false, error: 'HTTP ' + res.status + ' ' + (json.error?.message || json.error || '') });
-      return c.json({ ok: true, detail: { models: (json.data || []).length } });
-    }
+/* One test per key, in a table.
+ *
+ * This used to be a chain of ifs with Groq as the final else, which meant a
+ * newly added key was silently tested against Groq's API and came back "401
+ * Invalid API Key" — a correct key reported as broken. A missing entry is now
+ * said out loud instead of guessed at. */
+const KEY_TESTS = {
+  async OPENROUTER_API_KEY(value) {
+    const res = await fetch(OPENROUTER_BASE + '/key', {
+      headers: { authorization: 'Bearer ' + value },
+      signal: AbortSignal.timeout(15000),
+    });
+    const json = await res.json().catch(() => ({}));
+    if (!res.ok) return { ok: false, error: 'HTTP ' + res.status + ' ' + (json.error?.message || '') };
+    return {
+      ok: true,
+      detail: {
+        label: json.data?.label,
+        usage: json.data?.usage,
+        limit: json.data?.limit,
+        limitRemaining: json.data?.limit_remaining,
+        isFreeTier: json.data?.is_free_tier,
+      },
+    };
+  },
+
+  async GROQ_API_KEY(value) {
     const res = await fetch(GROQ_BASE + '/models', {
       headers: { authorization: 'Bearer ' + value },
       signal: AbortSignal.timeout(15000),
     });
     const json = await res.json().catch(() => ({}));
-    if (!res.ok) return c.json({ ok: false, error: 'HTTP ' + res.status + ' ' + (json.error?.message || '') });
-    return c.json({ ok: true, detail: { models: (json.data || []).length } });
+    if (!res.ok) return { ok: false, error: 'HTTP ' + res.status + ' ' + (json.error?.message || '') };
+    return { ok: true, detail: { models: (json.data || []).length } };
+  },
+
+  async XAI_API_KEY(value) {
+    const res = await fetch(XAI_BASE + '/models', {
+      headers: { authorization: 'Bearer ' + value },
+      signal: AbortSignal.timeout(15000),
+    });
+    const json = await res.json().catch(() => ({}));
+    if (!res.ok) return { ok: false, error: 'HTTP ' + res.status + ' ' + (json.error?.message || json.error || '') };
+    return { ok: true, detail: { models: (json.data || []).length } };
+  },
+
+  // Listing endpoints also confirms the key has the read access provisioning
+  // will need, which a plain auth check would not.
+  async RUNPOD_API_KEY(value) {
+    const res = await fetch('https://rest.runpod.io/v1/endpoints', {
+      headers: { authorization: 'Bearer ' + value, accept: 'application/json' },
+      signal: AbortSignal.timeout(20000),
+    });
+    const text = await res.text();
+    if (!res.ok) {
+      return {
+        ok: false,
+        error:
+          'HTTP ' + res.status + ' ' + text.slice(0, 200) +
+          (res.status === 401 ? '（RunPod の Settings → API Keys で Read/Write のキーを作り直してください）' : ''),
+      };
+    }
+    let list = [];
+    try {
+      const json = JSON.parse(text);
+      list = Array.isArray(json) ? json : json.endpoints || json.data || [];
+    } catch {
+      list = [];
+    }
+    return { ok: true, detail: { endpoints: list.length } };
+  },
+
+  // Costs one search, which is the only way to know the key actually works.
+  async OLLAMA_API_KEY(value) {
+    const res = await fetch('https://ollama.com/api/web_search', {
+      method: 'POST',
+      headers: { authorization: 'Bearer ' + value, 'content-type': 'application/json' },
+      body: JSON.stringify({ query: 'test', max_results: 1 }),
+      signal: AbortSignal.timeout(30000),
+    });
+    const text = await res.text();
+    if (!res.ok) return { ok: false, error: 'HTTP ' + res.status + ' ' + text.slice(0, 200) };
+    let count = 0;
+    try {
+      count = (JSON.parse(text).results || []).length;
+    } catch {
+      count = 0;
+    }
+    return { ok: true, detail: { results: count } };
+  },
+
+  async BRAVE_API_KEY(value) {
+    const res = await fetch('https://api.search.brave.com/res/v1/web/search?count=1&q=test', {
+      headers: { accept: 'application/json', 'x-subscription-token': value },
+      signal: AbortSignal.timeout(20000),
+    });
+    const text = await res.text();
+    if (!res.ok) return { ok: false, error: 'HTTP ' + res.status + ' ' + text.slice(0, 200) };
+    return { ok: true, detail: { ok: true } };
+  },
+};
+
+admin.post('/secrets/test', async (c) => {
+  const { key } = await c.req.json().catch(() => ({}));
+  if (!SECRET_KEYS.includes(key)) return c.json({ error: '未知のキーです' }, 400);
+  const value = await getApiKey(c.env, key);
+  if (!value) return c.json({ ok: false, error: '未設定です' });
+
+  const test = KEY_TESTS[key];
+  if (!test) return c.json({ ok: null, error: 'このキーには接続テストがありません' });
+
+  try {
+    return c.json(await test(value));
   } catch (e) {
     return c.json({ ok: false, error: e.message });
   }
