@@ -466,8 +466,13 @@ chat.post('/chat', async (c) => {
           url: req.url,
           headers: req.headers,
           body: req.body,
-          onPhase: (_kind, detail) =>
-            emit('meta', { notices: ['検索: ' + (detail?.args?.query || detail?.args?.url || '')] }).catch(() => {}),
+          onPhase: (kind, detail) => {
+            const text =
+              kind === 'deciding'
+                ? '検索が必要か判断しています（' + detail.round + '/' + detail.of + '）'
+                : '検索: ' + (detail?.args?.query || detail?.args?.url || '');
+            return emit('meta', { notices: [text] }).catch(() => {});
+          },
           execute: async (name, args) => {
             if (name === 'web_search') {
               const found = await webSearch2(c.env, {

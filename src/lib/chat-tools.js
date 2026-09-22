@@ -14,7 +14,9 @@
  * The tools here are read-only on purpose. Chat is not the agent: it can look
  * things up, and that is all. */
 
-export const MAX_ROUNDS = 3;
+/* Two, not three. Each round is a full round trip to a 27B model on a single
+ * GPU; the third rarely changes the answer and always costs the wait. */
+export const MAX_ROUNDS = 2;
 
 export const CHAT_TOOLS = [
   {
@@ -71,14 +73,23 @@ export async function resolveTools({ url, headers, body, execute, onPhase, maxRo
   let rounds = 0;
 
   for (rounds = 1; rounds <= maxRounds; rounds++) {
+    await onPhase?.('deciding', { round: rounds, of: maxRounds });
     const probe = {
       ...body,
       messages,
       tools: CHAT_TOOLS,
       tool_choice: 'auto',
       stream: false,
-      // The decision needs a few tokens, not an essay; the answer comes later.
-      max_tokens: 512,
+      /* "Do I need to search?" is a routing decision, not a reasoning task.
+       *
+       * Spreading the caller's body carried its thinking setting in, and Qwen
+       * thinks by default — so the budget below was spent entirely on an
+       * internal monologue and the turn ended before any tool call was
+       * emitted. Three rounds of that is a minute of nothing. Thinking is
+       * switched off here regardless of what the answer itself will use. */
+      chat_template_kwargs: { ...(body.chat_template_kwargs || {}), enable_thinking: false },
+      // Enough for a tool call and its arguments, and no more.
+      max_tokens: 700,
     };
 
     const res = await fetch(url, {

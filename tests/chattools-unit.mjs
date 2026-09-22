@@ -53,6 +53,24 @@ globalThis.fetch = async () => reply({ content: null, tool_calls: [{ id: 'c', fu
 out = await resolveTools({ url: 'u', headers: {}, body: { messages: [{ role: 'user', content: 'x' }] }, execute: async () => 'r' });
 check('無限に検索させない', out.exhausted === true && out.rounds === MAX_ROUNDS, 'rounds=' + out.rounds);
 
+// The probe must not inherit thinking: it would spend its budget on a
+// monologue and end the turn before emitting a tool call.
+let sentBody = null;
+globalThis.fetch = async (_u, o) => {
+  sentBody = JSON.parse(o.body);
+  return reply({ content: 'ok' });
+};
+await resolveTools({
+  url: 'u',
+  headers: {},
+  body: { messages: [{ role: 'user', content: 'x' }], chat_template_kwargs: { enable_thinking: true } },
+  execute: async () => 'x',
+});
+check('判断用リクエストは思考を切る', sentBody.chat_template_kwargs.enable_thinking === false,
+  JSON.stringify(sentBody.chat_template_kwargs));
+check('  ツール呼び出しに足る枠がある', sentBody.max_tokens >= 512, String(sentBody.max_tokens));
+check('  ストリーミングしない', sentBody.stream === false);
+
 globalThis.fetch = realFetch;
 const passed = results.filter(([ok]) => ok).length;
 console.log('\n' + passed + '/' + results.length + ' passed');
