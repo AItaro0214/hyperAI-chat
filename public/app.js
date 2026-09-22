@@ -1928,8 +1928,9 @@ async function renderBreakthroughTab(body) {
         '<label class="row" style="gap:6px"><input type="checkbox" id="bt-on"' + (bt.on ? ' checked' : '') + '>' +
         '<span class="sm">チャット・エージェントでこのモデルを使う</span></label>' +
         (bt.active
-          ? '<button class="btn danger" id="bt-off">停止（課金を止める）</button>' +
-            '<button class="btn" id="bt-warm">いま起動する</button>'
+          ? '<button class="btn danger" id="bt-off">' +
+            (bt.live?.ready || bt.live?.running || bt.live?.starting ? '停止（課金を止める）' : '無効化（起動しないようにする）') +
+            '</button><button class="btn" id="bt-warm">いま起動する</button>'
           : '<button class="btn primary" id="bt-activate">有効化する</button>') +
         '<button class="btn" id="bt-reset">キューを空にする</button>' +
         '<button class="btn" id="bt-diag">診断</button>' +
@@ -2010,12 +2011,16 @@ async function renderBreakthroughTab(body) {
 
   $('#bt-diag')?.addEventListener('click', async (e) => {
     e.target.disabled = true;
-    msg('調べています（最大3分）…');
+    msg('調べています…');
     let out;
     try {
       out = await api('/api/admin/breakthrough/diagnose', { method: 'POST', body: '{}' });
     } catch (err) {
-      msg(err.message, 'warn');
+      // "Load failed" is the browser giving up, not the server refusing.
+      const why = /load failed|fetch/i.test(err.message)
+        ? '応答が返る前に接続が切れました。数十秒おいてもう一度お試しください。'
+        : err.message;
+      msg(why, 'warn');
       e.target.disabled = false;
       return;
     }

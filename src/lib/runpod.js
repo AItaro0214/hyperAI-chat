@@ -348,7 +348,15 @@ export async function probeJob(apiKey, endpointId, { onProgress, timeoutMs = 900
       detail: JSON.stringify(state).slice(0, 2000),
     };
   }
-  return { ok: false, stage: 'job', jobId: queued.id, status: 'TIMEOUT', seconds: Math.round(timeoutMs / 1000) };
+  // Not a failure: it is still starting, and the id says where to look.
+  return {
+    ok: false,
+    stage: 'job',
+    jobId: queued.id,
+    status: 'STILL_RUNNING',
+    seconds: Math.round(timeoutMs / 1000),
+    note: 'まだ起動中です。数分後にもう一度診断してください。',
+  };
 }
 
 /**
@@ -383,9 +391,14 @@ export async function diagnose(apiKey, endpointId) {
 
   out.health = await health(apiKey, endpointId).catch((e) => ({ error: e.message }));
 
-  // Through the job API, because that is the path that reports why a worker
-  // failed to start; the synchronous one only ever produces a timeout.
-  out.probe = await probeJob(apiKey, endpointId, { timeoutMs: 480000 }).catch((e) => ({ error: e.message }));
+  /* Bounded well under any browser's patience.
+   *
+   * A cold start takes minutes, and waiting for one here meant the request
+   * never returned — the console showed "Load failed" while the server was
+   * still politely holding on. A startup failure, which is what this is for,
+   * surfaces in seconds once the image is cached; anything still queued after
+   * the cap is reported as such, with its job id so it can be checked later. */
+  out.probe = await probeJob(apiKey, endpointId, { timeoutMs: 40000 }).catch((e) => ({ error: e.message }));
 
   out.expected = DEFAULT_SPEC;
   return out;
