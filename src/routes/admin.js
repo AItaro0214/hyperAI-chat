@@ -44,6 +44,8 @@ import {
   health,
   purgeQueue,
   updateEndpoint,
+  setActive,
+  getEndpoint,
   diagnose,
   validateSpec,
   DEFAULT_SPEC,
@@ -262,9 +264,12 @@ admin.get('/breakthrough', async (c) => {
    * a Worker eviction — so on its own it will happily report "idle" while a
    * worker is in fact starting. RunPod knows the truth; ask it. */
   let live = null;
+  let out_workersMax = null;
   if (settings.runpodEndpointId) {
     const key = await getApiKey(c.env, 'RUNPOD_API_KEY');
     if (key) {
+      const ep = await getEndpoint(key, settings.runpodEndpointId).catch(() => null);
+      out_workersMax = ep?.workersMax ?? null;
       live = await health(key, settings.runpodEndpointId)
         .then((h) => ({
           workers: h.workers || null,
@@ -283,6 +288,8 @@ admin.get('/breakthrough', async (c) => {
   return c.json({
     live,
     on: !!settings.breakthrough,
+    active: Number(out_workersMax) > 0,
+    workersMax: out_workersMax,
     endpointId: settings.runpodEndpointId || null,
     model: settings.runpodModel || null,
     search: { backend: settings.searchBackend || 'ollama', searxngUrl: settings.searxngUrl || '', backends: BACKENDS, notes: BACKEND_NOTES },
@@ -376,6 +383,21 @@ admin.post('/breakthrough/diagnose', async (c) => {
   if (!settings.runpodEndpointId) return c.json({ error: 'エンドポイントがありません' }, 400);
   try {
     return c.json(await diagnose(key, settings.runpodEndpointId));
+  } catch (e) {
+    return c.json({ error: e.message }, 502);
+  }
+});
+
+admin.post('/breakthrough/active', async (c) => {
+  const { on } = await c.req.json().catch(() => ({}));
+  const settings = await getSettings(c.env);
+  const key = await getApiKey(c.env, 'RUNPOD_API_KEY');
+  if (!key) return c.json({ error: 'RUNPOD_API_KEY が未登録です' }, 400);
+  if (!settings.runpodEndpointId) return c.json({ error: 'エンドポイントがありません' }, 400);
+  try {
+    const out = await setActive(key, settings.runpodEndpointId, !!on);
+    if (!on) await writeWarming(c.env, null);
+    return c.json({ ok: true, ...out });
   } catch (e) {
     return c.json({ error: e.message }, 502);
   }

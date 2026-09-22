@@ -1893,8 +1893,10 @@ async function renderBreakthroughTab(body) {
 
   body.innerHTML =
     '<div class="card"><h3>自前モデル（RunPod Serverless）</h3>' +
-    '<p class="sm muted">ワーカー最小0・ボリュームなしで作るので、<b>待機中の課金はありません</b>。' +
-    'エンドポイントは置いたままでも無料で、次回の起動が速くなります。</p>' +
+    '<p class="sm muted">エンドポイントを置いておくだけなら無料です。' +
+    '<b>課金されるのはワーカーが動いている間だけ</b>で、これには応答後のアイドル待機（' +
+    (bt.spec?.idleTimeout ?? 300) + '秒）も含まれます。' +
+    '使い終わったら「停止」を押すと、待たずに課金が止まります。</p>' +
     (bt.endpointId
       ? '<div class="kv"><dt>エンドポイント</dt><dd><code>' + esc(bt.endpointId) + '</code></dd>' +
         '<dt>モデル名</dt><dd><code>' + esc(bt.model || '') + '</code></dd>' +
@@ -1925,7 +1927,10 @@ async function renderBreakthroughTab(body) {
         '<div class="row" style="margin-top:12px;flex-wrap:wrap">' +
         '<label class="row" style="gap:6px"><input type="checkbox" id="bt-on"' + (bt.on ? ' checked' : '') + '>' +
         '<span class="sm">チャット・エージェントでこのモデルを使う</span></label>' +
-        '<button class="btn" id="bt-warm">いま起動する</button>' +
+        (bt.active
+          ? '<button class="btn danger" id="bt-off">停止（課金を止める）</button>' +
+            '<button class="btn" id="bt-warm">いま起動する</button>'
+          : '<button class="btn primary" id="bt-on">有効化する</button>') +
         '<button class="btn" id="bt-reset">キューを空にする</button>' +
         '<button class="btn" id="bt-diag">診断</button>' +
         '<button class="btn danger" id="bt-destroy">破棄</button></div>' +
@@ -1962,6 +1967,21 @@ async function renderBreakthroughTab(body) {
       e.target.disabled = false;
     }
   });
+
+  const setActiveState = async (on, e) => {
+    e.target.disabled = true;
+    msg(on ? '有効化しています…' : '停止しています…');
+    try {
+      await api('/api/admin/breakthrough/active', { method: 'POST', body: JSON.stringify({ on }) });
+      msg(on ? '有効化しました。最初のリクエストで起動します。' : '停止しました。課金は止まります。', 'ok');
+      setTimeout(() => renderBreakthroughTab(body), 1200);
+    } catch (err) {
+      msg(err.message, 'warn');
+      e.target.disabled = false;
+    }
+  };
+  $('#bt-on')?.addEventListener('click', (e) => setActiveState(true, e));
+  $('#bt-off')?.addEventListener('click', (e) => setActiveState(false, e));
 
   $('#bt-warm')?.addEventListener('click', async (e) => {
     e.target.disabled = true;

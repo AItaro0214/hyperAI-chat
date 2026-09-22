@@ -25,13 +25,38 @@ export const DEFAULT_SPEC = {
   // 27B at bf16 is ~54GB and will not fit a 24GB card; the AWQ build is ~16GB.
   model: 'shawnw3i/Huihui-Qwen3.8-27B-abliterated-AWQ-MTP',
   quantization: 'awq',
-  gpu: 'NVIDIA GeForce RTX 4090',
+  /* 48GB, and cheaper per hour than the 24GB 4090 — $0.33 against $0.34 at
+   * the time of writing. The 27B weights are 20GB, which simply does not fit
+   * a 4090 once the KV cache and activations are accounted for; this was
+   * established the hard way, by watching it run out of memory during
+   * startup. Ampere generates more slowly than Ada, which is the trade for
+   * the model loading at all.
+   *
+   * Listed in order, so a stock-out on the first falls through rather than
+   * failing. */
+  gpu: ['NVIDIA RTX A6000', 'NVIDIA A40', 'NVIDIA L40S'],
+  /* 23.52 GiB, and the weights are about 16 of it. What is left has to hold
+   * the KV cache, peak activations and CUDA graphs, and the first attempt at
+   * these numbers died with "ran out of GPU memory during startup".
+   *
+   * 16K context rather than 32K halves the KV cache. Eight sequences rather
+   * than the default 256 is right for one user anyway. Eager mode gives up
+   * CUDA graph capture — some throughput for a couple of gigabytes. And
+   * vLLM 0.28 doubled MAX_NUM_BATCHED_TOKENS to 16384, which doubled peak
+   * activation memory with it, so it is put back. */
   maxModelLen: 32768,
-  // Qwen emits Hermes-style tool calls; without a parser the agent gets prose
-  // where it expects tool_calls and cannot do anything at all.
-  toolParser: 'hermes',
+  maxNumSeqs: 16,
+  maxNumBatchedTokens: 16384,
+  // CUDA graphs are worth their memory on a card that has it to spare.
+  enforceEager: false,
+  /* Not hermes. Asked for a tool, this model emits
+   *   <tool_call><function=name><parameter=q>…</parameter></function></tool_call>
+   * which is the Qwen3-Coder XML shape, not Hermes' JSON — so the hermes
+   * parser left it all sitting in content as prose and nothing ever saw a
+   * tool_call. Verified against the running endpoint. */
+  toolParser: 'qwen3_coder',
   reasoningParser: 'qwen3',
-  gpuMemoryUtilization: 0.95,
+  gpuMemoryUtilization: 0.92,
   workersMax: 1,
   /* Five minutes, not thirty seconds.
    *
@@ -85,6 +110,9 @@ export function templateBody(spec = {}) {
   const env = {
     MODEL_NAME: s.model,
     MAX_MODEL_LEN: String(s.maxModelLen),
+    MAX_NUM_SEQS: String(s.maxNumSeqs),
+    MAX_NUM_BATCHED_TOKENS: String(s.maxNumBatchedTokens),
+    ENFORCE_EAGER: String(!!s.enforceEager),
     GPU_MEMORY_UTILIZATION: String(s.gpuMemoryUtilization),
     // Tool calling is what makes agent mode possible at all.
     ENABLE_AUTO_TOOL_CHOICE: 'true',
@@ -113,7 +141,7 @@ export function endpointBody(templateId, spec = {}) {
     templateId,
     name: 'hyperai-breakthrough',
     computeType: 'GPU',
-    gpuTypeIds: [s.gpu],
+    gpuTypeIds: Array.isArray(s.gpu) ? s.gpu : [s.gpu],
     gpuCount: 1,
     // Zero minimum is the whole point: nothing runs, nothing is billed.
     workersMin: 0,
@@ -167,6 +195,25 @@ export async function destroy(apiKey, { endpointId, templateId } = {}) {
   return removed;
 }
 
+/**
+ * Turns the endpoint on and off by allowing or forbidding workers.
+ *
+ * Scaling to zero is not the same as costing nothing *now*: a worker inside
+ * its idle window is still running and still billed. Setting workersMax to 0
+ * ends that immediately rather than waiting out the timeout, and the cached
+ * image means switching back on is far cheaper than the first start was.
+ *
+ * The endpoint itself is only a configuration record either way, so nothing is
+ * lost by leaving it in place.
+ */
+export async function setActive(apiKey, endpointId, on) {
+  const patched = await call(apiKey, '/endpoints/' + endpointId, {
+    method: 'PATCH',
+    body: { workersMin: 0, workersMax: on ? 1 : 0 },
+  });
+  return { active: Number(patched?.workersMax) > 0, workersMax: patched?.workersMax };
+}
+
 /** Drops queued jobs. Used to clear a backlog that is only costing GPU time. */
 export async function purgeQueue(apiKey, endpointId) {
   const res = await fetch(RUN + '/' + endpointId + '/purge-queue', {
@@ -187,6 +234,9 @@ export async function purgeQueue(apiKey, endpointId) {
 export async function updateEndpoint(apiKey, endpointId, patch) {
   return call(apiKey, '/endpoints/' + endpointId, { method: 'PATCH', body: patch });
 }
+
+/** The endpoint record, for reading its current scale. */
+export const getEndpoint = (apiKey, endpointId) => call(apiKey, '/endpoints/' + endpointId);
 
 /** Worker counts, as the platform sees them. */
 export async function health(apiKey, endpointId) {
@@ -258,6 +308,50 @@ export async function warm(apiKey, endpointId, { onProgress, timeoutMs = 900000 
 }
 
 /**
+ * Submits one job and follows it to a verdict.
+ *
+ * The synchronous path cannot report a startup failure: it holds the socket
+ * while the worker tries to load, and the caller gives up first — Node's fetch
+ * at its 300-second header timeout, a Worker with a bare 500. Neither carries
+ * the reason. The job API keeps the verdict on the server, so "ran out of GPU
+ * memory during startup" is actually readable.
+ */
+export async function probeJob(apiKey, endpointId, { onProgress, timeoutMs = 900000 } = {}) {
+  const headers = { authorization: 'Bearer ' + apiKey, 'content-type': 'application/json' };
+  const submit = await fetch(RUN + '/' + endpointId + '/run', {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ input: { prompt: 'ping', sampling_params: { max_tokens: 8 } } }),
+    signal: AbortSignal.timeout(60000),
+  });
+  const queued = await submit.json().catch(() => null);
+  if (!queued?.id) {
+    return { ok: false, stage: 'submit', status: submit.status, detail: JSON.stringify(queued || {}).slice(0, 500) };
+  }
+
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    await new Promise((r) => setTimeout(r, 10000));
+    const state = await fetch(RUN + '/' + endpointId + '/status/' + queued.id, { headers })
+      .then((r) => r.json())
+      .catch((e) => ({ status: 'UNKNOWN', error: e.message }));
+    const elapsed = Math.round((Date.now() - started) / 1000);
+    onProgress?.({ elapsed, status: state.status });
+    if (['IN_QUEUE', 'IN_PROGRESS'].includes(state.status)) continue;
+    return {
+      ok: state.status === 'COMPLETED',
+      stage: 'job',
+      jobId: queued.id,
+      seconds: elapsed,
+      status: state.status,
+      // The whole thing: the useful part is whatever was not expected.
+      detail: JSON.stringify(state).slice(0, 2000),
+    };
+  }
+  return { ok: false, stage: 'job', jobId: queued.id, status: 'TIMEOUT', seconds: Math.round(timeoutMs / 1000) };
+}
+
+/**
  * Everything knowable about an endpoint from outside it.
  *
  * A 500 from the OpenAI path says nothing about why, and the reason is almost
@@ -289,29 +383,9 @@ export async function diagnose(apiKey, endpointId) {
 
   out.health = await health(apiKey, endpointId).catch((e) => ({ error: e.message }));
 
-  // The decisive part: what the endpoint actually says when asked.
-  const started = Date.now();
-  try {
-    const res = await fetch(openaiBase(endpointId) + '/chat/completions', {
-      method: 'POST',
-      headers: { authorization: 'Bearer ' + apiKey, 'content-type': 'application/json' },
-      body: JSON.stringify({
-        model: 'breakthrough',
-        messages: [{ role: 'user', content: 'ping' }],
-        max_tokens: 8,
-        stream: false,
-        chat_template_kwargs: { enable_thinking: false },
-      }),
-      signal: AbortSignal.timeout(180000),
-    });
-    out.probe = {
-      status: res.status,
-      seconds: Math.round((Date.now() - started) / 1000),
-      body: (await res.text()).slice(0, 3000),
-    };
-  } catch (e) {
-    out.probe = { error: String(e.message).slice(0, 400), seconds: Math.round((Date.now() - started) / 1000) };
-  }
+  // Through the job API, because that is the path that reports why a worker
+  // failed to start; the synchronous one only ever produces a timeout.
+  out.probe = await probeJob(apiKey, endpointId, { timeoutMs: 480000 }).catch((e) => ({ error: e.message }));
 
   out.expected = DEFAULT_SPEC;
   return out;
@@ -325,7 +399,8 @@ export function validateSpec(spec = {}) {
     problems.push('model は Hugging Face の "owner/name" 形式で指定してください');
   }
   // The combination people get wrong: a 24GB card and an unquantized 27B.
-  if (!s.quantization && /(?:2[0-9]|[3-9][0-9])b/i.test(s.model) && /4090|4080|3090/i.test(s.gpu)) {
+  const firstGpu = Array.isArray(s.gpu) ? s.gpu[0] : s.gpu;
+  if (!s.quantization && /(?:2[0-9]|[3-9][0-9])b/i.test(s.model) && /4090|4080|3090/i.test(firstGpu)) {
     problems.push('24GB のカードに 20B 超を無量子化で載せることはできません。AWQ / GPTQ 版を指定してください');
   }
   if (s.quantization && !['awq', 'gptq', 'squeezellm', 'bitsandbytes'].includes(s.quantization)) {

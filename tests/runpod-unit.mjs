@@ -34,7 +34,9 @@ check('文脈長を渡す', t.env.MAX_MODEL_LEN === '32768');
 
 // Without these the agent receives prose where it expects tool_calls.
 check('ツール呼び出しを有効化する', t.env.ENABLE_AUTO_TOOL_CHOICE === 'true');
-check('  パーサを指定する', t.env.TOOL_CALL_PARSER === 'hermes', t.env.TOOL_CALL_PARSER);
+// Verified against the running endpoint: this model emits the Qwen3-Coder
+// XML shape, and the hermes parser left it in content as prose.
+check('  パーサを指定する', t.env.TOOL_CALL_PARSER === 'qwen3_coder', t.env.TOOL_CALL_PARSER);
 check('モデル名を短縮名に固定', t.env.OPENAI_SERVED_MODEL_NAME_OVERRIDE === 'breakthrough');
 
 const noQuant = templateBody({ quantization: null, model: 'a/b' });
@@ -48,7 +50,9 @@ check('テンプレートを参照する', e.templateId === 'tpl_1');
 check('最小ワーカーは 0', e.workersMin === 0, 'アイドル課金が発生しない条件');
 check('  ネットワークボリュームを付けない', !('networkVolumeId' in e), '付けると月額が発生する');
 check('FlashBoot を有効化', e.flashboot === true, 'コールドスタート短縮');
-check('GPU を指定', e.gpuTypeIds[0] === 'NVIDIA GeForce RTX 4090');
+// 20GB of weights do not fit 24GB once the KV cache is accounted for.
+check('GPU は 48GB 以上', /A6000|A40|L40S/.test(e.gpuTypeIds[0]), e.gpuTypeIds.join(', '));
+check('  在庫切れに備えて複数指定', e.gpuTypeIds.length > 1, String(e.gpuTypeIds.length));
 check('実行タイムアウトに余裕', e.executionTimeoutMs >= 600000, String(e.executionTimeoutMs) + 'ms');
 // A short idle timeout spends minutes of GPU re-loading 16GB to save cents.
 check('アイドル待機が短すぎない', e.idleTimeout >= 120, e.idleTimeout + '秒');
