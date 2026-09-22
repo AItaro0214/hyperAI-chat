@@ -594,8 +594,22 @@ chat.post('/chat', async (c) => {
             await setPhase('writing');
             await emit('delta', { text: msg.content });
           }
-          if (!msg.content && !think) {
-            failed = 'モデルが空の応答を返しました: ' + JSON.stringify(whole || {}).slice(0, 400);
+          /* A tool call on the final turn is parsed out of content and, with
+           * no tools offered, has nowhere to go — so the reply arrives empty
+           * with the tokens already spent. Render it rather than lose it. */
+          if (!msg.content && !think && msg.tool_calls?.length) {
+            const asked = msg.tool_calls
+              .map((t) => t.function?.name + '(' + String(t.function?.arguments || '').slice(0, 120) + ')')
+              .join(', ');
+            const note = 'モデルはさらに ' + asked + ' を実行しようとしましたが、検索は既に打ち切られています。';
+            text += note;
+            await emit('delta', { text: note });
+          } else if (!msg.content && !think) {
+            failed =
+              'モデルが空の応答を返しました（出力 ' +
+              (whole?.usage?.completion_tokens ?? '?') +
+              ' トークン）: ' +
+              JSON.stringify(whole || {}).slice(0, 500);
             await emit('error', { message: failed });
           }
           await savePartial(false);

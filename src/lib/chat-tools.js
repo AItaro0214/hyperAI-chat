@@ -135,5 +135,16 @@ export async function resolveTools({ url, headers, body, execute, onPhase, maxRo
     }
   }
 
+  /* Out of rounds, and the model does not know that.
+   *
+   * Left to itself it asks for another tool on the final turn — but that turn
+   * offers none, and vLLM's tool parser is enabled endpoint-wide, so the call
+   * it writes is stripped out and the reply arrives with content: null and
+   * nothing else. Ninety-three tokens generated and thrown away. Saying the
+   * search is over is what stops it reaching for one. */
+  messages.push({
+    role: 'user',
+    content: 'これ以上は検索できません。ここまでに得られた情報だけで回答してください。分からない部分は分からないと述べてください。',
+  });
   return { messages, calls, rounds: maxRounds, exhausted: true };
 }
