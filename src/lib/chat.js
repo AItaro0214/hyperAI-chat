@@ -293,7 +293,16 @@ export function buildRequest({ provider, model, messages, options = {}, apiKey, 
     if (options.temperature !== null && options.temperature !== undefined && options.temperature !== '') {
       btBody.temperature = Number(options.temperature);
     }
-    if (Number(options.maxTokens) > 0) btBody.max_tokens = Number(options.maxTokens);
+    /* Capped, unlike the hosted providers.
+     *
+     * Leaving max_tokens off lets a hosted model stop when it is finished,
+     * which is what you want. A self-hosted one will instead keep going until
+     * it runs out of context — 32K minus a long prompt is some eighteen
+     * thousand tokens, and at twenty a second that is a quarter of an hour of
+     * GPU spent on a reply nobody asked to be that long. Worse here than
+     * elsewhere because the request is not streamed: nothing appears at all
+     * until it finishes. */
+    btBody.max_tokens = Number(options.maxTokens) > 0 ? Number(options.maxTokens) : 4096;
     /* The one reasoning control a self-hosted Qwen has: thinking on or off,
      * passed through the chat template rather than as a top-level field. */
     /* Off unless asked for. Qwen thinks by default, and on a 27B model on one

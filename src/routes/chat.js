@@ -534,7 +534,15 @@ chat.post('/chat', async (c) => {
         const started = Date.now();
         keepalive = setInterval(() => {
           const secs = Math.round((Date.now() - started) / 1000);
-          emit('meta', { notices: ['GPU の起動待ち… ' + secs + '秒（初回は重みの読み込みに数分かかります）'] }).catch(() => {});
+          /* The wait is for generation as much as for startup, and the reply
+           * is not streamed — so without this the screen shows nothing at all
+           * for however long the model takes, which is indistinguishable from
+           * a hang. */
+          const what =
+            secs < 60
+              ? 'GPU が応答を生成しています… ' + secs + '秒'
+              : '生成中… ' + Math.floor(secs / 60) + '分' + (secs % 60) + '秒（起動直後は重みの読み込みで数分かかります）';
+          emit('meta', { notices: [what] }).catch(() => {});
         }, 10000);
       }
 
