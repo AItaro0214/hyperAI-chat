@@ -30,6 +30,7 @@ import {
   listApiKeys,
   saveSettings,
   setApiKey,
+  getJsonSetting,
   setJsonSetting,
 } from '../lib/store.js';
 import { GROQ_PRICING } from '../data/groq-pricing.js';
@@ -185,8 +186,35 @@ admin.post('/secrets/test', async (c) => {
 
 /* ----------------------------- breakthrough ------------------------------
  * Provisioning is minutes, so the POST returns immediately and the console
- * polls the warm-up state kept here. */
-let warming = null;
+ * polls for progress.
+ *
+ * That progress cannot live in module memory. A Worker isolate is not pinned
+ * to a session: the POST that starts a warm-up and the GET that asks about it
+ * routinely land on different instances, so an in-memory value reads back as
+ * null and the console reports "idle" a second after starting. It goes in the
+ * database, which every instance can see.
+ *
+ * The loop that polls RunPod can still be cut short by an eviction, and that
+ * is survivable: the request it already sent is queued on RunPod's side and
+ * will bring a worker up whether or not anything here is still watching. The
+ * authoritative answer is RunPod's own health, read on every status call. */
+const WARM_KEY = 'runpodWarming';
+
+const readWarming = (env) => getJsonSetting(env, WARM_KEY, null);
+const writeWarming = (env, value) => setJsonSetting(env, WARM_KEY, value);
+
+/** Drives the warm-up, recording progress where any instance can read it. */
+async function runWarm(env, key, endpointId) {
+  const base = await readWarming(env);
+  try {
+    const out = await warm(key, endpointId, {
+      onProgress: (p) => writeWarming(env, { ...base, ...p }).catch(() => {}),
+    });
+    await writeWarming(env, { ...base, ready: true, seconds: out.seconds });
+  } catch (e) {
+    await writeWarming(env, { ...base, error: String(e.message).slice(0, 300) });
+  }
+}
 
 admin.get('/breakthrough', async (c) => {
   const settings = await getSettings(c.env);
@@ -221,7 +249,7 @@ admin.get('/breakthrough', async (c) => {
     search: { backend: settings.searchBackend || 'ollama', searxngUrl: settings.searxngUrl || '', backends: BACKENDS, notes: BACKEND_NOTES },
     spec: DEFAULT_SPEC,
     image: VLLM_IMAGE,
-    warming,
+    warming: await readWarming(c.env),
   });
 });
 
@@ -254,13 +282,8 @@ admin.post('/breakthrough/provision', async (c) => {
     breakthrough: true,
   });
 
-  warming = { started: Date.now(), elapsed: 0, ready: false, error: null };
-  // Survives the response, but not a Worker eviction; the console can retry.
-  c.executionCtx.waitUntil(
-    warm(key, created.endpointId, { onProgress: (p) => { warming = { ...warming, ...p }; } })
-      .then((r) => { warming = { ...warming, ready: true, seconds: r.seconds }; })
-      .catch((e) => { warming = { ...warming, error: e.message }; })
-  );
+  await writeWarming(c.env, { started: Date.now(), elapsed: 0, ready: false, error: null });
+  c.executionCtx.waitUntil(runWarm(c.env, key, created.endpointId));
   return c.json({ ...created, spec }, 202);
 });
 
@@ -269,15 +292,15 @@ admin.post('/breakthrough/warm', async (c) => {
   const key = await getApiKey(c.env, 'RUNPOD_API_KEY');
   if (!key) return c.json({ error: 'RUNPOD_API_KEY が未登録です' }, 400);
   if (!settings.runpodEndpointId) return c.json({ error: 'エンドポイントがありません' }, 400);
-  if (warming && !warming.ready && !warming.error) return c.json({ ok: true, already: true, warming });
+  const current = await readWarming(c.env);
+  // A stale record from an evicted run must not block a fresh attempt.
+  const fresh = current && Date.now() - current.started < 20 * 60 * 1000;
+  if (fresh && !current.ready && !current.error) return c.json({ ok: true, already: true, warming: current });
 
-  warming = { started: Date.now(), elapsed: 0, ready: false, error: null };
-  c.executionCtx.waitUntil(
-    warm(key, settings.runpodEndpointId, { onProgress: (p) => { warming = { ...warming, ...p }; } })
-      .then((r) => { warming = { ...warming, ready: true, seconds: r.seconds }; })
-      .catch((e) => { warming = { ...warming, error: e.message }; })
-  );
-  return c.json({ ok: true, warming }, 202);
+  const started = { started: Date.now(), elapsed: 0, ready: false, error: null };
+  await writeWarming(c.env, started);
+  c.executionCtx.waitUntil(runWarm(c.env, key, settings.runpodEndpointId));
+  return c.json({ ok: true, warming: started }, 202);
 });
 
 admin.post('/breakthrough/destroy', async (c) => {
@@ -290,7 +313,7 @@ admin.post('/breakthrough/destroy', async (c) => {
   } catch (e) {
     return c.json({ error: e.message }, 502);
   }
-  warming = null;
+  await writeWarming(c.env, null);
   await saveSettings(c.env, { runpodEndpointId: '', runpodTemplateId: '', runpodModel: '', runpodMaxLen: 0, breakthrough: false });
   return c.json({ ok: true });
 });
