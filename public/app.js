@@ -1930,7 +1930,7 @@ async function renderBreakthroughTab(body) {
         (bt.active
           ? '<button class="btn danger" id="bt-off">停止（課金を止める）</button>' +
             '<button class="btn" id="bt-warm">いま起動する</button>'
-          : '<button class="btn primary" id="bt-on">有効化する</button>') +
+          : '<button class="btn primary" id="bt-activate">有効化する</button>') +
         '<button class="btn" id="bt-reset">キューを空にする</button>' +
         '<button class="btn" id="bt-diag">診断</button>' +
         '<button class="btn danger" id="bt-destroy">破棄</button></div>' +
@@ -1980,7 +1980,7 @@ async function renderBreakthroughTab(body) {
       e.target.disabled = false;
     }
   };
-  $('#bt-on')?.addEventListener('click', (e) => setActiveState(true, e));
+  $('#bt-activate')?.addEventListener('click', (e) => setActiveState(true, e));
   $('#bt-off')?.addEventListener('click', (e) => setActiveState(false, e));
 
   $('#bt-warm')?.addEventListener('click', async (e) => {
