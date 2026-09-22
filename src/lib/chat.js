@@ -282,19 +282,25 @@ export function buildRequest({ provider, model, messages, options = {}, apiKey, 
    * OpenRouter features, and sending them to vLLM is at best ignored and at
    * worst a 400. Search is handled before the request instead, by xAI. */
   if (breakthrough?.baseUrl) {
-    const btBody = { model: breakthrough.model || 'breakthrough', messages, stream };
+    /* Not streamed.
+     *
+     * RunPod Serverless is job-based, and its OpenAI-compatible path did not
+     * deliver SSE the way a plain vLLM server does: a request that returned
+     * 200 after 164 seconds produced no deltas at all — no content, no
+     * reasoning, no token counts. One JSON body is slower to appear and
+     * actually arrives. */
+    const btBody = { model: breakthrough.model || 'breakthrough', messages, stream: false };
     if (options.temperature !== null && options.temperature !== undefined && options.temperature !== '') {
       btBody.temperature = Number(options.temperature);
     }
     if (Number(options.maxTokens) > 0) btBody.max_tokens = Number(options.maxTokens);
-    if (stream) btBody.stream_options = { include_usage: true };
     /* The one reasoning control a self-hosted Qwen has: thinking on or off,
      * passed through the chat template rather than as a top-level field. */
-    const thinking = thinkingFor(options.reasoning);
-    if (thinking !== null) {
-      btBody.chat_template_kwargs = { enable_thinking: thinking };
-      notices.push(thinking ? '思考モードを有効にしました' : '思考モードを切りました（高速）');
-    }
+    /* Off unless asked for. Qwen thinks by default, and on a 27B model on one
+     * GPU that is minutes of monologue before a greeting gets answered. */
+    const thinking = thinkingFor(options.reasoning) ?? false;
+    btBody.chat_template_kwargs = { enable_thinking: thinking };
+    if (thinking) notices.push('思考モードを有効にしました（応答が遅くなります）');
     notices.push('ブレイクスルーモード（自前GPU）で実行します');
     return {
       url: breakthrough.baseUrl + '/chat/completions',

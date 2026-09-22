@@ -555,6 +555,29 @@ chat.post('/chat', async (c) => {
         await emit('error', { message: failed });
       }
       if (!failed) {
+        /* Breakthrough replies come back whole, so they are handed to the
+         * same callbacks as one piece rather than parsed as a stream. */
+        if (breakthroughOn) {
+          const whole = await upstream.json().catch(() => null);
+          const msg = whole?.choices?.[0]?.message || {};
+          usage = whole?.usage || null;
+          const think = msg.reasoning_content || msg.reasoning || '';
+          if (think) {
+            reasoning += think;
+            await setPhase('thinking');
+            await emit('reasoning', { text: think });
+          }
+          if (msg.content) {
+            text += msg.content;
+            await setPhase('writing');
+            await emit('delta', { text: msg.content });
+          }
+          if (!msg.content && !think) {
+            failed = 'モデルが空の応答を返しました: ' + JSON.stringify(whole || {}).slice(0, 400);
+            await emit('error', { message: failed });
+          }
+          await savePartial(false);
+        } else
         await consumeChatStream(upstream, {
           onText: async (t) => {
             text += t;
