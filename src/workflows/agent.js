@@ -162,6 +162,13 @@ export class AgentWorkflow extends WorkflowEntrypoint {
             result = { text: 'エラー: ' + String(e?.message || e).slice(0, 800) };
           }
 
+          /* Tools that call a paid model — sub-agents, image, speech, video,
+           * X search — report what they spent in meta.cost. Only the coding
+           * model's own turns used to reach the run total, so a run that
+           * delegated or drew pictures was recorded as a fraction of its bill. */
+          const toolCost = Number(result?.meta?.cost);
+          if (Number.isFinite(toolCost) && toolCost > 0) cost += toolCost;
+
           if (result.image) {
             const id = newId('file');
             await env.KV.put('file:' + id, result.image.bytes, {

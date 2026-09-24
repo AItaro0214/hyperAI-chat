@@ -15,7 +15,7 @@ import {
   writeBinary,
 } from './sandbox.js';
 import { requireKey } from './chat.js';
-import { fetchImageModels, buildImageRequest, generateImages, imagesFrom } from './images.js';
+import { fetchImageModels, buildImageRequest, generateImages, imagesFrom, costOf as imageCostOf } from './images.js';
 import { pickImageModel, pickVideoModel, pickSpeechModel, fixExtension } from './image-purpose.js';
 import { fetchVideoModels, submitVideoJob, pollVideoJob, videoUrlFrom, jobStatusOf, estimateVideoCost, applyDiscount } from './video.js';
 import { fetchSpeechModels, synthesize, isGroqSpeech } from './speech.js';
@@ -130,7 +130,8 @@ export async function runTool(env, roomId, name, args, state, onOutput, options 
         text:
           '画像を生成しました: ' + out.path + '（' + Math.round(out.bytes / 1024) + 'KB）\n' +
           'モデル: ' + picked.model.id + '（選定理由: ' + picked.why + '）',
-        meta: { path: out.path, model: picked.model.id, purpose: args.purpose || null, prompt: args.prompt },
+        // The run total adds this in; without it a drawn picture was free.
+        meta: { path: out.path, model: picked.model.id, purpose: args.purpose || null, prompt: args.prompt, cost: imageCostOf(res) || null },
       };
     }
     case 'generate_video': {
