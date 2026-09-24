@@ -3,55 +3,58 @@
  * OpenRouter has a dedicated OpenAI-compatible /audio/speech endpoint. Its TTS
  * models are declared with the `speech` output modality — not `audio`, which is
  * only music and the conversational audio models — so they never show up in the
- * default catalogue listing. */
+ * default catalogue listing.
+ *
+ * GPT's voices are the exception: they are chat models that can answer in
+ * audio, not TTS models, so they are listed from the `audio` modality and
+ * reached through chat completions (see synthesizeViaChat). */
 
 import { OPENROUTER_BASE, GROQ_BASE, readProviderError } from './chat.js';
 import { attribution } from './branding.js';
+import { speechFamily, speechFields, styledText, GEMINI_VOICES } from './media-params.js';
 
 const CACHE_TTL_SEC = 3600;
-const SCHEMA = 'v1';
+const SCHEMA = 'v2';
 
-/** Voice sets are per provider and not exposed by the API, so they are listed here. */
-/* Google ships one cast across its TTS models. */
-const GEMINI_VOICES = [
-    'Zephyr', 'Puck', 'Charon', 'Kore', 'Fenrir', 'Leda', 'Orus', 'Aoede',
-    'Callirrhoe', 'Autonoe', 'Enceladus', 'Iapetus', 'Umbriel', 'Algieba',
-    'Despina', 'Erinome', 'Algenib', 'Rasalgethi', 'Laomedeia', 'Achernar',
-    'Alnilam', 'Schedar', 'Gacrux', 'Pulcherrima', 'Achird', 'Zubenelgenubi',
-    'Vindemiatrix', 'Sadachbia', 'Sadaltager', 'Sulafat',
-];
-
+/* Voice sets are per provider and not exposed by the API. Families that were
+ * verified keep their cast in media-params.js; these are the rest. */
 const VOICES = {
-  'google/gemini-3.1-flash-tts-preview': GEMINI_VOICES,
-  'google/gemini-3.8-flash-tts': GEMINI_VOICES,
-  'google/gemini-3.8-flash-lite-tts': GEMINI_VOICES,
-  'openai/gpt-audio': ['alloy', 'ash', 'ballad', 'coral', 'echo', 'sage', 'shimmer', 'verse'],
-  'openai/gpt-audio-mini': ['alloy', 'ash', 'ballad', 'coral', 'echo', 'sage', 'shimmer', 'verse'],
   'deepgram/aura-2': ['thalia', 'andromeda', 'helena', 'apollo', 'arcas', 'aries', 'amalthea'],
   'deepgram/flux-tts:free': ['thalia', 'andromeda', 'helena', 'apollo', 'arcas'],
-  'minimax/speech-2.8-turbo': ['Japanese_KindLady', 'female-shaonv'],
-  'minimax/speech-2.8-hd': ['Japanese_KindLady', 'female-shaonv'],
-  'x-ai/grok-voice-tts-1.0': ['Eve'],
   'hexgrad/kokoro-82m': ['af_heart', 'af_bella', 'af_nicole', 'am_michael', 'jf_alpha', 'jm_kumo'],
 };
 
-/** Models the app should offer first — the ones that handle Japanese well. */
+/* Models the app should offer first — the ones that handle Japanese well and
+ * were confirmed to work. Qwen's TTS is absent on purpose: no voice name it
+ * would accept could be found. */
 const PREFERRED = [
   'google/gemini-3.8-flash-tts',
   'google/gemini-3.8-flash-lite-tts',
   'google/gemini-3.1-flash-tts-preview',
-  'qwen/qwen-audio-3.0-tts-flash',
-  'qwen/qwen-audio-3.0-tts-plus',
-  'minimax/speech-2.8-turbo',
   'openai/gpt-audio-mini',
+  'openai/gpt-audio',
+  'minimax/speech-2.8-turbo',
+  'minimax/speech-2.8-hd',
 ];
 
-export const voicesFor = (model) => VOICES[model] || [];
+export const voicesFor = (model) => {
+  const fam = speechFamily(model);
+  return fam?.voices?.length ? fam.voices : VOICES[model] || (/gemini.*tts/i.test(String(model)) ? GEMINI_VOICES : []);
+};
+
+async function listModality(modality) {
+  const res = await fetch(OPENROUTER_BASE + '/models?output_modality=' + modality, {
+    headers: { accept: 'application/json' },
+    signal: AbortSignal.timeout(20000),
+  });
+  if (!res.ok) throw new Error('OpenRouter /models?output_modality=' + modality + ' ' + res.status);
+  return (await res.json()).data || [];
+}
 
 /**
  * Every model OpenRouter can speak with.
- * The listing is filtered by the `speech` output modality; `audio` returns music
- * models and the conversational audio pair instead.
+ * The TTS models come from the `speech` modality; GPT's audio-capable chat
+ * models are added from `audio`, leaving out the music models that share it.
  */
 export async function fetchSpeechModels(env, { force = false } = {}) {
   const key = 'cache:speechmodels:' + SCHEMA;
@@ -60,27 +63,33 @@ export async function fetchSpeechModels(env, { force = false } = {}) {
     if (hit && Date.now() - hit.at < CACHE_TTL_SEC * 1000) return hit.data;
   }
 
-  const res = await fetch(OPENROUTER_BASE + '/models?output_modality=speech', {
-    headers: { accept: 'application/json' },
-    signal: AbortSignal.timeout(20000),
-  });
-  if (!res.ok) throw new Error('OpenRouter /models?output_modality=speech ' + res.status);
-  const json = await res.json();
+  const speech = await listModality('speech');
+  const audio = await listModality('audio').catch(() => []);
+  const chatVoices = audio.filter((m) => speechFamily(m.id)?.route === 'chat');
 
-  const data = (json.data || []).map((m) => ({
-    id: m.id,
-    name: m.name || m.id,
-    description: (m.description || '').slice(0, 240),
-    free: /:free$/.test(m.id) || Number(m.pricing?.prompt) === 0,
-    // These models bill by input characters, so `prompt` is the rate that matters.
-    perMillionChars: Number(m.pricing?.prompt || 0) * 1e6,
-    voices: voicesFor(m.id),
-    params: m.supported_parameters || [],
-  }));
+  const data = [...speech, ...chatVoices].map((m) => {
+    const fam = speechFamily(m.id);
+    return {
+      id: m.id,
+      name: m.name || m.id,
+      description: (m.description || '').slice(0, 240),
+      free: /:free$/.test(m.id) || Number(m.pricing?.prompt) === 0,
+      // TTS models bill by input characters, so `prompt` is the rate that
+      // matters; the chat voices bill by token and report their own cost.
+      perMillionChars: fam?.route === 'chat' ? 0 : Number(m.pricing?.prompt || 0) * 1e6,
+      voices: voicesFor(m.id),
+      route: fam?.route || 'speech',
+      family: fam?.id || null,
+      // No voice list and no free entry means the provider default is used.
+      voiceRequired: !!fam && !fam.voiceOptional && !voicesFor(m.id).length,
+      hint: fam?.hint || null,
+      fields: speechFields(m.id),
+    };
+  });
 
   const rank = (m) => {
     const at = PREFERRED.indexOf(m.id);
-    return at === -1 ? PREFERRED.length + (m.free ? 0.5 : 1) : at;
+    return at === -1 ? PREFERRED.length + (m.free ? 0.5 : 1) + (m.family === 'qwen' ? 2 : 0) : at;
   };
   data.sort((a, b) => rank(a) - rank(b) || a.id.localeCompare(b.id));
 
@@ -117,8 +126,6 @@ export const OPENROUTER_FORMATS = ['mp3', 'pcm'];
 /** Groq's own endpoint is a separate service with a separate list. */
 export const GROQ_FORMATS = ['wav', 'mp3', 'flac'];
 
-/* Models that dictate the format rather than offering one. */
-const FORMAT_RULES = [{ match: /gemini.*tts|tts.*gemini/i, only: 'pcm' }];
 
 /**
  * The format to actually request for a model.
@@ -127,8 +134,10 @@ const FORMAT_RULES = [{ match: /gemini.*tts|tts.*gemini/i, only: 'pcm' }];
  */
 export function formatFor(model, wanted, { provider = 'openrouter' } = {}) {
   const allowed = provider === 'groq' ? GROQ_FORMATS : OPENROUTER_FORMATS;
-  const forced = FORMAT_RULES.find((r) => r.match.test(String(model || '')))?.only;
-  if (forced) return forced;
+  // Some families dictate the format rather than offering one: Gemini is
+  // pcm only, MiniMax is mp3 only.
+  const forced = speechFamily(model)?.format;
+  if (forced && allowed.includes(forced)) return forced;
   if (wanted && allowed.includes(wanted)) return wanted;
   return allowed[0];
 }
@@ -185,21 +194,30 @@ export function hasContainer(bytes) {
 }
 
 /**
- * Synthesises speech. Both providers expose the same OpenAI-compatible shape.
+ * Synthesises speech. Both providers expose the same OpenAI-compatible shape,
+ * and GPT's voices are reached through chat completions instead.
  *
  * The format asked for is not always the format that comes back: Gemini is
  * pcm or nothing, and pcm is given a WAV header here so that what the rest of
  * the app handles is always a playable file. `format` in the result is that
  * final one — the extension the file should carry.
  *
- * @returns {Promise<{bytes: Uint8Array, mime: string, format: string, requested: string}>}
+ * `params` are the already-validated speech settings (see sanitizeParams):
+ * speed, style tags, instructions. Only the ones the model's family was
+ * verified to honour are applied.
+ *
+ * @returns {Promise<{bytes: Uint8Array, mime: string, format: string, requested: string, cost?: number|null}>}
  */
-export async function synthesize(apiKey, model, { text, voice, format, provider = 'openrouter' } = {}) {
+export async function synthesize(apiKey, model, { text, voice, format, provider = 'openrouter', params = {} } = {}) {
+  const fam = speechFamily(model);
+  if (fam?.route === 'chat') return synthesizeViaChat(apiKey, model, { text, voice, params });
+
   const groq = provider === 'groq';
   const requested = formatFor(model, format, { provider });
-  const body = { model, input: text, response_format: requested };
+  const body = { model, input: groq ? text : styledText(model, text, params), response_format: requested };
   // Omitting the voice lets the provider pick its own default.
   if (voice) body.voice = voice;
+  if (fam?.speed && Number.isFinite(params.speed) && params.speed !== 1) body.speed = params.speed;
 
   const res = await fetch((groq ? GROQ_BASE : OPENROUTER_BASE) + '/audio/speech', {
     method: 'POST',
@@ -226,8 +244,101 @@ export async function synthesize(apiKey, model, { text, voice, format, provider 
     return { bytes, mime: 'audio/wav', format: 'wav', requested };
   }
 
-  const format2 = requested === 'pcm' ? 'wav' : requested;
-  return { bytes, mime: contentType || speechMime(format2), format: format2, requested };
+  const finalFormat = requested === 'pcm' ? 'wav' : requested;
+  return { bytes, mime: contentType || speechMime(finalFormat), format: finalFormat, requested };
+}
+
+/* A chat model left to itself *answers* the text — "そうですね、今日は本当に
+ * お天気が良くて…" in reply to a sentence about the weather. Pinning it to
+ * reading verbatim is what turns it into a voice. The style instructions go in
+ * the same system prompt, where they shape delivery without being spoken. */
+const READ_VERBATIM =
+  'あなたは読み上げ専用の音声です。ユーザーの文章を一字一句そのまま、省略も追加もせずに読み上げてください。' +
+  '返事・感想・説明・前置きは一切加えないこと。';
+
+/**
+ * GPT's voices, through chat completions with audio output.
+ *
+ * Streaming is mandatory for audio output there, and a streamed response
+ * accepts exactly one format — pcm16, i.e. raw 24kHz samples — so the result
+ * is always wrapped as WAV.
+ */
+export async function synthesizeViaChat(apiKey, model, { text, voice, params = {} } = {}) {
+  const system = READ_VERBATIM + (params.instructions ? '\n読み方: ' + String(params.instructions).slice(0, 600) : '');
+  const res = await fetch(OPENROUTER_BASE + '/chat/completions', {
+    method: 'POST',
+    headers: { authorization: 'Bearer ' + apiKey, 'content-type': 'application/json', ...attribution() },
+    body: JSON.stringify({
+      model,
+      messages: [
+        { role: 'system', content: system },
+        { role: 'user', content: text },
+      ],
+      modalities: ['text', 'audio'],
+      audio: { voice: voice || 'alloy', format: 'pcm16' },
+      stream: true,
+    }),
+    signal: AbortSignal.timeout(180000),
+  });
+  if (!res.ok) throw new Error(speechError(await readProviderError(res), model));
+
+  const { audio, usage } = await readAudioStream(res.body);
+  if (!audio.length) throw new Error('音声が返りませんでした');
+  return {
+    bytes: wavFromPcm(audio, { sampleRate: 24000, channels: 1, bits: 16 }),
+    mime: 'audio/wav',
+    format: 'wav',
+    requested: 'pcm16',
+    cost: typeof usage?.cost === 'number' ? usage.cost : null,
+  };
+}
+
+/** Collects the base64 audio deltas of an SSE stream into raw bytes. */
+export async function readAudioStream(stream) {
+  const decoder = new TextDecoder();
+  const reader = stream.getReader();
+  const parts = [];
+  let pending = '';
+  let usage = null;
+  let total = 0;
+
+  const take = (line) => {
+    if (!line.startsWith('data:')) return;
+    const body = line.slice(5).trim();
+    if (!body || body === '[DONE]') return;
+    let json;
+    try {
+      json = JSON.parse(body);
+    } catch {
+      return;
+    }
+    if (json.usage) usage = json.usage;
+    const data = json.choices?.[0]?.delta?.audio?.data;
+    if (!data) return;
+    const bin = atob(data);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    parts.push(bytes);
+    total += bytes.length;
+  };
+
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    pending += decoder.decode(value, { stream: true });
+    const lines = pending.split('\n');
+    pending = lines.pop();
+    lines.forEach(take);
+  }
+  if (pending) take(pending);
+
+  const audio = new Uint8Array(total);
+  let at = 0;
+  for (const p of parts) {
+    audio.set(p, at);
+    at += p.length;
+  }
+  return { audio, usage };
 }
 
 /* Provider errors arrive in English and in their own vocabulary; the two that

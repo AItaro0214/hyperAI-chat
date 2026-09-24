@@ -1,8 +1,9 @@
 import { OPENROUTER_BASE } from './chat.js';
 import { attribution } from './branding.js';
+import { videoFields } from './media-params.js';
 
 const CACHE_TTL_SEC = 3600;
-const SCHEMA = 'v3';
+const SCHEMA = 'v4';
 // OpenRouter bills video by "video tokens": (w * h * fps * duration) / 1024.
 // Providers render at 24fps unless stated otherwise.
 const ASSUMED_FPS = 24;
@@ -39,6 +40,7 @@ export async function fetchVideoModels(env, { force = false } = {}) {
     rates: normalizeRates(m.pricing_skus),
     passthrough: m.allowed_passthrough_parameters || [],
   }));
+  for (const model of data) model.fields = videoFields(model);
   // Promotional discounts only appear on the per-model endpoints route, so they
   // are collected in parallel and folded in before caching.
   const raw = json.data || [];
@@ -53,6 +55,8 @@ export async function fetchVideoModels(env, { force = false } = {}) {
         });
         if (!detail.ok) return;
         const body = await detail.json();
+        // The provider slug keys passthrough options: provider.options[tag].
+        model.providerTag = body?.data?.endpoints?.[0]?.tag || null;
         const discount = Number(body?.data?.endpoints?.[0]?.pricing?.discount || 0);
         if (Number.isFinite(discount) && discount > 0 && discount < 1) model.discount = discount;
       } catch {

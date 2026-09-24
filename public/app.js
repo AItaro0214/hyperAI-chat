@@ -5,7 +5,7 @@ import { initExport, attachExportButtons, openExport } from '/export.js';
 import { initImageGen } from '/imagegen.js';
 import { initAgent } from '/agent.js';
 import { initRecorder } from '/recorder.js';
-import { initTts, ttsPrefs, speakInBrowser, refreshModels as refreshTtsModels } from '/tts.js';
+import { initTts, ttsPrefs, ttsParams, speakInBrowser, refreshModels as refreshTtsModels } from '/tts.js';
 import { initGestures } from '/gestures.js';
 
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -933,7 +933,13 @@ async function speak(text, btn) {
     }
     const res = await api('/api/tts', {
       method: 'POST',
-      body: JSON.stringify({ text: text.slice(0, 4000), roomId: state.roomId, model: prefs.model, voice: prefs.voice }),
+      body: JSON.stringify({
+        text: text.slice(0, 4000),
+        roomId: state.roomId,
+        model: prefs.model,
+        voice: prefs.voice,
+        params: ttsParams(prefs.model),
+      }),
     });
     await new Audio(res.url).play();
     toast('読み上げ ' + res.chars + '文字' + (res.cost ? ' · ' + usd(res.cost) : ''));

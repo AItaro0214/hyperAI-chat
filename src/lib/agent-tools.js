@@ -217,7 +217,9 @@ export async function runTool(env, roomId, name, args, state, onOutput, options 
       try {
         out = await synthesize(apiKey, picked.model.id, {
           text: String(args.text || ''),
-          voice: args.voice,
+          // Several providers refuse a request without a voice, so fall back
+          // to the first one the catalogue knows for the model.
+          voice: args.voice || picked.model.voices?.[0],
           format,
           provider: groq ? 'groq' : 'openrouter',
         });
@@ -225,10 +227,14 @@ export async function runTool(env, roomId, name, args, state, onOutput, options 
         return { text: '読み上げに失敗しました: ' + String(e.message).slice(0, 300) };
       }
 
-      const saved = await writeBinary(sandbox, fixExtension(args.path, format), out.bytes);
-      const cost = picked.model.perMillionChars
-        ? (String(args.text || '').length / 1e6) * picked.model.perMillionChars
-        : null;
+      // Gemini answers only in raw pcm, which synthesize() turns into a WAV,
+      // so the extension follows what came back rather than what was asked.
+      const saved = await writeBinary(sandbox, fixExtension(args.path, out.format || format), out.bytes);
+      const cost = typeof out.cost === 'number'
+        ? out.cost
+        : picked.model.perMillionChars
+          ? (String(args.text || '').length / 1e6) * picked.model.perMillionChars
+          : null;
       return {
         text:
           '音声を生成しました: ' + saved.path + '（' + Math.round(saved.bytes / 1024) + 'KB）\n' +

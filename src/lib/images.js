@@ -6,9 +6,10 @@
 
 import { OPENROUTER_BASE } from './chat.js';
 import { attribution } from './branding.js';
+import { imageFields, sanitizeParams } from './media-params.js';
 
 const CACHE_TTL_SEC = 3600;
-const SCHEMA = 'v1';
+const SCHEMA = 'v2';
 
 export async function fetchImageModels(env, { force = false } = {}) {
   const key = 'cache:imagemodels:' + SCHEMA;
@@ -40,6 +41,8 @@ export async function fetchImageModels(env, { force = false } = {}) {
       seed: !!params.seed,
       maxReferences: Number(params.input_references?.max) || 0,
       params: Object.keys(params),
+      // The form is built from this, and requests are checked against it.
+      fields: imageFields(params),
     };
   });
 
@@ -65,7 +68,16 @@ export function buildImageRequest(model, options = {}) {
   if (model.maxReferences > 0 && Array.isArray(options.references) && options.references.length) {
     body.input_references = options.references.slice(0, model.maxReferences);
   }
-  return { body, requested: wanted };
+  /* The dynamic form sends `params`, keyed as the schema names them. Each is
+   * re-checked here against the model's own fields, so a stale form or a
+   * hand-written request cannot forward something the model never declared. */
+  let dropped = [];
+  if (options.params && typeof options.params === 'object') {
+    const clean = sanitizeParams(model.fields || imageFields({}), options.params);
+    Object.assign(body, clean.body);
+    dropped = clean.dropped;
+  }
+  return { body, requested: wanted, dropped };
 }
 
 /**

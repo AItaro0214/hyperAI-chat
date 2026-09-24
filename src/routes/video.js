@@ -4,6 +4,7 @@ import { now } from '../lib/auth.js';
 import { requireAuth } from '../lib/guard.js';
 import { logUsage } from '../lib/store.js';
 import { requireKey } from '../lib/chat.js';
+import { sanitizeParams, passthroughBody } from '../lib/media-params.js';
 import { applyDiscount, estimateVideoCost, fetchVideoModels, jobStatusOf, pollVideoJob, submitVideoJob, videoUrlFrom } from '../lib/video.js';
 
 const video = new Hono();
@@ -62,6 +63,19 @@ video.post('/videos', async (c) => {
     payload.seed = Number(body.seed);
   }
   if (model.generateAudio && body.generateAudio !== undefined) payload.generate_audio = !!body.generateAudio;
+
+  /* The dynamic form sends `params`. Each value is re-checked against the
+   * model's fields; body settings go top level, provider-specific ones under
+   * provider.options[slug], which is the only place OpenRouter forwards them. */
+  let dropped = [];
+  if (body.params && typeof body.params === 'object') {
+    const clean = sanitizeParams(model.fields || [], body.params);
+    Object.assign(payload, clean.body);
+    const provider = passthroughBody(model.providerTag, clean.passthrough);
+    if (provider) payload.provider = provider;
+    else if (Object.keys(clean.passthrough).length) dropped.push(...Object.keys(clean.passthrough));
+    dropped.push(...clean.dropped);
+  }
 
   const frames = [];
   for (const frame of Array.isArray(body.frameImages) ? body.frameImages.slice(0, 2) : []) {
@@ -143,7 +157,7 @@ video.post('/videos', async (c) => {
     )
     .run();
 
-  return c.json({ job: { id: jobId, status: jobStatusOf(submitted), model: model.id, messageId, roomId: room?.id || null, estimate } }, 202);
+  return c.json({ job: { id: jobId, status: jobStatusOf(submitted), model: model.id, messageId, roomId: room?.id || null, estimate }, dropped }, 202);
 });
 
 video.get('/videos/jobs', async (c) => {

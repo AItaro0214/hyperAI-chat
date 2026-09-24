@@ -847,3 +847,20 @@ pre.diag {
   overflow: auto;
   user-select: all;
 }
+
+/* ---- Generated settings forms (public/paramform.js) ---- */
+.param-form { display: flex; flex-direction: column; gap: 12px; }
+.param-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px 13px; align-items: start; }
+.param-field { min-width: 0; }
+.param-field .param-value { color: var(--ink); font-weight: 620; margin-left: 4px; }
+.param-hint { color: var(--muted); line-height: 1.5; }
+.param-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.param-adv > summary { cursor: pointer; font-size: 12.5px; color: var(--ink-2); list-style: none; padding: 4px 0; }
+.param-adv > summary::-webkit-details-marker { display: none; }
+.param-adv > summary::before { content: '▸ '; }
+.param-adv[open] > summary::before { content: '▾ '; }
+.param-adv > .param-grid { margin-top: 10px; }
+.param-note { grid-column: 1 / -1; color: var(--muted); line-height: 1.5; }
+.slider.unset::-webkit-slider-thumb { opacity: .45; }
+.slider.unset::-moz-range-thumb { opacity: .45; }
+.param-clear { align-self: flex-start; padding: 2px 8px; font-size: 11.5px; }

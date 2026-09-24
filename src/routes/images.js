@@ -63,10 +63,12 @@ images.post('/images', async (c) => {
 
   // Models capped at n=1 still produce a batch: the request is simply split.
   const batches = planBatches(count, model.maxN);
+  let dropped = [];
   const results = await Promise.allSettled(
     batches.map((n) => {
-      const { body: payload } = buildImageRequest(model, { ...body, prompt, n, references });
-      return generateImages(apiKey, payload);
+      const built = buildImageRequest(model, { ...body, prompt, n, references });
+      dropped = built.dropped;
+      return generateImages(apiKey, built.body);
     })
   );
 
@@ -138,7 +140,7 @@ images.post('/images', async (c) => {
 
   if (cost) await logUsage(c.env, { userId, roomId: room?.id || null, provider: 'openrouter', model: model.id, kind: 'image', units: attachments.length, cost });
 
-  return c.json({ images: attachments, cost: cost || null, messageId, roomId: room?.id || null, errors }, 201);
+  return c.json({ images: attachments, cost: cost || null, messageId, roomId: room?.id || null, errors, dropped }, 201);
 });
 
 export default images;

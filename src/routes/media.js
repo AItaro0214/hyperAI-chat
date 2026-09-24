@@ -6,6 +6,7 @@ import { getSettings, logUsage } from '../lib/store.js';
 import { GROQ_BASE, readProviderError, requireKey } from '../lib/chat.js';
 import { estimateAsrCost, estimateTtsCost, getCatalog, findModel } from '../lib/models.js';
 import { fetchSpeechModels, synthesize, isGroqSpeech, speechMime, formatFor } from '../lib/speech.js';
+import { speechFields, sanitizeParams } from '../lib/media-params.js';
 import { isExpired, expiresAt, EXPIRING_KINDS, MEDIA_TTL_DAYS } from '../lib/media-retention.js';
 
 const media = new Hono();
@@ -231,8 +232,13 @@ media.post('/tts', async (c) => {
   const text = String(body.text || '').slice(0, 8000);
   if (!text.trim()) return c.json({ error: 'text が必要です' }, 400);
   const model = body.model || settings.ttsModel;
-  const voice = body.voice || settings.ttsVoice;
   const userId = c.get('userId');
+
+  /* Settings from the form, checked against what this model's family was
+   * verified to honour. A typed voice ID wins over the picker, because it is
+   * only there for voices the picker does not know. */
+  const clean = sanitizeParams(speechFields(model), body.params || {});
+  const voice = clean.speech.voice_custom || body.voice || settings.ttsVoice;
 
   // Groq's Orpheus needs its own endpoint and its 200-character cap; every
   // other model goes to OpenRouter's /audio/speech in one shot.
@@ -270,12 +276,15 @@ media.post('/tts', async (c) => {
       const catalog = await getCatalog(c.env).catch(() => ({ models: [] }));
       cost = estimateTtsCost(findModel(catalog, 'groq:' + model), spoken.length);
     } else {
-      const out = await synthesize(key, model, { text, voice, format, provider: 'openrouter' });
+      const out = await synthesize(key, model, { text, voice, format, provider: 'openrouter', params: clean.speech });
       buf = out.bytes;
       mime = out.mime;
       ext = out.format;
-      const meta = (await fetchSpeechModels(c.env).catch(() => [])).find((m) => m.id === model);
-      if (meta?.perMillionChars) cost = (text.length / 1e6) * meta.perMillionChars;
+      if (typeof out.cost === 'number') cost = out.cost;
+      else {
+        const meta = (await fetchSpeechModels(c.env).catch(() => [])).find((m) => m.id === model);
+        if (meta?.perMillionChars) cost = (text.length / 1e6) * meta.perMillionChars;
+      }
     }
   } catch (e) {
     return c.json({ error: e.message }, 502);
@@ -300,7 +309,7 @@ media.post('/tts', async (c) => {
     cost,
   });
 
-  return c.json({ id, url: '/api/files/' + id, mime, size, format: ext, cost, chars: spoken.length });
+  return c.json({ id, url: '/api/files/' + id, mime, size, format: ext, cost, chars: spoken.length, dropped: clean.dropped });
 });
 
 export default media;

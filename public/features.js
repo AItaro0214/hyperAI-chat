@@ -2,6 +2,7 @@
  * The chat shell hands its helpers in via initFeatures so this module stays
  * free of duplicated plumbing. */
 import { icon } from '/icons.js';
+import { paramForm } from '/paramform.js';
 
 let ctx = null;
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -86,31 +87,20 @@ function bindArtifacts() {
 /* ========================== VIDEO GENERATION =========================== */
 let videoModels = [];
 let videoTimer = null;
+let videoForm = null;
 
 const currentVideoModel = () => videoModels.find((m) => m.id === $('#vid-model').value) || null;
-
-function fillSelect(sel, values, { empty = null, selected = null } = {}) {
-  const node = $(sel);
-  const opts = [];
-  if (empty !== null) opts.push('<option value="">' + empty + '</option>');
-  for (const v of values) {
-    opts.push('<option value="' + ctx.esc(v) + '"' + (String(v) === String(selected) ? ' selected' : '') + '>' + ctx.esc(v) + '</option>');
-  }
-  node.innerHTML = opts.join('');
-  node.disabled = values.length === 0;
-}
 
 function renderVideoParams() {
   const m = currentVideoModel();
   if (!m) return;
   $('#vid-desc').textContent = m.description || '';
-  fillSelect('#vid-duration', m.durations, { selected: m.durations.includes(5) ? 5 : m.durations[0] });
-  fillSelect('#vid-resolution', m.resolutions, { selected: m.resolutions[0] });
-  fillSelect('#vid-aspect', m.aspectRatios, { empty: '指定しない' });
-  fillSelect('#vid-size', m.sizes, { empty: '解像度に任せる' });
-  $('#vid-audio').disabled = !m.generateAudio;
-  $('#vid-audio').checked = false;
-  $('#vid-seed').disabled = !m.seed;
+  // Durations, resolutions and the rest come from the model itself, as do
+  // its provider-specific options; remembered per model.
+  videoForm = paramForm($('#vid-params'), m.fields || [], {
+    store: 'cft.params.video.' + m.id,
+    onChange: updateVideoCost,
+  });
 
   const images = ctx.state.attachments.filter((a) => a.kind === 'image');
   const canFrame = m.frameImages.includes('first_frame') && images.length > 0;
@@ -179,10 +169,13 @@ function estimateCost(model, { resolution, size, duration, audio }) {
 function updateVideoCost() {
   const m = currentVideoModel();
   if (!m) return;
-  const duration = Number($('#vid-duration').value || 0);
-  const size = $('#vid-size').value;
-  const resolution = $('#vid-resolution').value;
-  const audio = $('#vid-audio').checked;
+  const v = videoForm ? videoForm.values() : {};
+  /* A model with a single duration or resolution has no control for it, so
+   * the estimate falls back to that one value. */
+  const duration = Number(v.duration ?? (m.durations.length === 1 ? m.durations[0] : 0));
+  const size = v.size || '';
+  const resolution = v.resolution || (m.resolutions.length === 1 ? m.resolutions[0] : '');
+  const audio = !!v.generate_audio;
   const list = estimateCost(m, { resolution, size, duration, audio });
   if (list == null) {
     $('#vid-cost').textContent = '概算コストを算出できません';
@@ -218,9 +211,6 @@ function bindVideo() {
   });
 
   $('#vid-model').addEventListener('change', renderVideoParams);
-  for (const sel of ['#vid-duration', '#vid-resolution', '#vid-size', '#vid-audio']) {
-    $(sel).addEventListener('change', updateVideoCost);
-  }
 
   $('#vid-run').addEventListener('click', async () => {
     const m = currentVideoModel();
@@ -238,15 +228,11 @@ function bindVideo() {
           roomId: ctx.state.roomId,
           model: m.id,
           prompt,
-          duration: Number($('#vid-duration').value) || undefined,
-          resolution: $('#vid-resolution').value || undefined,
-          aspectRatio: $('#vid-aspect').value || undefined,
-          size: $('#vid-size').value || undefined,
-          seed: $('#vid-seed').value === '' ? undefined : Number($('#vid-seed').value),
-          generateAudio: $('#vid-audio').disabled ? undefined : $('#vid-audio').checked,
+          params: videoForm ? videoForm.values() : {},
           frameImages: frameId ? [{ fileId: frameId, frameType: 'first_frame' }] : [],
         }),
       });
+      if (res.dropped?.length) ctx.toast('このモデルが受け付けない設定を除外しました: ' + res.dropped.join(', '));
       if (ctx.state.roomId) await ctx.openRoom(ctx.state.roomId);
       watchVideoJob(res.job.id, true);
     } catch (e) {

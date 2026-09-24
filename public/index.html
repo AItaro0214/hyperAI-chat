@@ -272,6 +272,9 @@
               <span>ボイス</span>
               <div class="voice-grid" id="tts-voices"></div>
             </div>
+            <p class="xs muted" id="tts-hint" hidden></p>
+            <!-- Only the controls verified for this model's family: see src/lib/media-params.js -->
+            <div id="tts-params" class="param-form"></div>
             <label class="field">
               <span>試し読みのテキスト</span>
               <input id="tts-sample" class="input sm" value="こんにちは。これはテスト音声です。" />
@@ -302,16 +305,8 @@
             <span>プロンプト</span>
             <textarea id="vid-prompt" rows="3" class="input sm" placeholder="生成したい映像を説明してください"></textarea>
           </label>
-          <div class="grid2">
-            <label class="field"><span>長さ（秒）</span><select id="vid-duration" class="input sm"></select></label>
-            <label class="field"><span>解像度</span><select id="vid-resolution" class="input sm"></select></label>
-            <label class="field"><span>アスペクト比</span><select id="vid-aspect" class="input sm"></select></label>
-            <label class="field"><span>サイズ</span><select id="vid-size" class="input sm"></select></label>
-          </div>
-          <div class="grid2">
-            <label class="toggle-row"><input type="checkbox" id="vid-audio" /><span class="sm">音声も生成</span></label>
-            <label class="field"><span>シード（任意）</span><input id="vid-seed" type="number" class="input sm" placeholder="ランダム" /></label>
-          </div>
+          <!-- Built from the model's published settings: see public/paramform.js -->
+          <div id="vid-params" class="param-form"></div>
           <label class="field" id="vid-frame-wrap" hidden>
             <span>開始フレーム画像（添付から選択）</span>
             <select id="vid-frame" class="input sm"></select>
@@ -547,20 +542,8 @@
             <input type="range" id="img-count" class="slider" min="1" max="10" step="1" value="1" />
             <p class="xs muted" id="img-count-note"></p>
           </div>
-          <div class="row wrap gap">
-            <label class="field grow">
-              <span>アスペクト比</span>
-              <select id="img-aspect" class="input sm"></select>
-            </label>
-            <label class="field grow">
-              <span>品質</span>
-              <select id="img-quality" class="input sm"></select>
-            </label>
-            <label class="field grow">
-              <span>解像度</span>
-              <select id="img-resolution" class="input sm"></select>
-            </label>
-          </div>
+          <!-- Built from the model's published schema: see public/paramform.js -->
+          <div id="img-params" class="param-form"></div>
           <label class="field" id="img-ref-wrap" hidden>
             <span>参照画像（添付から）</span>
             <select id="img-ref" class="input sm" multiple size="3"></select>

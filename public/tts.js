@@ -1,5 +1,7 @@
 /* Voice picker for Groq TTS. The chosen model/voice is remembered on the
  * device and used by the 🔊 button on every assistant answer. */
+import { paramForm } from '/paramform.js';
+
 const $ = (sel) => document.querySelector(sel);
 
 // Orpheus ships a fixed cast per model.
@@ -34,7 +36,9 @@ let ctx = null;
 export function ttsPrefs() {
   try {
     const saved = JSON.parse(localStorage.getItem(STORE_KEY) || '{}');
-    if (saved.model && saved.voice) return saved;
+    // Some models have no voice to pick (the provider's own is used), so a
+    // saved model alone is a complete preference.
+    if (saved.model) return saved;
   } catch {
     /* ignore */
   }
@@ -52,6 +56,17 @@ function savePrefs(prefs) {
   }
 }
 
+const paramsKey = (model) => 'cft.params.tts.' + model;
+
+/** The speed / style settings saved for a model, sent with every synthesis. */
+export function ttsParams(model) {
+  try {
+    return JSON.parse(localStorage.getItem(paramsKey(model)) || '{}') || {};
+  } catch {
+    return {};
+  }
+}
+
 function voicesFor(model) {
   if (model === 'browser') return browserVoices().map((v) => v.name);
   return speechModels.find((m) => m.id === model)?.voices || [];
@@ -65,7 +80,15 @@ function renderVoices() {
   $('#tts-voices').innerHTML = voices
     .map((v) => '<button type="button" class="chip toggle" data-voice="' + v + '" data-on="' + (v === active ? 'true' : 'false') + '">' + v + '</button>')
     .join('');
+  $('#tts-voices').closest('.field').hidden = !voices.length;
   savePrefs({ model, voice: active });
+
+  // Speed, reading style and the like — only what this family was verified
+  // to honour, so every control here actually changes the audio.
+  const meta = speechModels.find((m) => m.id === model);
+  $('#tts-hint').textContent = meta?.hint || '';
+  $('#tts-hint').hidden = !meta?.hint;
+  paramForm($('#tts-params'), meta?.fields || [], { store: paramsKey(model) });
 }
 
 export function initTts(context) {
@@ -103,7 +126,7 @@ export function initTts(context) {
       } else {
         const res = await ctx.api('/api/tts', {
           method: 'POST',
-          body: JSON.stringify({ text: sample, model: prefs.model, voice: prefs.voice }),
+          body: JSON.stringify({ text: sample, model: prefs.model, voice: prefs.voice, params: ttsParams(prefs.model) }),
         });
         $('#tts-preview').src = res.url;
         $('#tts-preview').hidden = false;
