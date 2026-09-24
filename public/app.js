@@ -942,7 +942,7 @@ async function speak(text, btn) {
       }),
     });
     await new Audio(res.url).play();
-    toast('読み上げ ' + res.chars + '文字' + (res.cost ? ' · ' + usd(res.cost) : ''));
+    toast('読み上げ ' + res.chars + '文字' + (res.cost ? ' · ' + usd(res.cost) : res.costPending ? ' · 料金は確定後に使用状況へ記録' : ''));
   } catch (err) {
     toast(err.message, 'err');
   } finally {
@@ -1940,10 +1940,59 @@ async function renderSecurityTab(body) {
   });
 }
 
+/* OpenRouter's own counters against the app's ledger. The ledger is what the
+ * rest of this tab shows; this card is the check that it is complete. */
+async function spendCard() {
+  let s;
+  try {
+    s = await api('/api/admin/spend');
+  } catch (err) {
+    return '<div class="card"><h3>OpenRouter の請求と照合</h3><p class="sm muted">' + esc(err.message) + '</p></div>';
+  }
+  const rows = [
+    ['今日（UTC）', s.billed.day, s.recorded.day],
+    ['今週（UTC・月曜から）', s.billed.week, s.recorded.week],
+    ['今月（UTC）', s.billed.month, s.recorded.month],
+    ['このキーの累計', s.billed.total, s.recorded.total],
+  ];
+  const gapCell = (billed, rec) => {
+    const gap = billed - (Number(rec?.cost) || 0);
+    // A few thousandths is settlement lag, not missing records.
+    if (Math.abs(gap) < 0.005) return '<td class="num ok">一致</td>';
+    return '<td class="num ' + (gap > 0 ? 'warn' : '') + '">' + (gap > 0 ? '+' : '') + usd(gap) + '</td>';
+  };
+  const others = s.account ? s.account.usage - s.billed.total : null;
+  return (
+    '<div class="card"><h3>OpenRouter の請求と照合</h3>' +
+    '<p class="sm muted">左が OpenRouter がこのアプリのキーに実際に請求した額、右がアプリが記録した額です。' +
+    '差があれば、その分はアプリの記録から漏れています（途中で切れた応答など）。</p>' +
+    '<div class="scroll-x"><table class="data"><thead><tr><th>期間</th><th>請求</th><th>記録</th><th>差</th></tr></thead><tbody>' +
+    rows
+      .map(
+        ([label, billed, rec]) =>
+          '<tr><td>' + label + '</td><td class="num">' + usd(billed) + '</td><td class="num">' + usd(Number(rec?.cost) || 0) +
+          (rec?.unpriced ? ' <span class="xs muted">（金額なし ' + fmtInt(rec.unpriced) + ' 件）</span>' : '') +
+          '</td>' + gapCell(billed, rec) + '</tr>'
+      )
+      .join('') +
+    '</tbody></table></div>' +
+    (s.ledgerSince
+      ? '<p class="xs muted">アプリの記録は ' + fmtDate(s.ledgerSince) + ' から。それより前にこのキーを使っていれば、累計の差に含まれます。</p>'
+      : '') +
+    (s.account
+      ? '<div class="kv"><dt>アカウント全体</dt><dd>使用 ' + usd(s.account.usage) + ' / 入金 ' + usd(s.account.credits) +
+        '（残り ' + usd(s.account.credits - s.account.usage) + '）</dd>' +
+        '<dt>他のキーでの使用</dt><dd>' + usd(Math.max(0, others)) +
+        ' <span class="xs muted">hyperdev・別のアプリなど、このアプリ以外のキー</span></dd></div>'
+      : '') +
+    '</div>'
+  );
+}
+
 async function renderUsageTab(body) {
-  const data = await api('/api/admin/usage?days=30');
-  const stats = await api('/api/admin/stats');
+  const [data, stats, spend] = await Promise.all([api('/api/admin/usage?days=30'), api('/api/admin/stats'), spendCard()]);
   body.innerHTML =
+    spend +
     '<div class="card"><h3>直近 30 日</h3><div class="kv">' +
     '<dt>合計コスト</dt><dd><strong>' + usd(data.totals?.cost) + '</strong></dd>' +
     '<dt>呼び出し</dt><dd>' + fmtInt(data.totals?.calls) + ' 回</dd>' +

@@ -44,7 +44,8 @@
     "test:dom": "node tests/dom-unit.mjs",
     "test:recover": "node tests/recover-unit.mjs",
     "test:ttslive": "node tests/tts-live.mjs",
-    "test:params": "node tests/params-unit.mjs"
+    "test:params": "node tests/params-unit.mjs",
+    "test:spend": "node tests/spend-unit.mjs"
   },
   "dependencies": {
     "@cloudflare/puppeteer": "^1.4.0",

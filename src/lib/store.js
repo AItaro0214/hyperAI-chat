@@ -151,7 +151,7 @@ export async function setJsonSetting(env, key, value) {
 /* ----------------------------- usage logging ---------------------------- */
 export async function logUsage(env, entry) {
   try {
-    await env.DB.prepare(
+    const res = await env.DB.prepare(
       'INSERT INTO usage_log (user_id, room_id, provider, model, kind, prompt_tokens, completion_tokens, units, cost, at) ' +
         'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
     )
@@ -168,7 +168,19 @@ export async function logUsage(env, entry) {
         now()
       )
       .run();
+    return res?.meta?.last_row_id ?? null;
   } catch (e) {
     console.error('logUsage failed', e);
+    return null;
+  }
+}
+
+/** Replaces an estimated cost with the settled one. */
+export async function settleUsageCost(env, rowId, cost) {
+  if (!rowId || !Number.isFinite(cost)) return;
+  try {
+    await env.DB.prepare('UPDATE usage_log SET cost = ? WHERE id = ?').bind(cost, rowId).run();
+  } catch (e) {
+    console.error('settleUsageCost failed', e);
   }
 }

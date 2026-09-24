@@ -704,7 +704,7 @@ chat.post('/chat', async (c) => {
         roomId: room.id,
         provider,
         model: req.effectiveModel,
-        kind: imageOutput ? 'image' : 'chat',
+        kind: images.length ? 'image' : 'chat',
         promptTokens: usage?.prompt_tokens ?? null,
         completionTokens: usage?.completion_tokens ?? null,
         cost,

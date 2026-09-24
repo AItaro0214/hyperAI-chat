@@ -239,13 +239,15 @@ export async function synthesize(apiKey, model, { text, voice, format, provider 
   /* Raw samples with no header: unplayable as a file, and the provider says
    * so in the content type (`audio/pcm;rate=24000;channels=1`). */
   const pcm = parsePcmType(contentType) || (requested === 'pcm' ? { sampleRate: 24000, channels: 1, bits: 16 } : null);
+  // TTS responses carry no cost; this id is how the real charge is found.
+  const generationId = res.headers.get('x-generation-id') || null;
   if (pcm && !hasContainer(bytes)) {
     bytes = wavFromPcm(bytes, pcm);
-    return { bytes, mime: 'audio/wav', format: 'wav', requested };
+    return { bytes, mime: 'audio/wav', format: 'wav', requested, generationId };
   }
 
   const finalFormat = requested === 'pcm' ? 'wav' : requested;
-  return { bytes, mime: contentType || speechMime(finalFormat), format: finalFormat, requested };
+  return { bytes, mime: contentType || speechMime(finalFormat), format: finalFormat, requested, generationId };
 }
 
 /* A chat model left to itself *answers* the text — "そうですね、今日は本当に

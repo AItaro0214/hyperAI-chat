@@ -52,6 +52,7 @@ import {
   VLLM_IMAGE,
 } from '../lib/runpod.js';
 import { BACKENDS, BACKEND_NOTES } from '../lib/search.js';
+import { keyUsage, accountCredits, utcWindows } from '../lib/generation.js';
 
 const admin = new Hono();
 admin.use('*', requireAdmin);
@@ -593,6 +594,40 @@ admin.get('/usage', async (c) => {
     .bind(since)
     .first();
   return c.json({ days, totals, byModel: byModel.results || [], byDay: byDay.results || [] });
+});
+
+/* What OpenRouter billed this app's key, against what the app recorded, over
+ * the same UTC windows OpenRouter's own counters use. The gap is spending the
+ * ledger never saw — a reply whose Worker was gone before the final usage
+ * chunk arrived, say — and the account line shows how much went through other
+ * keys entirely. */
+admin.get('/spend', async (c) => {
+  const key = await getApiKey(c.env, 'OPENROUTER_API_KEY');
+  if (!key) return c.json({ error: 'OPENROUTER_API_KEY が未登録です' }, 400);
+  let billed;
+  try {
+    billed = await keyUsage(key);
+  } catch (e) {
+    return c.json({ error: String(e.message || e) }, 502);
+  }
+  const account = await accountCredits(key).catch(() => null);
+  const w = utcWindows(now());
+  const sum = (since) =>
+    c.env.DB.prepare(
+      "SELECT COALESCE(SUM(cost), 0) AS cost, COUNT(*) AS calls, SUM(cost IS NULL) AS unpriced FROM usage_log " +
+        "WHERE provider = 'openrouter' AND at >= ?"
+    )
+      .bind(since)
+      .first();
+  const [day, week, month, total] = await Promise.all([sum(w.day), sum(w.week), sum(w.month), sum(0)]);
+  const first = await c.env.DB.prepare("SELECT MIN(at) AS at FROM usage_log WHERE provider = 'openrouter'").first();
+  return c.json({
+    billed,
+    recorded: { day, week, month, total },
+    account,
+    windows: w,
+    ledgerSince: first?.at || null,
+  });
 });
 
 admin.get('/stats', async (c) => {

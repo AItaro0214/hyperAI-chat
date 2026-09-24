@@ -2,7 +2,8 @@ import { Hono } from 'hono';
 import { newId } from '../lib/crypto.js';
 import { now } from '../lib/auth.js';
 import { requireAuth } from '../lib/guard.js';
-import { getSettings, logUsage } from '../lib/store.js';
+import { getSettings, logUsage, settleUsageCost } from '../lib/store.js';
+import { generationCost } from '../lib/generation.js';
 import { GROQ_BASE, readProviderError, requireKey } from '../lib/chat.js';
 import { estimateAsrCost, estimateTtsCost, getCatalog, findModel } from '../lib/models.js';
 import { fetchSpeechModels, synthesize, isGroqSpeech, speechMime, formatFor } from '../lib/speech.js';
@@ -255,6 +256,7 @@ media.post('/tts', async (c) => {
   let buf;
   let mime;
   let ext = format;
+  let generationId = null;
   let spoken = text;
   let cost = null;
 
@@ -280,8 +282,9 @@ media.post('/tts', async (c) => {
       buf = out.bytes;
       mime = out.mime;
       ext = out.format;
+      generationId = out.generationId || null;
       if (typeof out.cost === 'number') cost = out.cost;
-      else {
+      else if (!generationId) {
         const meta = (await fetchSpeechModels(c.env).catch(() => [])).find((m) => m.id === model);
         if (meta?.perMillionChars) cost = (text.length / 1e6) * meta.perMillionChars;
       }
@@ -299,7 +302,7 @@ media.post('/tts', async (c) => {
     .bind(id, userId, body.roomId || null, 'audio', mime, 'speech.' + ext, size, now())
     .run();
 
-  await logUsage(c.env, {
+  const usageId = await logUsage(c.env, {
     userId,
     roomId: body.roomId || null,
     provider,
@@ -309,7 +312,17 @@ media.post('/tts', async (c) => {
     cost,
   });
 
-  return c.json({ id, url: '/api/files/' + id, mime, size, format: ext, cost, chars: spoken.length, dropped: clean.dropped });
+  /* The character estimate was a hundredth of the real charge for Gemini, so
+   * none is shown; the settled figure is looked up after responding and
+   * written into the ledger, which is what the usage tab reads. */
+  const costPending = !!generationId && cost == null;
+  if (costPending) {
+    c.executionCtx.waitUntil(
+      generationCost(key, generationId).then((exact) => settleUsageCost(c.env, usageId, exact))
+    );
+  }
+
+  return c.json({ id, url: '/api/files/' + id, mime, size, format: ext, cost, costPending, chars: spoken.length, dropped: clean.dropped });
 });
 
 export default media;

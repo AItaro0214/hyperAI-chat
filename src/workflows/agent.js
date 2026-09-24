@@ -217,9 +217,12 @@ export class AgentWorkflow extends WorkflowEntrypoint {
     } catch (e) {
       const msg = String(e?.message || e).slice(0, 600);
       await emit('error', { message: msg });
-      await env.DB.prepare('UPDATE agent_runs SET status = ?, error = ?, updated_at = ? WHERE id = ?')
-        .bind('failed', msg, now(), runId)
+      await env.DB.prepare('UPDATE agent_runs SET status = ?, error = ?, cost = ?, steps = ?, updated_at = ? WHERE id = ?')
+        .bind('failed', msg, cost || null, steps, now(), runId)
         .run();
+      // A failed run still paid for every turn it took; leaving it out of the
+      // ledger is how the usage tab came to show less than OpenRouter billed.
+      if (cost) await logUsage(env, { userId, roomId, provider, model, kind: 'agent', cost });
       await emit('done', { steps, error: true });
       return;
     }
