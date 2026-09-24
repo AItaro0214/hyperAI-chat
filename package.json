@@ -41,7 +41,9 @@
     "test:search": "node tests/search-unit.mjs",
     "test:chattools": "node tests/chattools-unit.mjs",
     "test:keytest": "node tests/keytest-unit.mjs",
-    "test:dom": "node tests/dom-unit.mjs"
+    "test:dom": "node tests/dom-unit.mjs",
+    "test:recover": "node tests/recover-unit.mjs",
+    "test:ttslive": "node tests/tts-live.mjs"
   },
   "dependencies": {
     "@cloudflare/puppeteer": "^1.4.0",

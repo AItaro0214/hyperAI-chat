@@ -5,7 +5,7 @@ import { requireAuth } from '../lib/guard.js';
 import { getSettings, logUsage } from '../lib/store.js';
 import { GROQ_BASE, readProviderError, requireKey } from '../lib/chat.js';
 import { estimateAsrCost, estimateTtsCost, getCatalog, findModel } from '../lib/models.js';
-import { fetchSpeechModels, synthesize, isGroqSpeech, speechMime } from '../lib/speech.js';
+import { fetchSpeechModels, synthesize, isGroqSpeech, speechMime, formatFor } from '../lib/speech.js';
 import { isExpired, expiresAt, EXPIRING_KINDS, MEDIA_TTL_DAYS } from '../lib/media-retention.js';
 
 const media = new Hono();
@@ -238,13 +238,17 @@ media.post('/tts', async (c) => {
   // other model goes to OpenRouter's /audio/speech in one shot.
   const groq = isGroqSpeech(model);
   const provider = groq ? 'groq' : 'openrouter';
-  const format = body.format || (groq ? 'wav' : 'mp3');
+  /* What is asked for, not what comes back: Gemini answers only in raw pcm,
+   * which is given a WAV header on the way through, so the file's real
+   * format is whatever synthesize() reports. */
+  const format = formatFor(model, body.format, { provider });
 
   const key = await requireKey(c.env, provider).catch((e) => e);
   if (key instanceof Error) return c.json({ error: key.message }, 400);
 
   let buf;
   let mime;
+  let ext = format;
   let spoken = text;
   let cost = null;
 
@@ -257,10 +261,11 @@ media.post('/tts', async (c) => {
       for (const chunk of chunks) {
         const out = await synthesize(key, model, { text: chunk, voice, format, provider: 'groq' });
         contentType = contentType || out.mime;
+        ext = out.format;
         parts.push(out.bytes.buffer);
       }
-      buf = format === 'wav' ? concatWav(parts) : new Uint8Array(parts[0]);
-      mime = contentType || speechMime(format);
+      buf = ext === 'wav' ? concatWav(parts) : new Uint8Array(parts[0]);
+      mime = contentType || speechMime(ext);
       spoken = chunks.join('');
       const catalog = await getCatalog(c.env).catch(() => ({ models: [] }));
       cost = estimateTtsCost(findModel(catalog, 'groq:' + model), spoken.length);
@@ -268,6 +273,7 @@ media.post('/tts', async (c) => {
       const out = await synthesize(key, model, { text, voice, format, provider: 'openrouter' });
       buf = out.bytes;
       mime = out.mime;
+      ext = out.format;
       const meta = (await fetchSpeechModels(c.env).catch(() => [])).find((m) => m.id === model);
       if (meta?.perMillionChars) cost = (text.length / 1e6) * meta.perMillionChars;
     }
@@ -281,7 +287,7 @@ media.post('/tts', async (c) => {
   await c.env.DB.prepare(
     'INSERT INTO files (id, user_id, room_id, kind, mime, name, size, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
   )
-    .bind(id, userId, body.roomId || null, 'audio', mime, 'speech.' + format, size, now())
+    .bind(id, userId, body.roomId || null, 'audio', mime, 'speech.' + ext, size, now())
     .run();
 
   await logUsage(c.env, {
@@ -294,7 +300,7 @@ media.post('/tts', async (c) => {
     cost,
   });
 
-  return c.json({ id, url: '/api/files/' + id, mime, size, cost, chars: spoken.length });
+  return c.json({ id, url: '/api/files/' + id, mime, size, format: ext, cost, chars: spoken.length });
 });
 
 export default media;

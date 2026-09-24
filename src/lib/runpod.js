@@ -424,3 +424,153 @@ export function validateSpec(spec = {}) {
   }
   return problems;
 }
+
+/* ---------------------------------------------------------------------------
+ * Picking a reply back up off RunPod.
+ *
+ * RunPod keeps every job — including the ones the OpenAI-compatible route
+ * creates behind the scenes — for roughly half an hour after it finishes, with
+ * the entire SSE stream stored as the job's output. The Cloudflare Worker that
+ * was transcribing that stream into D1 has no such staying power: waitUntil
+ * outlives the response by seconds, so a closed tab or an evicted isolate can
+ * lose a reply the GPU actually produced and billed for.
+ *
+ * Nothing in the OpenAI route's response names the job — no header, no field —
+ * so the id cannot be written down in advance. What the stored chunks do carry
+ * is `created`, and that is enough to line a finished job up with the message
+ * that was waiting for one.
+ * ------------------------------------------------------------------------- */
+
+/** Recent jobs on the endpoint, newest first, as RunPod still remembers them. */
+export async function listRequests(apiKey, endpointId) {
+  const res = await fetch(RUN + '/' + endpointId + '/requests', {
+    headers: { authorization: 'Bearer ' + apiKey },
+    signal: AbortSignal.timeout(20000),
+  });
+  if (!res.ok) throw new Error('RunPod requests → ' + res.status);
+  const json = await res.json().catch(() => null);
+  return Array.isArray(json?.requests) ? json.requests : [];
+}
+
+/** One job, with its output if it has finished. */
+export async function fetchJob(apiKey, endpointId, jobId) {
+  const res = await fetch(RUN + '/' + endpointId + '/status/' + encodeURIComponent(jobId), {
+    headers: { authorization: 'Bearer ' + apiKey },
+    signal: AbortSignal.timeout(30000),
+  });
+  if (!res.ok) throw new Error('RunPod status → ' + res.status);
+  return res.json();
+}
+
+/* A job's output is whatever the worker wrote, which is not one shape: the
+ * streaming route stores strings holding several `data: {...}` frames apiece,
+ * the non-streaming one stores the completion object, and the worker's native
+ * handler stores something else again. All three are flattened to chunks. */
+function chunksOf(output) {
+  const out = [];
+  const take = (value) => {
+    if (value === null || value === undefined) return;
+    if (Array.isArray(value)) {
+      value.forEach(take);
+      return;
+    }
+    if (typeof value === 'object') {
+      out.push(value);
+      return;
+    }
+    for (const line of String(value).split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      const body = trimmed.startsWith('data:') ? trimmed.slice(5).trim() : trimmed;
+      // [DONE] is a terminator, and a frame split across two stored strings is
+      // unparseable — neither is worth failing the whole recovery over.
+      if (!body || body === '[DONE]') continue;
+      try {
+        out.push(JSON.parse(body));
+      } catch {
+        /* ignore */
+      }
+    }
+  };
+  take(output);
+  return out;
+}
+
+/** The reply a finished job holds, reassembled. */
+export function extractCompletion(job) {
+  const chunks = chunksOf(job?.output);
+  let text = '';
+  let reasoning = '';
+  let usage = null;
+  let created = null;
+  let chatId = null;
+  let finishReason = null;
+
+  for (const chunk of chunks) {
+    if (chunk.usage) usage = chunk.usage;
+    if (!created && Number(chunk.created)) created = Number(chunk.created);
+    if (!chatId && typeof chunk.id === 'string') chatId = chunk.id;
+
+    const choice = chunk.choices?.[0];
+    if (!choice) {
+      if (typeof chunk.text === 'string') text += chunk.text;
+      continue;
+    }
+    if (choice.finish_reason) finishReason = choice.finish_reason;
+    // delta for a stream, message for a single completion; tokens is the
+    // worker's own format.
+    const part = choice.delta || choice.message || {};
+    if (typeof part.content === 'string') text += part.content;
+    else if (Array.isArray(part.content)) {
+      text += part.content.map((p) => (typeof p === 'string' ? p : p?.text || '')).join('');
+    }
+    if (typeof part.reasoning_content === 'string') reasoning += part.reasoning_content;
+    else if (typeof part.reasoning === 'string') reasoning += part.reasoning;
+    if (typeof choice.text === 'string') text += choice.text;
+    if (Array.isArray(choice.tokens)) text += choice.tokens.join('');
+  }
+
+  return { text, reasoning, usage, created, chatId, finishReason, status: job?.status || null };
+}
+
+/* How far from the message's own timestamp a job may sit and still be its
+ * reply. Generous on the late side because the job is finished after the
+ * message row was created, and only slightly tolerant on the early side for
+ * clock skew between RunPod and the Worker. */
+const MATCH_BEFORE_SEC = 120;
+const MATCH_AFTER_SEC = 3600;
+
+/**
+ * Finds the finished job that belongs to a message and returns its reply.
+ *
+ * @param {number} since  the message row's created_at, in epoch seconds
+ * @returns {Promise<{found: object|null, pending: object[], checked: number}>}
+ */
+export async function recoverReply(apiKey, endpointId, { since = 0, limit = 8 } = {}) {
+  const requests = await listRequests(apiKey, endpointId);
+  const pending = requests.filter((r) => r.status === 'IN_QUEUE' || r.status === 'IN_PROGRESS');
+  const done = requests.filter((r) => r.status === 'COMPLETED').slice(0, limit);
+
+  const candidates = [];
+  for (const row of done) {
+    const job = await fetchJob(apiKey, endpointId, row.id).catch(() => null);
+    if (!job) continue;
+    const reply = extractCompletion(job);
+    if (!reply.text && !reply.reasoning) continue;
+    candidates.push({ ...reply, jobId: row.id, executionTime: row.executionTime ?? null });
+  }
+  if (!candidates.length) return { found: null, pending, checked: done.length };
+
+  /* Which job is this message's? The timestamps inside the chunks decide when
+   * they are usable, and length breaks the tie when they are not — a job with
+   * no `created` at all is better than telling someone their reply is gone. */
+  const inWindow = since
+    ? candidates.filter((c) => c.created && c.created >= since - MATCH_BEFORE_SEC && c.created <= since + MATCH_AFTER_SEC)
+    : [];
+  const pool = inWindow.length ? inWindow : candidates;
+  const found = since && inWindow.length
+    ? pool.reduce((best, c) => (Math.abs(c.created - since) < Math.abs(best.created - since) ? c : best))
+    : pool.reduce((best, c) => (c.text.length > best.text.length ? c : best));
+
+  return { found, pending, checked: done.length, matched: inWindow.length > 0 };
+}

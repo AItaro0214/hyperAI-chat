@@ -97,7 +97,7 @@ export const DEFAULT_SETTINGS = {
   searchRounds: 2,
   searxngUrl: '',
   asrModel: 'whisper-large-v3-turbo',
-  ttsModel: 'google/gemini-3.1-flash-tts-preview',
+  ttsModel: 'google/gemini-3.8-flash-tts',
   ttsVoice: 'Kore',
   imageModel: 'google/gemini-3.1-flash-image',
   showCost: true,

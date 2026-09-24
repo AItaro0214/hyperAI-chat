@@ -66,7 +66,7 @@ export const SPEECH_PURPOSES = {
   natural: {
     label: '自然・日本語向き',
     hint: '通常のナレーション',
-    models: ['google/gemini-3.1-flash-tts-preview', 'qwen/qwen-audio-3.0-tts-flash', 'openai/gpt-audio-mini'],
+    models: ['google/gemini-3.8-flash-tts', 'qwen/qwen-audio-3.0-tts-flash', 'openai/gpt-audio-mini'],
   },
   quality: {
     label: '高品質',
@@ -76,7 +76,7 @@ export const SPEECH_PURPOSES = {
   free: {
     label: '無料',
     hint: '下読みや大量生成',
-    models: ['deepgram/flux-tts:free', 'fish-audio/s2.1-pro-free:free', 'google/gemini-3.1-flash-tts-preview'],
+    models: ['deepgram/flux-tts:free', 'fish-audio/s2.1-pro-free:free', 'google/gemini-3.8-flash-tts'],
   },
 };
 export const SPEECH_PURPOSE_KEYS = Object.keys(SPEECH_PURPOSES);
@@ -318,7 +318,7 @@ export const pickVideoModel = (catalogue, opts = {}) =>
   pickModel(catalogue, VIDEO_PURPOSES, { ...opts, defaultId: 'bytedance/seedance-2.0-mini' });
 
 export const pickSpeechModel = (catalogue, opts = {}) =>
-  pickModel(catalogue, SPEECH_PURPOSES, { ...opts, defaultId: 'google/gemini-3.1-flash-tts-preview' });
+  pickModel(catalogue, SPEECH_PURPOSES, { ...opts, defaultId: 'google/gemini-3.8-flash-tts' });
 
 /** Vector output only makes sense with an .svg name. */
 export function fixExtension(path, format) {

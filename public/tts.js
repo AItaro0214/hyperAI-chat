@@ -39,7 +39,7 @@ export function ttsPrefs() {
     /* ignore */
   }
   return {
-    model: ctx?.state?.defaults?.ttsModel || 'google/gemini-3.1-flash-tts-preview',
+    model: ctx?.state?.defaults?.ttsModel || 'google/gemini-3.8-flash-tts',
     voice: ctx?.state?.defaults?.ttsVoice || 'Kore',
   };
 }

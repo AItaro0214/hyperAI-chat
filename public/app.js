@@ -572,6 +572,49 @@ function withExpiry(node, label) {
   return node;
 }
 
+/* A breakthrough reply the UI never received.
+ *
+ * The GPU generated it and it was billed for; what went missing is the Worker
+ * that was relaying it. RunPod keeps finished jobs for about half an hour, so
+ * within that window the text can be claimed back — which is worth a button,
+ * because the alternative is paying for the same answer twice. */
+function isRecoverable(msg) {
+  if (msg.role !== 'assistant') return false;
+  if (msg.provider !== 'runpod' && msg.model !== 'breakthrough') return false;
+  return !msg.content || msg.meta?.partial === true || msg.meta?.abandoned === true || !!msg.error;
+}
+
+function recoverRow(msg) {
+  const row = el('div', 'recover');
+  const btn = el('button', 'btn quiet');
+  btn.type = 'button';
+  btn.innerHTML = icon('redo', 15);
+  btn.appendChild(el('span', null, 'RunPod から回収'));
+  const note = el('span', 'xs', 'GPU 側に残っている応答を取りに行きます（保持は約30分）');
+  btn.addEventListener('click', async () => {
+    btn.disabled = true;
+    note.textContent = 'RunPod のジョブを探しています…';
+    try {
+      const res = await api('/api/rooms/' + state.roomId + '/messages/' + msg.id + '/recover', { method: 'POST' });
+      if (!res.ok) {
+        note.textContent = res.reason || '回収できませんでした';
+        btn.disabled = false;
+        return;
+      }
+      const i = state.messages.findIndex((m) => m.id === msg.id);
+      if (i >= 0) state.messages[i] = res.message;
+      renderMessages();
+      toast(res.matched ? '応答を回収しました' : '時刻の一致するジョブがなかったため、直近の完了ジョブを取り込みました');
+    } catch (err) {
+      note.textContent = err.message;
+      btn.disabled = false;
+    }
+  });
+  row.appendChild(btn);
+  row.appendChild(note);
+  return row;
+}
+
 function messageNode(msg) {
   const wrap = el('div', 'msg ' + msg.role);
   wrap.dataset.id = msg.id;
@@ -676,6 +719,8 @@ function messageNode(msg) {
     err.appendChild(el('span', null, msg.error));
     wrap.appendChild(err);
   }
+
+  if (isRecoverable(msg)) wrap.appendChild(recoverRow(msg));
 
   const foot = el('div', 'foot');
   if (msg.promptTokens || msg.cost != null) {
@@ -1033,7 +1078,9 @@ async function followUnfinished(roomId, messageId, { tries = 120, everyMs = 3000
 
     const partial = row.meta?.partial === true;
     if (!partial) {
-      if (row.error) toast(row.error, 'err');
+      if (row.meta?.abandoned && !row.content) {
+        toast('応答は完了しませんでした（生成が長すぎて記録が途切れました）。もう一度お試しください。', 'err');
+      } else if (row.error) toast(row.error, 'err');
       else if (row.content) toast('応答を取得しました');
       return true;
     }

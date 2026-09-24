@@ -2,7 +2,8 @@ import { Hono } from 'hono';
 import { newId } from '../lib/crypto.js';
 import { now } from '../lib/auth.js';
 import { requireAuth } from '../lib/guard.js';
-import { getSettings } from '../lib/store.js';
+import { getSettings, getApiKey } from '../lib/store.js';
+import { recoverReply } from '../lib/runpod.js';
 
 const rooms = new Hono();
 rooms.use('*', requireAuth);
@@ -22,6 +23,16 @@ function parseJson(value, fallback) {
   }
 }
 
+/** Fifteen minutes: longer than any reply, shorter than forever. */
+const PARTIAL_GRACE_SEC = 900;
+
+function staleMeta(row) {
+  const meta = row.meta && row.meta.length > 20000 ? { truncated: true } : parseJson(row.meta, null);
+  if (!meta?.partial) return meta;
+  if (now() - Number(row.created_at || 0) < PARTIAL_GRACE_SEC) return meta;
+  return { ...meta, partial: false, abandoned: true };
+}
+
 export function shapeMessage(row) {
   return {
     id: row.id,
@@ -35,7 +46,11 @@ export function shapeMessage(row) {
     promptTokens: row.prompt_tokens,
     completionTokens: row.completion_tokens,
     cost: row.cost,
-    meta: row.meta && row.meta.length > 20000 ? { truncated: true } : parseJson(row.meta, null),
+    /* A row still marked partial long after it was created is not in
+     * progress — the Worker that was writing it is gone. waitUntil outlives
+     * the response by seconds, not the quarter hour an unbounded generation
+     * can take, and a row left this way makes the client poll it forever. */
+    meta: staleMeta(row),
     error: row.error || null,
     createdAt: row.created_at,
   };
@@ -265,6 +280,77 @@ rooms.get('/:id/export', async (c) => {
       'content-disposition': 'attachment; filename="room-' + room.id + '.json"',
     },
   });
+});
+
+/* Fetches a lost reply back from RunPod and writes it into its message row.
+ *
+ * The GPU finished and was paid for; only the Worker relaying it went away.
+ * RunPod holds finished jobs for about half an hour, so within that window the
+ * reply is still there to be claimed — after it, nothing can bring it back and
+ * saying so plainly is better than a spinner. */
+rooms.post('/:id/messages/:mid/recover', async (c) => {
+  const room = await ownedRoom(c, c.req.param('id'));
+  if (!room) return c.json({ error: 'not found' }, 404);
+  const msg = await c.env.DB.prepare('SELECT * FROM messages WHERE id = ? AND room_id = ?')
+    .bind(c.req.param('mid'), room.id)
+    .first();
+  if (!msg) return c.json({ error: 'message not found' }, 404);
+
+  const settings = await getSettings(c.env);
+  const endpointId = settings.runpodEndpointId;
+  if (!endpointId) return c.json({ error: 'ブレイクスルー用のエンドポイントが設定されていません' }, 400);
+  const apiKey = await getApiKey(c.env, 'RUNPOD_API_KEY');
+  if (!apiKey) return c.json({ error: 'RUNPOD_API_KEY が未登録です' }, 400);
+
+  let result;
+  try {
+    result = await recoverReply(apiKey, endpointId, { since: Number(msg.created_at) || 0 });
+  } catch (e) {
+    return c.json({ error: 'RunPod に問い合わせできませんでした: ' + String(e?.message || e).slice(0, 300) }, 502);
+  }
+
+  if (!result.found) {
+    const waiting = result.pending.length;
+    return c.json({
+      ok: false,
+      pending: waiting,
+      checked: result.checked,
+      reason: waiting
+        ? '同じエンドポイントでまだ実行中のジョブが ' + waiting + ' 件あります。完了後にもう一度お試しください。'
+        : result.checked
+          ? '完了済みジョブは ' + result.checked + ' 件見つかりましたが、本文が取り出せませんでした。'
+          : 'RunPod 側に残っているジョブがありません。保持期間（約30分）を過ぎた可能性があります。',
+    });
+  }
+
+  const reply = result.found;
+  // Never trade a longer reply for a shorter one: a row that streamed most of
+  // the way through is better than a job that matched only by timestamp.
+  const keepExisting = String(msg.content || '').length > reply.text.length;
+  const content = keepExisting ? msg.content : reply.text;
+  const reasoning = reply.reasoning || msg.reasoning || null;
+  const meta = {
+    ...(parseJson(msg.meta, {}) || {}),
+    partial: false,
+    abandoned: false,
+    recovered: { jobId: reply.jobId, at: now(), matched: !!result.matched },
+  };
+
+  await c.env.DB.prepare(
+    'UPDATE messages SET content = ?, reasoning = ?, prompt_tokens = ?, completion_tokens = ?, meta = ?, error = NULL WHERE id = ?'
+  )
+    .bind(
+      content,
+      reasoning,
+      reply.usage?.prompt_tokens ?? msg.prompt_tokens ?? null,
+      reply.usage?.completion_tokens ?? msg.completion_tokens ?? null,
+      JSON.stringify(meta),
+      msg.id
+    )
+    .run();
+
+  const updated = await c.env.DB.prepare('SELECT * FROM messages WHERE id = ?').bind(msg.id).first();
+  return c.json({ ok: true, matched: !!result.matched, jobId: reply.jobId, message: shapeMessage(updated) });
 });
 
 export default rooms;
