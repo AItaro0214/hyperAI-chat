@@ -93,6 +93,9 @@ export const DEFAULT_SETTINGS = {
   /* New endpoints may fall back to the R2 copy of the model. Off until the
    * RunPod secrets it reads have been created (R2_SECRETS in runpod.js). */
   runpodUseR2: false,
+  /* Your own Hugging Face copy of the quant (owner/name), for RunPod's cache
+   * and the worker's first download. Empty: the original repository only. */
+  runpodOwnRepo: '',
   // A self-hosted model has no built-in search; xAI runs it as a tool instead.
   breakthroughSearch: true,
   // Raw results, not another model's summary — see search.js.

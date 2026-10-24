@@ -42,7 +42,7 @@ export const VLLM_IMAGE = 'runpod/worker-v1-vllm:v2.27.1';
  * .github/workflows/llamacpp-worker.yml. The tag is the llama.cpp build it is
  * based on and the handler's WORKER_VERSION, pinned for the same reason as the
  * vLLM one; the workflow refuses to build if this does not match. */
-export const LLAMACPP_IMAGE = 'ghcr.io/aitaro0214/hyperai-llamacpp-worker:b11804-5';
+export const LLAMACPP_IMAGE = 'ghcr.io/aitaro0214/hyperai-llamacpp-worker:b11804-6';
 
 /* The previous model, on vLLM. Kept whole so going back is passing this as the
  * spec rather than reconstructing it from git. */
@@ -125,6 +125,12 @@ export const LLAMACPP_SPEC = {
    * until the RunPod secrets it reads exist — see R2_SECRETS. */
   useR2: false,
   r2Bucket: 'hyperai-models',
+  /* Your own Hugging Face repository holding just this quant (the "mirror
+   * model" workflow makes it). Set, it is what RunPod caches — 84 GB rather
+   * than the original's 281 — and the worker's first download; the original
+   * stays as the fallback. Private repositories are read with HF_TOKEN, a
+   * RunPod secret (HF_TOKEN_SECRET). Empty: the original only. */
+  ownRepo: '',
   /* A100 first, H100 when no A100 is free; 48GB cards cannot hold IQ3_S. The
    * H100 NVL (94GB) is left out to keep the choice to the two 80GB parts. */
   gpu: ['NVIDIA A100 80GB PCIe', 'NVIDIA A100-SXM4-80GB', 'NVIDIA H100 80GB HBM3', 'NVIDIA H100 PCIe'],
@@ -203,12 +209,18 @@ export function vramEstimate({ ctx, seqs = 2, kv = 'f16' } = {}) {
 /* What each quant's two shards add up to, in GB as RunPod sizes disks. */
 const QUANT_DISK_GB = { Q2_0: 67, IQ2_XS: 69, IQ3_XXS: 77, IQ3_S: 84 };
 
-/** The value RunPod's console takes in an endpoint's Model field: pinned to
- * the commit in use, as the download and the R2 copy are. */
+/** The value RunPod's console takes in an endpoint's Model field: your own
+ * copy when there is one (at main — it is yours), else the original pinned
+ * to the commit in use, as the download and the R2 copy are. */
 export const modelReference = (spec = {}) => {
   const s = resolveSpec(spec);
+  if (s.ownRepo) return 'https://huggingface.co/' + s.ownRepo + ':main';
   return 'https://huggingface.co/' + s.model + ':' + (s.revision || 'main');
 };
+
+/* The RunPod secret holding a Hugging Face read token, for a private copy of
+ * your own. Referred to only when ownRepo is set. */
+export const HF_TOKEN_SECRET = 'hyperai_hf_token';
 
 /* The R2 copy's credentials, as RunPod secrets the template refers to — so
  * they are never in the template, the app or the repository. RunPod fills
@@ -427,6 +439,11 @@ function llamacppTemplate(s) {
     LAZY_MODE: s.lazyMode || '',
     SERVED_MODEL_NAME: 'breakthrough',
   };
+  if (s.ownRepo) {
+    env.OWN_MODEL_REPO = s.ownRepo;
+    // A private repository needs a token; RunPod fills it in from the secret.
+    env.HF_TOKEN = '{{ RUNPOD_SECRET_' + HF_TOKEN_SECRET + ' }}';
+  }
   if (s.hfToken) env.HF_TOKEN = s.hfToken;
   if (s.useR2) {
     env.R2_BUCKET = s.r2Bucket;
@@ -780,8 +797,9 @@ export async function probeJob(apiKey, endpointId, { onProgress, timeoutMs = 900
  * unhealthy worker count and, usually, a detail string in the raw body. Both
  * are collected here rather than guessed at.
  */
-export async function diagnose(apiKey, endpointId) {
+export async function diagnose(apiKey, endpointId, spec = {}) {
   const out = { endpointId };
+  const s = resolveSpec(spec);
 
   out.endpoint = await call(apiKey, '/endpoints/' + endpointId).catch((e) => ({ error: e.message }));
   if (out.endpoint?.templateId) {
@@ -796,8 +814,10 @@ export async function diagnose(apiKey, endpointId) {
           ),
         };
     if (out.template.env) {
-      const expected = templateBody();
-      out.drift = Object.keys(expected.env).filter((k) => String(out.template.env[k]) !== String(expected.env[k]));
+      const expected = templateBody(s);
+      // Against the raw values: the masked ones would always differ.
+      const raw = t?.env || {};
+      out.drift = Object.keys(expected.env).filter((k) => String(raw[k]) !== String(expected.env[k]));
       // An endpoint still on the other engine differs in everything; say so once.
       if (out.template.imageName !== expected.imageName) out.drift.unshift('imageName');
     }
@@ -807,8 +827,8 @@ export async function diagnose(apiKey, endpointId) {
 
   // Whether RunPod was asked to cache the model, and the value to enter in
   // the console's Model field if it was not.
-  if (DEFAULT_SPEC.engine === 'llamacpp' && DEFAULT_SPEC.cacheModel) {
-    const value = modelReference(DEFAULT_SPEC);
+  if (s.engine === 'llamacpp' && s.cacheModel) {
+    const value = modelReference(s);
     out.modelCache = await cachedModels(apiKey, endpointId)
       .then((refs) => ({ attached: !!matchModelRef(refs, value), resolved: matchModelRef(refs, value), refs, value }))
       .catch((e) => ({ attached: null, error: e.message, value }));
@@ -826,7 +846,7 @@ export async function diagnose(apiKey, endpointId) {
   // loading, and the next diagnosis will have it.
   out.weightsFrom = out.probe?.worker?.source || null;
 
-  out.expected = DEFAULT_SPEC;
+  out.expected = s;
   return out;
 }
 
@@ -842,6 +862,9 @@ export function validateSpec(spec = {}) {
     problems.push('model は Hugging Face の "owner/name" 形式で指定してください');
   }
   if (s.engine === 'llamacpp') {
+    if (s.ownRepo && !/^[\w.-]+\/[\w.-]+$/.test(s.ownRepo)) {
+      problems.push('自分のリポジトリは Hugging Face の "owner/name" 形式で指定してください');
+    }
     if (!s.modelFile || !/\.gguf$/i.test(s.modelFile) || !s.modelFile.includes('/')) {
       problems.push('modelFile は量子化フォルダ内の 1 本目の .gguf を指定してください（例: IQ2_XS/…-00001-of-00002.gguf）');
     }

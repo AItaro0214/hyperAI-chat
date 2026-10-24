@@ -220,5 +220,127 @@ except SystemExit as e:
     refused = "sha" in str(e)
 check("ブランチ名は断る（中身が変わり得る）", refused)
 
+# --------------------------- to one's own HF repo ---------------------------
+import types  # noqa: E402
+
+hub = types.ModuleType("huggingface_hub")
+
+
+class CommitOperationAdd:
+    def __init__(self, path_in_repo, path_or_fileobj):
+        self.path_in_repo, self.path_or_fileobj = path_in_repo, path_or_fileobj
+
+
+class CommitOperationCopy:
+    def __init__(self, src_path_in_repo, path_in_repo, src_revision=None, src_repo_id=None, src_repo_type=None):
+        self.__dict__.update(locals())
+        del self.__dict__["self"]
+
+
+hub.CommitOperationAdd, hub.CommitOperationCopy = CommitOperationAdd, CommitOperationCopy
+sys.modules["huggingface_hub"] = hub
+DEST = "someone/qwen38-flash-next-abliterated-iq3s"
+
+
+class Hub:
+    """A destination repository: what has been committed to it."""
+
+    def __init__(self, tamper=None):
+        self.files, self.commits, self.created, self.tamper = {}, [], [], tamper
+
+    def whoami(self):
+        return {"name": "someone"}
+
+    def create_repo(self, repo_id, repo_type=None, private=None, exist_ok=None):
+        self.created.append((repo_id, private))
+
+    def create_commit(self, repo_id, repo_type=None, operations=(), commit_message=""):
+        self.commits.append((commit_message, operations))
+        for op in operations:
+            if isinstance(op, CommitOperationCopy):
+                assert op.src_repo_id == REPO and op.src_revision == REV and op.src_repo_type == "model"
+                body = FILES[op.src_path_in_repo]
+                if self.tamper == op.path_in_repo:
+                    body = body[:-1]
+                self.files[op.path_in_repo] = body
+            else:
+                self.files[op.path_in_repo] = op.path_or_fileobj
+
+
+class HFWithDest(HF):
+    """The source as before, and the destination served from a Hub fake."""
+
+    def __init__(self, files, hub):
+        super().__init__(files)
+        self.hub = hub
+
+    def get(self, url, headers=None, stream=False, timeout=None):
+        if f"/api/models/{DEST}/" in url:
+            self.urls.append(url)
+            entries = [
+                {"type": "file", "path": p, "size": len(b), "lfs": {"oid": sha(b), "size": len(b)}}
+                for p, b in self.hub.files.items() if p.startswith("IQ3_S/")
+            ]
+            return Res(data=entries) if entries else Res(status=404)
+        return super().get(url, headers=headers, stream=stream, timeout=timeout)
+
+
+def hf_args(**kw):
+    return args(to_hf=DEST, public=False, **kw)
+
+
+h = Hub()
+src = HFWithDest(FILES, h)
+mm.mirror_to_hf(h, src, hf_args(), "tok")
+copied = [op for _, ops in h.commits for op in ops if isinstance(op, CommitOperationCopy)]
+check("HF: 非公開で作る", h.created == [(DEST, True)], h.created)
+check("  サーバー側のコピーで、元のコミットから取る", len(copied) == 2 and all(op.src_revision == REV and op.src_repo_id == REPO for op in copied))
+check("  ファイルを取ってこない（ダウンロードしない）", not any("/resolve/" in u for u in src.urls), [u for u in src.urls if "/resolve/" in u])
+check("  同じ場所に置く（IQ3_S/…）", set(op.path_in_repo for op in copied) == set(FILES))
+readme_text = h.files["README.md"].decode()
+check("  README に元・コミット・ライセンス", REPO in readme_text and REV in readme_text and "license: apache-2.0" in readme_text and "Apache-2.0" in readme_text)
+check("  README に sha256 の一覧", all(sha(b) in readme_text for b in FILES.values()))
+check("  mirror.json に記録", json.loads(h.files["mirror.json"])["revision"] == REV)
+
+# Rerun: nothing to copy again.
+src2 = HFWithDest(FILES, h)
+before = len(h.commits)
+mm.mirror_to_hf(h, src2, hf_args(), "tok")
+recopied = [op for _, ops in h.commits[before:] for op in ops if isinstance(op, CommitOperationCopy)]
+check("再実行: 同じ sha256 のファイルはコピーし直さない", recopied == [], recopied)
+
+# A copy that does not match the source is caught.
+bad = Hub(tamper="IQ3_S/m-00002-of-00002.gguf")
+try:
+    mm.mirror_to_hf(bad, HFWithDest(FILES, bad), hf_args(), "tok")
+    raised = ""
+except RuntimeError as e:
+    raised = str(e)
+check("コピー先が元と違えば失敗にする", "sha256" in raised, raised)
+
+# Dry run: no repository, no commit.
+dry = Hub()
+mm.mirror_to_hf(dry, HFWithDest(FILES, dry), hf_args(dry_run=True), "tok")
+check("試行: リポジトリも作らず、コミットもしない", dry.created == [] and dry.commits == [])
+
+# Arguments.
+for argv, words in [
+    (["--repo", REPO, "--revision", REV, "--folder", "IQ3_S"], "複製先"),
+    (["--repo", REPO, "--revision", REV, "--folder", "IQ3_S", "--to-hf", "noslash"], "owner/name"),
+]:
+    try:
+        mm.main(argv)
+        msg = ""
+    except SystemExit as e:
+        msg = str(e)
+    check("引数の誤りを断る: " + words, words in msg, msg)
+os.environ.pop("HF_TOKEN", None)
+try:
+    mm.main(["--repo", REPO, "--revision", REV, "--folder", "IQ3_S", "--to-hf", DEST])
+    msg = ""
+except SystemExit as e:
+    msg = str(e)
+check("  書き込みトークンが無ければ断る", "HF_TOKEN" in msg, msg)
+
 print(f"\n{sum(results)}/{len(results)} passed")
 sys.exit(0 if all(results) else 1)

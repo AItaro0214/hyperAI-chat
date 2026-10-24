@@ -21,6 +21,7 @@ import {
   warm as warmUp,
   isAppJob,
   rememberOwnJob,
+  diagnose,
   recoverReply,
   failedReason,
   WORKER_META_KEY,
@@ -464,6 +465,32 @@ check('  時刻の合わない返答は、長くても取り込まない', rr.fo
 jobBoard({ ownlooking: { ...SHORT_REPLY } });
 rr = await recoverReply('k', 'ep', { since: SINCE, ownJobs: new Set(['ownlooking']) });
 check('  記録したアプリのジョブは除く', rr.found === null && rr.appJobs === 1);
+globalThis.fetch = realFetch;
+
+/* --------------------- your own Hugging Face copy ------------------------ */
+const OWN = 'someone/qwen38-flash-next-abliterated-iq3s';
+check('自分のリポジトリ: 未設定なら元のリポジトリをコミット固定で', modelReference({}) === REF);
+check('  設定すると事前保存の参照は自分のリポジトリ（main）', modelReference({ ownRepo: OWN }) === 'https://huggingface.co/' + OWN + ':main');
+const ownT = templateBody({ ownRepo: OWN });
+check('  ワーカーに自分のリポジトリを渡し、元も残す', ownT.env.OWN_MODEL_REPO === OWN && ownT.env.MODEL_REPO === DEFAULT_SPEC.model && ownT.env.MODEL_REVISION === DEFAULT_SPEC.revision);
+check('  トークンは RunPod の secret の参照だけ', ownT.env.HF_TOKEN === '{{ RUNPOD_SECRET_hyperai_hf_token }}');
+check('  未設定なら HF_TOKEN を付けない（元は公開）', !('HF_TOKEN' in templateBody().env) && !('OWN_MODEL_REPO' in templateBody().env));
+check('  形の誤りを弾く', validateSpec({ ownRepo: 'no-slash' }).some((p) => p.includes('owner/name')) && validateSpec({ ownRepo: OWN }).length === 0);
+// Switching the cache to your own copy: a reference to the original no longer counts.
+check('  元のリポジトリの事前保存は、自分のリポジトリの設定とは一致しない', modelCacheResult([SHA_REF], modelReference({ ownRepo: OWN })).ok === false);
+
+// Diagnosis: secret references are compared raw, not as their masked display.
+globalThis.fetch = async (url, options = {}) => {
+  const u = String(url);
+  if (u.includes('/endpoints/')) return { ok: true, status: 200, text: async () => JSON.stringify({ templateId: 'tpl' }) };
+  if (u.includes('/templates/')) return { ok: true, status: 200, text: async () => JSON.stringify({ imageName: LLAMACPP_IMAGE, env: ownT.env }) };
+  if (u.includes('graphql')) return { ok: true, status: 200, json: async () => ({ data: { myself: { endpoint: { modelReferences: [] } } } }) };
+  if (u.endsWith('/run')) return { ok: true, status: 200, json: async () => ({}) };
+  return { ok: true, status: 200, json: async () => ({}) };
+};
+const dg = await diagnose('k', 'ep', { ownRepo: OWN });
+check('診断: secret を参照する設定でも、ずれと誤判定しない', Array.isArray(dg.drift) && dg.drift.length === 0, JSON.stringify(dg.drift));
+check('  表示ではトークンを伏せる', dg.template.env.HF_TOKEN === '（設定あり）');
 globalThis.fetch = realFetch;
 
 const passed = results.filter(([ok]) => ok).length;

@@ -8,6 +8,8 @@ llama-server, so nothing in the app has to know which engine is behind it.
 Configuration comes from the template's environment (see src/lib/runpod.js):
   MODEL_REPO, MODEL_FILE                   what to load
   MODEL_REVISION                           the commit to load it at
+  OWN_MODEL_REPO                           your own copy of the quant, tried first
+                                           (HF_TOKEN if it is private)
   MODEL_CACHE                              "on": look in RunPod's model cache first
   MODEL_INCLUDE                            what to download when it is not there
   R2_ENDPOINT, R2_ACCESS_KEY_ID,           the app's own copy in Cloudflare R2, for
@@ -17,7 +19,8 @@ Configuration comes from the template's environment (see src/lib/runpod.js):
   SERVED_MODEL_NAME                        the name the app sends as `model`
   HF_TOKEN                                 only for gated repositories
 
-The weights come from, in order: RunPod's model cache, Hugging Face, R2.
+The weights come from, in order: RunPod's model cache, your own Hugging Face
+copy, the original on Hugging Face, R2.
 """
 
 import collections
@@ -86,17 +89,34 @@ def shards(first):
     return [first[: m.start()] + f"-{i:05d}-of-{total:05d}.gguf" for i in range(1, total + 1)]
 
 
-def from_cache():
+def sources():
+    """Where the files can come from, in order: your own copy (OWN_MODEL_REPO,
+    at main — it is yours, and holds only this quant), then the original at
+    its pinned commit. The same relative path (MODEL_FILE) in both."""
+    out = []
+    if env("OWN_MODEL_REPO"):
+        out.append({"repo": env("OWN_MODEL_REPO"), "revision": None, "own": True})
+    out.append({"repo": env("MODEL_REPO"), "revision": env("MODEL_REVISION") or None, "own": False})
+    return out
+
+
+def from_cache(repo=None, pinned=None):
     """The first shard inside RunPod's model cache, if every shard is there.
 
     The cache holds the whole repository under snapshots/<revision>/. Files
     appear there only once complete, so a missing shard means the cache is
-    absent or still filling, and either way it cannot be used yet."""
-    repo = "models--" + env("MODEL_REPO").replace("/", "--")
-    snapshots = glob.glob(os.path.join(HF_CACHE, repo, "snapshots", "*"))
+    absent or still filling, and either way it cannot be used yet. With no
+    repository named, each of sources() is looked for in turn."""
+    if repo is None:
+        for s in sources():
+            found = from_cache(s["repo"], s["revision"])
+            if found:
+                return found
+        return None
+    folder = "models--" + repo.replace("/", "--")
+    snapshots = glob.glob(os.path.join(HF_CACHE, folder, "snapshots", "*"))
     # The pinned commit first; then newest first, in case another is around.
-    pinned = env("MODEL_REVISION")
-    ordered = sorted(snapshots, key=lambda s: (os.path.basename(s) != pinned, -os.path.getmtime(s)))
+    ordered = sorted(snapshots, key=lambda s: (os.path.basename(s) != (pinned or ""), -os.path.getmtime(s)))
     for snap in ordered:
         first = os.path.join(snap, env("MODEL_FILE"))
         if all(os.path.isfile(p) for p in shards(first)):
@@ -114,18 +134,26 @@ def supports(flag):
         return False
 
 
-def download():
+def hf_token():
+    """HF_TOKEN, for a private copy of your own. A RunPod secret that was never
+    created arrives as its "{{ … }}" placeholder; sent as a token, that would
+    fail even the public original with a 401, so it counts as none."""
+    token = env("HF_TOKEN").strip()
+    return None if not token or token.startswith("{{") else token
+
+
+def download(repo=None, revision=None):
     started = time.time()
     root = snapshot_download(
-        repo_id=env("MODEL_REPO"),
-        # Pinned, so a download gets exactly what the R2 copy holds.
-        revision=env("MODEL_REVISION") or None,
+        repo_id=repo or env("MODEL_REPO"),
+        # The original is pinned, so a download gets what the R2 copy holds.
+        revision=revision,
         allow_patterns=[env("MODEL_INCLUDE")],
         local_dir=MODELS,
-        token=env("HF_TOKEN") or None,
+        token=hf_token(),
     )
     INFO["seconds"]["download"] = round(time.time() - started)
-    print(f"[worker] downloaded in {INFO['seconds']['download']}s", flush=True)
+    print(f"[worker] downloaded from {repo} in {INFO['seconds']['download']}s", flush=True)
     return os.path.join(root, env("MODEL_FILE"))
 
 
@@ -211,16 +239,26 @@ def locate():
             return cached
         INFO["cacheMissing"] = True
         print("[worker] not in RunPod's model cache; downloading " + env("MODEL_INCLUDE"), flush=True)
-    try:
-        path = download()
-        INFO["source"] = "download"
-        return path
-    except Exception as e:  # noqa: BLE001 — 404, 401, a network failure: all mean "try the copy"
-        INFO["hfError"] = f"{type(e).__name__}: {str(e)[:300]}"
-        print("[worker] Hugging Face failed: " + INFO["hfError"], flush=True)
-        cfg = r2_settings()
-        if not cfg:
-            raise RuntimeError("Hugging Face から取れず、R2 の控えも設定されていません: " + INFO["hfError"]) from e
+    # Your own copy, then the original: 404, 401, a network failure — any of
+    # them means "try the next".
+    errors = []
+    for s in sources():
+        try:
+            path = download(s["repo"], s["revision"])
+            INFO["source"] = "download"
+            INFO["downloadedFrom"] = s["repo"]
+            if errors:
+                INFO["hfError"] = " / ".join(errors)
+            return path
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"{s['repo']}: {type(e).__name__}: {str(e)[:200]}")
+            print("[worker] Hugging Face failed: " + errors[-1], flush=True)
+            # Whatever a failed attempt left, out of the next one's way.
+            shutil.rmtree(os.path.join(MODELS, ".cache"), ignore_errors=True)
+    INFO["hfError"] = " / ".join(errors)
+    cfg = r2_settings()
+    if not cfg:
+        raise RuntimeError("Hugging Face から取れず、R2 の控えも設定されていません: " + INFO["hfError"])
     INFO["source"] = "r2"
     return from_r2(cfg)
 

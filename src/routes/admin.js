@@ -56,6 +56,7 @@ import {
   modelCacheResult,
   r2Prefix,
   R2_SECRETS,
+  HF_TOKEN_SECRET,
   OWN_JOBS_KEY,
   rememberOwnJob,
   DEFAULT_SPEC,
@@ -306,8 +307,18 @@ async function runWarm(env, key, endpointId) {
   }
 }
 
+/* The spec the settings call for: where to fetch the model from (your own
+ * copy, R2) is chosen in the admin tab, the rest is LLAMACPP_SPEC. */
+const appSpec = (settings, extra = {}) =>
+  resolveSpec({
+    useR2: !!settings.runpodUseR2,
+    ownRepo: String(settings.runpodOwnRepo || '').trim(),
+    ...extra,
+  });
+
 admin.get('/breakthrough', async (c) => {
   const settings = await getSettings(c.env);
+  const spec = appSpec(settings);
 
   /* The warm-up progress above lives in module memory, which does not survive
    * a Worker eviction — so on its own it will happily report "idle" while a
@@ -345,19 +356,27 @@ admin.get('/breakthrough', async (c) => {
       // Which of Brave and Exa "let the model choose" can actually offer.
       engines: await availableEngines(c.env).catch(() => []),
     },
-    spec: DEFAULT_SPEC,
-    image: imageFor(DEFAULT_SPEC),
+    spec,
+    image: imageFor(spec),
     // What RunPod's console takes in the Model field, for setting it by hand.
-    modelReference: DEFAULT_SPEC.cacheModel ? modelReference(DEFAULT_SPEC) : null,
+    modelReference: spec.cacheModel ? modelReference(spec) : null,
+    // Your own HF copy, if set, and the RunPod secret a private one is read with.
+    own: spec.engine === 'llamacpp' ? { repo: spec.ownRepo || '', secret: HF_TOKEN_SECRET, source: spec.model } : null,
     // The R2 copy: where it is, which RunPod secrets it needs, whether new
     // endpoints use it.
-    r2: DEFAULT_SPEC.engine === 'llamacpp'
-      ? { enabled: !!settings.runpodUseR2, bucket: DEFAULT_SPEC.r2Bucket, prefix: r2Prefix(DEFAULT_SPEC), secrets: Object.values(R2_SECRETS) }
+    r2: spec.engine === 'llamacpp'
+      ? { enabled: !!settings.runpodUseR2, bucket: spec.r2Bucket, prefix: r2Prefix(spec), secrets: Object.values(R2_SECRETS) }
       : null,
-    /* Re-judged from the stored references: records written before a
-     * resolved ":<sha>" counted as a match still say ok:false. */
+    /* Judged against the repository the settings now point at — so records
+     * from before ":main" resolving to a sha counted as a match read right,
+     * and a cache still on the original after switching to your own copy
+     * shows as not set. */
     modelCache: settings.runpodModelCache?.refs
-      ? { ...settings.runpodModelCache, ...modelCacheResult(settings.runpodModelCache.refs, settings.runpodModelCache.value) }
+      ? {
+          ...settings.runpodModelCache,
+          ...modelCacheResult(settings.runpodModelCache.refs, modelReference(spec)),
+          otherRepo: !modelCacheResult(settings.runpodModelCache.refs, modelReference(spec)).ok && settings.runpodModelCache.refs.length > 0,
+        }
       : settings.runpodModelCache || null,
     warming: await describeWarming(c.env, live),
   });
@@ -366,8 +385,8 @@ admin.get('/breakthrough', async (c) => {
 admin.post('/breakthrough/provision', async (c) => {
   const body = await c.req.json().catch(() => ({}));
   const settings = await getSettings(c.env);
-  // The R2 fallback is a setting, applied when an endpoint is made.
-  const spec = resolveSpec({ useR2: !!settings.runpodUseR2, ...(body.spec || {}) });
+  // Your own copy and the R2 fallback are settings, applied when an endpoint is made.
+  const spec = appSpec(settings, body.spec || {});
   const problems = validateSpec(spec);
   if (problems.length) return c.json({ error: problems.join(' / ') }, 400);
 
@@ -455,7 +474,7 @@ admin.post('/breakthrough/cache', async (c) => {
   const key = await getApiKey(c.env, 'RUNPOD_API_KEY');
   if (!key) return c.json({ error: 'RUNPOD_API_KEY が未登録です' }, 400);
   if (!settings.runpodEndpointId) return c.json({ error: 'エンドポイントがありません' }, 400);
-  const value = modelReference(DEFAULT_SPEC);
+  const value = modelReference(appSpec(settings));
   const result = await attachModel(key, settings.runpodEndpointId, [value])
     .then((refs) => modelCacheResult(refs, value))
     .catch((e) => ({ ok: false, error: e.message, value }));
@@ -469,7 +488,7 @@ admin.post('/breakthrough/diagnose', async (c) => {
   if (!key) return c.json({ error: 'RUNPOD_API_KEY が未登録です' }, 400);
   if (!settings.runpodEndpointId) return c.json({ error: 'エンドポイントがありません' }, 400);
   try {
-    const out = await diagnose(key, settings.runpodEndpointId);
+    const out = await diagnose(key, settings.runpodEndpointId, appSpec(settings));
     await noteOwnJob(c.env, out.probe?.jobId).catch(() => {});
     return c.json(out);
   } catch (e) {

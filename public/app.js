@@ -2206,6 +2206,23 @@ let btTimer = null;
 /* The app's own copy of the model in R2, for when Hugging Face stops serving
  * it. Off until the RunPod secrets exist: a template naming a secret that is
  * not there may fail to start. */
+function ownRepoNote(bt) {
+  if (!bt.own) return '';
+  const own = bt.own;
+  return (
+    '<div style="margin-top:12px"><div class="field"><span>自分の Hugging Face リポジトリ（IQ3_S の控え）</span>' +
+    '<div class="row" style="flex-wrap:wrap">' +
+    '<input class="input sm" id="bt-own" placeholder="owner/name（空なら元のリポジトリ）" value="' + esc(own.repo) + '" style="flex:1 1 220px">' +
+    '<button class="btn" id="bt-own-save">保存</button></div></div>' +
+    '<p class="xs muted">' +
+    (own.repo
+      ? '事前保存とダウンロードは <code>' + esc(own.repo) + '</code> から（約84GB）。取れなければ元の <code>' + esc(own.source) + '</code>、R2 の順に切り替えます。'
+      : '未設定です。今は元の <code>' + esc(own.source) + '</code>（全量子化で約281GB）を事前保存しています。') +
+    ' 控えは GitHub Actions の「mirror model」で作ります。非公開なら、RunPod の Settings → Secrets に読み取り用トークンを <code>' +
+    esc(own.secret) + '</code> の名前で作ってください。変更はエンドポイントを作り直すと効きます（事前保存の指定だけなら「モデルのキャッシュを設定」でも変わります）。</p></div>'
+  );
+}
+
 function r2Note(bt) {
   if (!bt.r2) return '';
   const r2 = bt.r2;
@@ -2235,7 +2252,8 @@ function modelCacheNote(bt) {
     );
   }
   return (
-    '<p class="xs"><span class="warn">モデルのキャッシュが' + (mc ? '設定できませんでした' : '未設定です') + '</span>' +
+    '<p class="xs"><span class="warn">モデルのキャッシュが' +
+    (mc?.otherRepo ? '今の設定と違うリポジトリを指しています' : mc ? '設定できませんでした' : '未設定です') + '</span>' +
     (mc?.error ? '（' + esc(mc.error) + '）' : '') +
     '。「モデルのキャッシュを設定」を押すか、RunPod のコンソールでエンドポイントの <b>Manage → Edit Endpoint</b> を開き、' +
     '<b>Model</b> 欄に次の値を入れてください:<br><code>' + esc(bt.modelReference) + '</code><br>' +
@@ -2338,6 +2356,7 @@ async function renderBreakthroughTab(body) {
         '</div>' +
         '<p class="xs muted">RunPod の API キーは「キー」タブで <code>RUNPOD_API_KEY</code> として登録してください。</p>' +
         '<button class="btn primary" id="bt-create" style="margin-top:12px">エンドポイントを作成して起動</button>') +
+    ownRepoNote(bt) +
     r2Note(bt) +
     '<p class="xs" id="bt-msg"></p></div>' +
     '<div class="card"><h3>ウェブ検索</h3>' +
@@ -2465,6 +2484,14 @@ async function renderBreakthroughTab(body) {
       msg(err.message, 'warn');
       e.target.disabled = false;
     }
+  });
+
+  $('#bt-own-save')?.addEventListener('click', async () => {
+    const repo = $('#bt-own').value.trim();
+    if (repo && !/^[\w.-]+\/[\w.-]+$/.test(repo)) return msg('owner/name の形で入力してください', 'warn');
+    await api('/api/admin/settings', { method: 'POST', body: JSON.stringify({ runpodOwnRepo: repo }) });
+    await renderBreakthroughTab(body);
+    msg(repo ? '自分のリポジトリを設定しました。エンドポイントを作り直すと使われます' : '元のリポジトリに戻しました', 'ok');
   });
 
   $('#bt-r2')?.addEventListener('change', async (e) => {

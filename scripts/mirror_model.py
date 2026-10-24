@@ -1,4 +1,8 @@
-"""Copies one quant of a Hugging Face GGUF repository into Cloudflare R2.
+"""Copies one quant of a Hugging Face GGUF repository into a Hugging Face
+repository of one's own (--to-hf), Cloudflare R2 (--bucket), or both.
+
+The Hugging Face copy is made server-side; see mirror_to_hf below. What
+follows describes the R2 copy.
 
 Breakthrough mode runs a community upload that its author can delete or make
 private at any time. This keeps a copy of exactly the files in use, at the
@@ -237,22 +241,151 @@ def r2_client():
     )
 
 
+# ---------------------------------------------------------------------------
+# To a Hugging Face repository of one's own.
+#
+# The Hub copies files between repositories server-side (CommitOperationCopy
+# with src_repo_id): nothing is downloaded or uploaded here, so 84 GB costs a
+# commit rather than an hour of transfer. The copy holds only this quant, so
+# RunPod's model cache — which takes whole repositories — fetches 84 GB from
+# it instead of the source's 281 GB, and it keeps working if the source goes.
+# ---------------------------------------------------------------------------
+
+def readme(source, revision, folder, files):
+    rows = "\n".join(f"| `{f['path']}` | {f['size']:,} | `{f['sha256']}` |" for f in files)
+    return f"""---
+license: apache-2.0
+base_model: {source}
+tags:
+  - gguf
+  - mirror
+---
+
+# {folder} of {source}
+
+A copy of the `{folder}` files of [{source}](https://huggingface.co/{source}),
+taken at commit [`{revision}`](https://huggingface.co/{source}/tree/{revision}),
+for private use by one application. Nothing here is modified.
+
+- Source: https://huggingface.co/{source}
+- Source commit: `{revision}`
+- License: Apache-2.0, as the source states
+- The source describes the model as abliterated, with no meaningful built-in
+  guardrails. That applies here unchanged.
+
+| File | Bytes | sha256 |
+| --- | ---: | --- |
+{rows}
+
+The sha256 values are the source's own (its LFS oids); the copy was checked
+against them after it was made.
+"""
+
+
+def hf_tree(session, repo, revision, folder, token=None):
+    """Like hf_files, but a missing repository or folder is an empty list."""
+    try:
+        return hf_files(session, repo, revision, folder, token)
+    except SystemExit:
+        return []
+    except Exception as e:  # noqa: BLE001
+        if "404" in str(e):
+            return []
+        raise
+
+
+def mirror_to_hf(api, session, args, token):
+    """Copies the folder into args.to_hf (created private if absent), adds a
+    README and mirror.json, and checks every file's sha256 and size against
+    the source. Returns the destination's file list."""
+    from huggingface_hub import CommitOperationAdd, CommitOperationCopy
+
+    files = hf_files(session, args.repo, args.revision, args.folder, token)
+    dest = args.to_hf
+    log(f"{len(files)} files, {sum(f['size'] for f in files) / 1e9:.1f} GB → hf://{dest}/{args.folder}/ (server-side copy)")
+    if args.dry_run:
+        for f in files:
+            log(f"  {f['path']}  {f['size']}  sha256 {f['sha256']}")
+        who = api.whoami()
+        log(f"token belongs to {who.get('name')}; dry run: nothing copied")
+        return None
+
+    api.create_repo(dest, repo_type="model", private=not args.public, exist_ok=True)
+    have = {f["path"]: f for f in hf_tree(session, dest, "main", args.folder, token)}
+    todo = [f for f in files if have.get(f["path"], {}).get("sha256") != f["sha256"]]
+    for f in files:
+        if f not in todo:
+            log(f"skip {f['path']} (already there, same sha256)")
+
+    try:
+        copies = [
+            CommitOperationCopy(
+                src_path_in_repo=f["path"],
+                path_in_repo=f["path"],
+                src_revision=args.revision,
+                src_repo_id=args.repo,
+                src_repo_type="model",
+            )
+            for f in todo
+        ]
+    except TypeError as e:
+        raise SystemExit(
+            "この huggingface_hub はリポジトリ間のコピー（src_repo_id）に対応していません。"
+            "pip install -U huggingface_hub で更新してください: " + str(e)
+        )
+    record = {"source": args.repo, "revision": args.revision, "folder": args.folder, "files": files}
+    ops = copies + [
+        CommitOperationAdd(path_in_repo="README.md", path_or_fileobj=readme(args.repo, args.revision, args.folder, files).encode()),
+        CommitOperationAdd(path_in_repo="mirror.json", path_or_fileobj=json.dumps(record, indent=1).encode()),
+    ]
+    api.create_commit(
+        repo_id=dest,
+        repo_type="model",
+        operations=ops,
+        commit_message=f"Copy {args.folder} from {args.repo}@{args.revision[:12]}",
+    )
+
+    after = {f["path"]: f for f in hf_tree(session, dest, "main", args.folder, token)}
+    for f in files:
+        got = after.get(f["path"])
+        if not got or got["sha256"] != f["sha256"] or got["size"] != f["size"]:
+            raise RuntimeError(f"{f['path']}: コピー先の sha256 / 大きさが元と違います（{got} / {f}）")
+    log(f"done: {len(files)} files in hf://{dest}, sha256 checked against the source")
+    return list(after.values())
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     p.add_argument("--repo", required=True)
     p.add_argument("--revision", required=True, help="the commit sha, not a branch")
     p.add_argument("--folder", required=True)
-    p.add_argument("--bucket", required=True)
+    p.add_argument("--bucket", default="", help="R2 bucket to copy to")
     p.add_argument("--prefix", default="", help="default: <repo>/<revision>")
+    p.add_argument("--to-hf", default="", help="a Hugging Face repository of your own to copy to (owner/name)")
+    p.add_argument("--public", action="store_true", help="create the --to-hf repository public (default private)")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--no-verify", dest="verify", action="store_false")
     args = p.parse_args(argv)
     if len(args.revision) < 40:
         raise SystemExit("--revision はコミットの sha（40 文字）で指定してください。ブランチ名だと中身が変わり得ます")
+    if not args.bucket and not args.to_hf:
+        raise SystemExit("複製先がありません。--to-hf か --bucket を指定してください")
+    if args.to_hf and args.to_hf.count("/") != 1:
+        raise SystemExit("--to-hf は owner/name の形で指定してください")
+
+    token = os.environ.get("HF_TOKEN") or None
+    if args.to_hf and not token:
+        raise SystemExit("自分のリポジトリへの複製には、書き込み権限のある HF_TOKEN が要ります")
 
     import requests
 
-    mirror(r2_client(), requests.Session(), args, os.environ.get("HF_TOKEN") or None)
+    session = requests.Session()
+    if args.to_hf:
+        from huggingface_hub import HfApi
+
+        mirror_to_hf(HfApi(token=token), session, args, token)
+    if args.bucket:
+        mirror(r2_client(), session, args, token)
 
 
 if __name__ == "__main__":

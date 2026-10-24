@@ -306,5 +306,54 @@ with tempfile.TemporaryDirectory() as root:
         os.environ.pop(k, None)
     os.environ.pop("MODEL_REVISION", None)
 
+# ---------------------- your own copy on Hugging Face ----------------------
+OWN = "someone/qwen38-flash-next-abliterated-iq3s"
+REV = "eec4e10a2c29b440a2ae85591fa11569ce752963"
+
+with tempfile.TemporaryDirectory() as root:
+    handler.HF_CACHE = os.path.join(root, "hub")
+    handler.MODELS = os.path.join(root, "models")
+    os.environ.update(MODEL_CACHE="on", MODEL_REVISION=REV, OWN_MODEL_REPO=OWN, HF_TOKEN="hf_private")
+    calls = []
+
+    def fake_download(**kw):
+        calls.append((kw["repo_id"], kw["revision"], kw["token"]))
+        if kw["repo_id"] in FAILING:
+            raise RuntimeError("401 Client Error: Unauthorized")
+        return kw["local_dir"]
+
+    handler.snapshot_download = fake_download
+    FAILING = set()
+    handler.locate()
+    check("自分のリポジトリから先に取る", calls[0] == (OWN, None, "hf_private") and handler.INFO["downloadedFrom"] == OWN, calls)
+    check("  取れたら元のリポジトリには行かない", len(calls) == 1)
+
+    calls.clear()
+    FAILING = {OWN}
+    handler.locate()
+    check("自分のが取れなければ、元をコミット固定で取る", calls[1] == (REPO, REV, "hf_private") and handler.INFO["downloadedFrom"] == REPO, calls)
+    check("  自分の失敗の理由を残す", OWN in handler.INFO.get("hfError", "") and "401" in handler.INFO["hfError"])
+
+    calls.clear()
+    FAILING = set()
+    os.environ["HF_TOKEN"] = "{{ RUNPOD_SECRET_hyperai_hf_token }}"
+    handler.locate()
+    check("未作成の secret はトークンとして送らない（元の公開リポジトリが 401 にならない）", calls[0][2] is None, calls)
+    os.environ["HF_TOKEN"] = "hf_private"
+
+    # RunPod's cache: your copy (at whatever commit main was) before the original.
+    for repo, rev in ((REPO, REV), (OWN, "aaaa000000000000000000000000000000000000")):
+        snap = os.path.join(handler.HF_CACHE, "models--" + repo.replace("/", "--"), "snapshots", rev)
+        touch(os.path.join(snap, FILE))
+        touch(os.path.join(snap, FILE.replace("00001-of", "00002-of")))
+    found = handler.from_cache() or ""
+    check("キャッシュ: 自分のリポジトリを先に見る", "models--someone--" in found, found)
+    os.environ.pop("OWN_MODEL_REPO")
+    found = handler.from_cache() or ""
+    check("  設定が無ければ元のリポジトリ", "models--SC117--" in found, found)
+    for k in ("MODEL_REVISION", "HF_TOKEN"):
+        os.environ.pop(k, None)
+    handler.snapshot_download = lambda **kw: kw["local_dir"]
+
 print(f"\n{sum(results)}/{len(results)} passed")
 sys.exit(0 if all(results) else 1)

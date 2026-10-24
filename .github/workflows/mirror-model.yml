@@ -1,37 +1,52 @@
-# Copies the breakthrough model's files from Hugging Face into R2, so the
-# worker can still start if the upload is deleted or made private (the worker
-# falls back to this copy; see runpod-worker/llamacpp/handler.py).
+# Copies the breakthrough model's files to where the worker can still find
+# them if the original upload is deleted or made private (the worker's order:
+# RunPod's cache → your own HF repository → the original → R2; see
+# runpod-worker/llamacpp/handler.py).
 #
-# Run by hand only: it moves ~84 GB. Nothing is written to the runner's disk;
-# each file streams from Hugging Face into an R2 multipart upload, is checked
-# against the sha256 Hugging Face records for it, and is read back from R2 and
-# checked again. Rerunning skips files already verified.
+# Run by hand only. Two destinations, either or both:
 #
-# Needs repository secrets R2_ACCOUNT_ID, R2_ACCESS_KEY_ID and
-# R2_SECRET_ACCESS_KEY (an R2 token with read and write on the bucket).
-name: mirror model to R2
+#   hf_repo  A Hugging Face repository of your own, private by default. The
+#            Hub copies the files server-side, so this moves nothing through
+#            the runner and takes minutes. Holding just this quant, it is also
+#            what RunPod's model cache should point at: 84 GB, not 281.
+#            Needs secret HF_TOKEN (a write token).
+#   bucket   Cloudflare R2. Each file streams through the runner into a
+#            multipart upload (never touching its disk), is checked against
+#            the sha256 Hugging Face records, and is read back and checked
+#            again. ~84 GB through the runner. Needs secrets R2_ACCOUNT_ID,
+#            R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY.
+#
+# Rerunning skips files already copied and checked.
+name: mirror model
 
 on:
   workflow_dispatch:
     inputs:
       repo:
-        description: Hugging Face repository
+        description: Source Hugging Face repository
         default: SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF
       revision:
-        description: Commit sha (40 characters, not a branch)
+        description: Source commit sha (40 characters, not a branch)
         default: eec4e10a2c29b440a2ae85591fa11569ce752963
       folder:
         description: Quant folder
         default: IQ3_S
+      hf_repo:
+        description: Your own HF repository to copy to (owner/name; empty = skip)
+        default: ''
+      hf_public:
+        description: Create that repository public (default private)
+        type: boolean
+        default: false
       bucket:
-        description: R2 bucket
-        default: hyperai-models
+        description: R2 bucket to copy to (empty = skip)
+        default: ''
       dry_run:
         description: List the files and check access only
         type: boolean
         default: true
       verify:
-        description: Read each file back from R2 and hash it again (free egress; doubles the time)
+        description: R2 only — read each file back and hash it again (free egress; doubles the time)
         type: boolean
         default: true
 
@@ -45,7 +60,7 @@ concurrency:
 jobs:
   mirror:
     runs-on: ubuntu-latest
-    # Two passes over 84 GB; GitHub's own ceiling is six hours.
+    # R2: two passes over 84 GB. GitHub's own ceiling is six hours.
     timeout-minutes: 300
     steps:
       - uses: actions/checkout@v4
@@ -57,26 +72,42 @@ jobs:
       - name: Test the copier
         run: python -I scripts/test_mirror_model.py
 
+      # The latest huggingface_hub: copying between repositories (src_repo_id)
+      # is recent.
       - name: Install
-        run: pip install "boto3>=1.36" "requests>=2.31"
+        run: pip install -U "huggingface_hub" "boto3>=1.36" "requests>=2.31"
 
       - name: Copy
         env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
           R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           REPO: ${{ inputs.repo }}
           REVISION: ${{ inputs.revision }}
           FOLDER: ${{ inputs.folder }}
+          HF_REPO: ${{ inputs.hf_repo }}
+          HF_PUBLIC: ${{ inputs.hf_public }}
           BUCKET: ${{ inputs.bucket }}
           DRY_RUN: ${{ inputs.dry_run }}
           VERIFY: ${{ inputs.verify }}
         run: |
           set -euo pipefail
-          for v in R2_ACCOUNT_ID R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY; do
-            if [ -z "${!v}" ]; then echo "::error::secret $v is not set"; exit 1; fi
-          done
-          args=(--repo "$REPO" --revision "$REVISION" --folder "$FOLDER" --bucket "$BUCKET")
+          if [ -z "$HF_REPO" ] && [ -z "$BUCKET" ]; then
+            echo "::error::hf_repo か bucket のどちらかを指定してください"; exit 1
+          fi
+          if [ -n "$HF_REPO" ] && [ -z "$HF_TOKEN" ]; then
+            echo "::error::secret HF_TOKEN is not set"; exit 1
+          fi
+          if [ -n "$BUCKET" ]; then
+            for v in R2_ACCOUNT_ID R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY; do
+              if [ -z "${!v}" ]; then echo "::error::secret $v is not set"; exit 1; fi
+            done
+          fi
+          args=(--repo "$REPO" --revision "$REVISION" --folder "$FOLDER")
+          if [ -n "$HF_REPO" ]; then args+=(--to-hf "$HF_REPO"); fi
+          if [ "$HF_PUBLIC" = "true" ]; then args+=(--public); fi
+          if [ -n "$BUCKET" ]; then args+=(--bucket "$BUCKET"); fi
           if [ "$DRY_RUN" = "true" ]; then args+=(--dry-run); fi
           if [ "$VERIFY" != "true" ]; then args+=(--no-verify); fi
           python scripts/mirror_model.py "${args[@]}"
