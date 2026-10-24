@@ -56,7 +56,9 @@ import {
   modelCacheResult,
   r2Prefix,
   R2_SECRETS,
-  HF_TOKEN_SECRET,
+  cacheEnv,
+  cachedModels,
+  describeModelCache,
   OWN_JOBS_KEY,
   rememberOwnJob,
   DEFAULT_SPEC,
@@ -189,6 +191,17 @@ const KEY_TESTS = {
     const text = await res.text();
     if (!res.ok) return { ok: false, error: 'HTTP ' + res.status + ' ' + text.slice(0, 200) };
     return { ok: true, detail: { ok: true } };
+  },
+
+  // Free: who the token belongs to, and what it may do.
+  async HF_TOKEN(value) {
+    const res = await fetch('https://huggingface.co/api/whoami-v2', {
+      headers: { authorization: 'Bearer ' + value },
+      signal: AbortSignal.timeout(20000),
+    });
+    const json = await res.json().catch(() => ({}));
+    if (!res.ok) return { ok: false, error: 'HTTP ' + res.status + ' ' + String(json.error || '').slice(0, 200) };
+    return { ok: true, detail: { name: json.name, role: json.auth?.accessToken?.role || null } };
   },
 
   // One page through /contents, $0.001 — a search would be $0.007.
@@ -325,11 +338,14 @@ admin.get('/breakthrough', async (c) => {
    * worker is in fact starting. RunPod knows the truth; ask it. */
   let live = null;
   let out_workersMax = null;
+  let liveRefs = null;
   if (settings.runpodEndpointId) {
     const key = await getApiKey(c.env, 'RUNPOD_API_KEY');
     if (key) {
       const ep = await getEndpoint(key, settings.runpodEndpointId).catch(() => null);
       out_workersMax = ep?.workersMax ?? null;
+      // What RunPod is caching now, rather than what was recorded at creation.
+      liveRefs = await cachedModels(key, settings.runpodEndpointId).catch(() => null);
       /* Sorted by what bills: only "running" does. "ready" also counts a
        * stopped worker kept for a fast restart, so it is not shown as one
        * that is up (see describeWorkers). */
@@ -360,24 +376,17 @@ admin.get('/breakthrough', async (c) => {
     image: imageFor(spec),
     // What RunPod's console takes in the Model field, for setting it by hand.
     modelReference: spec.cacheModel ? modelReference(spec) : null,
-    // Your own HF copy, if set, and the RunPod secret a private one is read with.
-    own: spec.engine === 'llamacpp' ? { repo: spec.ownRepo || '', secret: HF_TOKEN_SECRET, source: spec.model } : null,
+    // Your own HF copy, if set, and whether a token to read it is registered
+    // (whether, never what).
+    own: spec.engine === 'llamacpp'
+      ? { repo: spec.ownRepo || '', tokenSet: !!(await getApiKey(c.env, 'HF_TOKEN')), source: spec.model }
+      : null,
     // The R2 copy: where it is, which RunPod secrets it needs, whether new
     // endpoints use it.
     r2: spec.engine === 'llamacpp'
       ? { enabled: !!settings.runpodUseR2, bucket: spec.r2Bucket, prefix: r2Prefix(spec), secrets: Object.values(R2_SECRETS) }
       : null,
-    /* Judged against the repository the settings now point at — so records
-     * from before ":main" resolving to a sha counted as a match read right,
-     * and a cache still on the original after switching to your own copy
-     * shows as not set. */
-    modelCache: settings.runpodModelCache?.refs
-      ? {
-          ...settings.runpodModelCache,
-          ...modelCacheResult(settings.runpodModelCache.refs, modelReference(spec)),
-          otherRepo: !modelCacheResult(settings.runpodModelCache.refs, modelReference(spec)).ok && settings.runpodModelCache.refs.length > 0,
-        }
-      : settings.runpodModelCache || null,
+    modelCache: describeModelCache({ liveRefs, stored: settings.runpodModelCache, expected: modelReference(spec) }),
     warming: await describeWarming(c.env, live),
   });
 });
@@ -399,7 +408,9 @@ admin.post('/breakthrough/provision', async (c) => {
 
   let created;
   try {
-    created = await provision(key, spec);
+    // The token goes to RunPod with the cached model, never into the spec
+    // (which this route echoes back).
+    created = await provision(key, spec, { hfToken: await getApiKey(c.env, 'HF_TOKEN') });
   } catch (e) {
     return c.json({ error: e.message }, 502);
   }
@@ -474,8 +485,10 @@ admin.post('/breakthrough/cache', async (c) => {
   const key = await getApiKey(c.env, 'RUNPOD_API_KEY');
   if (!key) return c.json({ error: 'RUNPOD_API_KEY が未登録です' }, 400);
   if (!settings.runpodEndpointId) return c.json({ error: 'エンドポイントがありません' }, 400);
-  const value = modelReference(appSpec(settings));
-  const result = await attachModel(key, settings.runpodEndpointId, [value])
+  const spec = appSpec(settings);
+  const value = modelReference(spec);
+  const env = cacheEnv(spec, await getApiKey(c.env, 'HF_TOKEN'));
+  const result = await attachModel(key, settings.runpodEndpointId, [value], { env })
     .then((refs) => modelCacheResult(refs, value))
     .catch((e) => ({ ok: false, error: e.message, value }));
   await saveSettings(c.env, { runpodModelCache: { ...result, at: Date.now() } });

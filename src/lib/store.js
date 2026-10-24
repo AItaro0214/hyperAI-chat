@@ -10,6 +10,8 @@ export const SECRET_KEYS = [
   'OLLAMA_API_KEY',
   'BRAVE_API_KEY',
   'EXA_API_KEY',
+  // Read access to a private Hugging Face copy of the breakthrough model.
+  'HF_TOKEN',
 ];
 
 /* ---------------------------- sealed API keys ---------------------------

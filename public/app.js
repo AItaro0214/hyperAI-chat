@@ -2203,9 +2203,9 @@ async function renderEventsTab(body) {
 
 let btTimer = null;
 
-/* The app's own copy of the model in R2, for when Hugging Face stops serving
- * it. Off until the RunPod secrets exist: a template naming a secret that is
- * not there may fail to start. */
+/* Your own Hugging Face copy of the quant: what RunPod caches and the worker
+ * downloads first. A private one needs the HF_TOKEN API key, which goes to the
+ * endpoint with the cache. */
 function ownRepoNote(bt) {
   if (!bt.own) return '';
   const own = bt.own;
@@ -2218,8 +2218,11 @@ function ownRepoNote(bt) {
     (own.repo
       ? '事前保存とダウンロードは <code>' + esc(own.repo) + '</code> から（約84GB）。取れなければ元の <code>' + esc(own.source) + '</code>、R2 の順に切り替えます。'
       : '未設定です。今は元の <code>' + esc(own.source) + '</code>（全量子化で約281GB）を事前保存しています。') +
-    ' 控えは GitHub Actions の「mirror model」で作ります。非公開なら、RunPod の Settings → Secrets に読み取り用トークンを <code>' +
-    esc(own.secret) + '</code> の名前で作ってください。変更はエンドポイントを作り直すと効きます（事前保存の指定だけなら「モデルのキャッシュを設定」でも変わります）。</p></div>'
+    ' 控えは GitHub Actions の「mirror model」で作ります。' +
+    (own.tokenSet
+      ? '<span class="ok">読み取り用トークン（HF_TOKEN）は登録済み</span>で、事前保存を設定するときにエンドポイントへ渡します。'
+      : '<span class="warn">非公開なら「API キー」タブで <code>HF_TOKEN</code>（読み取り用）を登録してください。</span>') +
+    ' 変更はエンドポイントを作り直すと効きます（事前保存の指定だけなら「モデルのキャッシュを設定」でも変わります）。</p></div>'
   );
 }
 
@@ -2243,7 +2246,8 @@ function modelCacheNote(bt) {
   if (!bt.modelReference) return '';
   const mc = bt.modelCache;
   if (mc?.ok) {
-    // RunPod pins ":main" to the commit it resolved to; that is what is cached.
+    // Read from RunPod just now (mc.live), not from a record of an earlier
+    // attempt. RunPod pins ":main" to the commit it resolved to.
     const sha = /:([0-9a-f]{12,})$/i.exec(mc.resolved || '')?.[1];
     return (
       '<p class="xs muted"><span class="ok">モデルのキャッシュを設定済み</span>: <code>' + esc(mc.resolved || mc.value) + '</code>' +

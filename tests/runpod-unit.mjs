@@ -22,6 +22,10 @@ import {
   isAppJob,
   rememberOwnJob,
   diagnose,
+  cacheEnv,
+  redact,
+  maskEnv,
+  describeModelCache,
   recoverReply,
   failedReason,
   WORKER_META_KEY,
@@ -263,7 +267,8 @@ const out = await provision('key');
 check('テンプレート→エンドポイントの順で作る', calls[0].startsWith('POST /templates') && calls[1].startsWith('POST /endpoints'), calls.join(' → '));
 check('  ベースURLを組み立てて返す', out.base === openaiBase('ep_9'), out.base);
 check('  短縮モデル名を返す', out.model === 'breakthrough');
-check('  そのあとキャッシュを付ける', calls[2] === 'GQL EndpointConfig' && calls[3] === 'GQL SaveEndpoint', calls.join(' → '));
+check('  そのあとキャッシュを付ける（設定と env を読んでから保存）',
+  calls[2] === 'GQL EndpointConfig' && calls[3] === 'GET /endpoints/ep_9' && calls[4] === 'GQL SaveEndpoint', calls.join(' → '));
 check('  付けられたと報告する', out.modelCache?.ok === true && out.modelCache.value === REF, JSON.stringify(out.modelCache));
 const saved = calls.gql.find((g) => g.op === 'SaveEndpoint').variables.input;
 check('  モデルの参照を送る', JSON.stringify(saved.modelReferences) === JSON.stringify([REF]));
@@ -473,7 +478,11 @@ check('自分のリポジトリ: 未設定なら元のリポジトリをコミ�
 check('  設定すると事前保存の参照は自分のリポジトリ（main）', modelReference({ ownRepo: OWN }) === 'https://huggingface.co/' + OWN + ':main');
 const ownT = templateBody({ ownRepo: OWN });
 check('  ワーカーに自分のリポジトリを渡し、元も残す', ownT.env.OWN_MODEL_REPO === OWN && ownT.env.MODEL_REPO === DEFAULT_SPEC.model && ownT.env.MODEL_REVISION === DEFAULT_SPEC.revision);
-check('  トークンは RunPod の secret の参照だけ', ownT.env.HF_TOKEN === '{{ RUNPOD_SECRET_hyperai_hf_token }}');
+// RunPod validates a private cached model with the endpoint's env, and does
+// not expand secret references there: the token goes on the endpoint, not here.
+check('  テンプレートにはトークンを入れない', !('HF_TOKEN' in ownT.env));
+check('  エンドポイントの env に入れるのは、自分のリポジトリでトークンがあるときだけ',
+  cacheEnv({ ownRepo: OWN }, 'hf_x').HF_TOKEN === 'hf_x' && Object.keys(cacheEnv({}, 'hf_x')).length === 0 && Object.keys(cacheEnv({ ownRepo: OWN }, null)).length === 0);
 check('  未設定なら HF_TOKEN を付けない（元は公開）', !('HF_TOKEN' in templateBody().env) && !('OWN_MODEL_REPO' in templateBody().env));
 check('  形の誤りを弾く', validateSpec({ ownRepo: 'no-slash' }).some((p) => p.includes('owner/name')) && validateSpec({ ownRepo: OWN }).length === 0);
 // Switching the cache to your own copy: a reference to the original no longer counts.
@@ -490,8 +499,104 @@ globalThis.fetch = async (url, options = {}) => {
 };
 const dg = await diagnose('k', 'ep', { ownRepo: OWN });
 check('診断: secret を参照する設定でも、ずれと誤判定しない', Array.isArray(dg.drift) && dg.drift.length === 0, JSON.stringify(dg.drift));
-check('  表示ではトークンを伏せる', dg.template.env.HF_TOKEN === '（設定あり）');
+check('  テンプレートの env にトークンは無い', !('HF_TOKEN' in dg.template.env));
 globalThis.fetch = realFetch;
+
+/* ------------- private copy: the token goes on the endpoint -------------- */
+const TOKEN = 'hf_SECRETvalue1234';
+const OWN_REF = 'https://huggingface.co/' + OWN + ':main';
+// What the console left on the production endpoint: MODEL_NAME and a token.
+const CONSOLE_ENV = { MODEL_NAME: 'AItaro0214/qwen38-flash-next-abliterated-iq3s', OTHER: '1' };
+
+calls = fakeFetch({
+  'GET /endpoints': { id: 'ep_9', env: CONSOLE_ENV },
+  'GQL EndpointConfig': { myself: { endpoint: GQL_ENDPOINT } },
+  'GQL SaveEndpoint': { saveEndpoint: { id: 'ep_9', modelReferences: [OWN_REF.replace(':main', ':ec130c79fed1986f1b79866e31a283968f117c87')] } },
+});
+let got = await attachModel('key', 'ep_9', [OWN_REF], { env: { HF_TOKEN: TOKEN } });
+let sentInput = calls.gql.find((g) => g.op === 'SaveEndpoint').variables.input;
+const asMap = (list) => Object.fromEntries((list || []).map((v) => [v.key, v.value]));
+check('非公開: エンドポイントの env に HF_TOKEN の実値を足す', asMap(sentInput.env).HF_TOKEN === TOKEN, JSON.stringify(Object.keys(asMap(sentInput.env))));
+check('  既存の env（MODEL_NAME など）は消さない', asMap(sentInput.env).MODEL_NAME === CONSOLE_ENV.MODEL_NAME && asMap(sentInput.env).OTHER === '1');
+check('  形は [{key, value}]', Array.isArray(sentInput.env) && sentInput.env.every((v) => 'key' in v && 'value' in v));
+check('  SHA に解決された参照で成功と分かる', modelCacheResult(got, OWN_REF).ok === true);
+
+// Without a token to add, the env still goes back unchanged (saveEndpoint replaces everything).
+calls = fakeFetch({
+  'GET /endpoints': { id: 'ep_9', env: { ...CONSOLE_ENV, HF_TOKEN: TOKEN } },
+  'GQL EndpointConfig': { myself: { endpoint: GQL_ENDPOINT } },
+  'GQL SaveEndpoint': { saveEndpoint: { id: 'ep_9', modelReferences: [REF] } },
+});
+await attachModel('key', 'ep_9', [REF]);
+sentInput = calls.gql.find((g) => g.op === 'SaveEndpoint').variables.input;
+check('  足すものが無くても env をそのまま送り返す', JSON.stringify(asMap(sentInput.env)) === JSON.stringify({ ...CONSOLE_ENV, HF_TOKEN: TOKEN }));
+
+// Unreadable env: adding a token would mean guessing the rest — refuse.
+calls = fakeFetch({ 'GET /endpoints': new Error('boom'), 'GQL EndpointConfig': { myself: { endpoint: GQL_ENDPOINT } } });
+let attachErr = '';
+try {
+  await attachModel('key', 'ep_9', [OWN_REF], { env: { HF_TOKEN: TOKEN } });
+} catch (e) {
+  attachErr = e.message;
+}
+check('  env が読めなければ上書きしない', /環境変数が読めない/.test(attachErr) && !calls.includes('GQL SaveEndpoint'), attachErr);
+
+// GraphQL echoes rejected input values in its errors; the token must not survive that.
+calls = fakeFetch({
+  'GET /endpoints': { id: 'ep_9', env: {} },
+  'GQL EndpointConfig': { myself: { endpoint: GQL_ENDPOINT } },
+  'GQL SaveEndpoint': new Error('Variable "$input" got invalid value { key: "HF_TOKEN", value: "' + TOKEN + '" }'),
+});
+attachErr = '';
+try {
+  await attachModel('key', 'ep_9', [OWN_REF], { env: { HF_TOKEN: TOKEN } });
+} catch (e) {
+  attachErr = e.message;
+}
+check('  エラーにトークンの値を残さない', attachErr.includes('***') && !attachErr.includes(TOKEN), attachErr);
+check('値を伏せる', redact('a ' + TOKEN + ' b ' + TOKEN, [TOKEN]) === 'a *** b ***' && redact('x', ['']) === 'x');
+
+// Provisioning: the token reaches RunPod, and nothing the route echoes back.
+calls = fakeFetch({
+  'POST /templates': { id: 'tpl_o' },
+  'POST /endpoints': { id: 'ep_o' },
+  'GET /endpoints': { id: 'ep_o', env: {} },
+  'GQL EndpointConfig': { myself: { endpoint: GQL_ENDPOINT } },
+  'GQL SaveEndpoint': { saveEndpoint: { id: 'ep_o', modelReferences: [OWN_REF] } },
+});
+const createdOwn = await provision('key', { ownRepo: OWN }, { hfToken: TOKEN });
+sentInput = calls.gql.find((g) => g.op === 'SaveEndpoint').variables.input;
+check('作成時: 事前保存と一緒にトークンを渡す', asMap(sentInput.env).HF_TOKEN === TOKEN && createdOwn.modelCache.ok === true);
+check('  返す値にトークンが入らない', !JSON.stringify(createdOwn).includes(TOKEN));
+check('  テンプレートにも入れない', !JSON.stringify(templateBody({ ownRepo: OWN })).includes(TOKEN));
+
+// Display: credentials show as set, never as values.
+check('表示: トークン類は伏せる', JSON.stringify(maskEnv({ HF_TOKEN: TOKEN, R2_SECRET_ACCESS_KEY: 'x', MODEL_NAME: 'm' })) ===
+  JSON.stringify({ HF_TOKEN: '（設定あり）', R2_SECRET_ACCESS_KEY: '（設定あり）', MODEL_NAME: 'm' }));
+globalThis.fetch = async (url) => {
+  const u = String(url);
+  if (u.includes('/endpoints/')) return { ok: true, status: 200, text: async () => JSON.stringify({ templateId: 'tpl', env: { HF_TOKEN: TOKEN, MODEL_NAME: 'm' } }) };
+  if (u.includes('/templates/')) return { ok: true, status: 200, text: async () => JSON.stringify({ imageName: LLAMACPP_IMAGE, env: {} }) };
+  if (u.includes('graphql')) return { ok: true, status: 200, json: async () => ({ data: { myself: { endpoint: { modelReferences: [] } } } }) };
+  return { ok: true, status: 200, json: async () => ({}) };
+};
+const dg2 = await diagnose('k', 'ep', { ownRepo: OWN });
+check('  診断の結果にエンドポイントの HF_TOKEN を出さない', !JSON.stringify(dg2).includes(TOKEN) && dg2.endpoint.env.HF_TOKEN === '（設定あり）');
+globalThis.fetch = realFetch;
+
+/* ------------- the cache status follows RunPod, not a record ------------- */
+const staleFailure = { ok: false, error: 'Failed to validate model reference … Unable to access model', value: OWN_REF, at: 1 };
+const liveOk = describeModelCache({
+  liveRefs: [OWN_REF.replace(':main', ':ec130c79fed1986f1b79866e31a283968f117c87')],
+  stored: staleFailure,
+  expected: OWN_REF,
+});
+check('キャッシュ表示: 今の RunPod の設定に従う（古い失敗の記録より優先）', liveOk.ok === true && liveOk.live === true && !liveOk.error, JSON.stringify(liveOk));
+check('  RunPod が読めなければ記録を出す', describeModelCache({ liveRefs: null, stored: staleFailure, expected: OWN_REF }).ok === false &&
+  describeModelCache({ liveRefs: null, stored: staleFailure, expected: OWN_REF }).live === false);
+check('  別のリポジトリなら、そう分かる', describeModelCache({ liveRefs: [SHA_REF], stored: null, expected: OWN_REF }).otherRepo === true);
+check('  何も無ければ未設定', describeModelCache({ liveRefs: [], stored: null, expected: OWN_REF }).ok === false &&
+  describeModelCache({ liveRefs: null, stored: null, expected: OWN_REF }) === null);
 
 const passed = results.filter(([ok]) => ok).length;
 console.log('\n' + passed + '/' + results.length + ' passed');

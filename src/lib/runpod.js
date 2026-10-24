@@ -128,8 +128,9 @@ export const LLAMACPP_SPEC = {
   /* Your own Hugging Face repository holding just this quant (the "mirror
    * model" workflow makes it). Set, it is what RunPod caches — 84 GB rather
    * than the original's 281 — and the worker's first download; the original
-   * stays as the fallback. Private repositories are read with HF_TOKEN, a
-   * RunPod secret (HF_TOKEN_SECRET). Empty: the original only. */
+   * stays as the fallback. A private one is read with the HF_TOKEN API key,
+   * which goes on the endpoint with the cache (cacheEnv). Empty: the
+   * original only. */
   ownRepo: '',
   /* A100 first, H100 when no A100 is free; 48GB cards cannot hold IQ3_S. The
    * H100 NVL (94GB) is left out to keep the choice to the two 80GB parts. */
@@ -218,9 +219,29 @@ export const modelReference = (spec = {}) => {
   return 'https://huggingface.co/' + s.model + ':' + (s.revision || 'main');
 };
 
-/* The RunPod secret holding a Hugging Face read token, for a private copy of
- * your own. Referred to only when ownRepo is set. */
-export const HF_TOKEN_SECRET = 'hyperai_hf_token';
+/**
+ * The cache status the admin tab shows. RunPod's current references decide
+ * when they could be read — a failure recorded at creation stays recorded
+ * long after the cache was set in the console — and the stored record is
+ * the fallback. Judged against the repository the settings point at now.
+ */
+export function describeModelCache({ liveRefs, stored, expected }) {
+  const judge = (refs, extra) => {
+    const r = modelCacheResult(refs, expected);
+    return { ...r, otherRepo: !r.ok && refs.length > 0, ...extra };
+  };
+  if (Array.isArray(liveRefs)) return judge(liveRefs, { live: true });
+  if (stored?.refs) return { ...stored, ...judge(stored.refs, { live: false }) };
+  return stored ? { ...stored, live: false } : null;
+}
+
+/* What goes in the endpoint's env with its cached model: the Hugging Face
+ * token, when the model is your own copy (likely private) and one is
+ * registered. The original is public and gets nothing. */
+export function cacheEnv(spec, hfToken) {
+  const s = resolveSpec(spec);
+  return s.ownRepo && hfToken ? { HF_TOKEN: hfToken } : {};
+}
 
 /* The R2 copy's credentials, as RunPod secrets the template refers to — so
  * they are never in the template, the app or the repository. RunPod fills
@@ -326,7 +347,37 @@ const ENDPOINT_FIELDS =
  * hosts. Pass an empty list to detach.
  * @returns {Promise<string[]>} the references the endpoint now has
  */
-export async function attachModel(apiKey, endpointId, refs) {
+export async function attachModel(apiKey, endpointId, refs, { env: extraEnv = {} } = {}) {
+  const secrets = Object.values(extraEnv).filter(Boolean);
+  try {
+    return await attach(apiKey, endpointId, refs, extraEnv);
+  } catch (e) {
+    // GraphQL echoes a rejected input's values back in its errors; a token
+    // must not reach the screen or D1 that way.
+    throw new Error(redact(e.message, secrets));
+  }
+}
+
+/** Replaces each of `secrets` in text with ***. */
+export function redact(text, secrets = []) {
+  let out = String(text ?? '');
+  for (const s of secrets) if (s && s.length >= 4) out = out.split(s).join('***');
+  return out;
+}
+
+/* The endpoint's own env, as the console sets it (HF_TOKEN, MODEL_NAME) — an
+ * override on top of the template's. REST returns it; saveEndpoint, a full
+ * replace, has to be sent it back or it is lost. Null when it cannot be read. */
+async function endpointEnv(apiKey, endpointId) {
+  const ep = await call(apiKey, '/endpoints/' + endpointId).catch(() => null);
+  // Absent is unknown, not empty (the schema's default is {}): sending an
+  // empty list on a guess could wipe what the console set.
+  if (!ep || typeof ep !== 'object' || ep.env === undefined || ep.env === null) return null;
+  if (Array.isArray(ep.env)) return Object.fromEntries(ep.env.map((v) => [v.key, v.value]));
+  return typeof ep.env === 'object' ? { ...ep.env } : null;
+}
+
+async function attach(apiKey, endpointId, refs, extraEnv) {
   const read = await graphql(
     apiKey,
     'query EndpointConfig($id: String!) { myself { endpoint(id: $id) { ' + ENDPOINT_FIELDS + ' } } }',
@@ -336,6 +387,16 @@ export async function attachModel(apiKey, endpointId, refs) {
   if (!e) throw new Error('エンドポイント ' + endpointId + ' が見つかりません');
   // An empty gpuIds would be written back as "no GPU" — refuse rather than guess.
   if (!e.gpuIds && !(e.instanceIds || []).length) throw new Error('gpuIds が読めないため、設定を上書きしません');
+
+  /* RunPod validates a private repository with the token in the endpoint's
+   * env, as a real value: a {{ RUNPOD_SECRET_… }} reference is not expanded
+   * at that point (seen in production: "Unable to access model … For private
+   * models …" until the console put the token there). So it goes there,
+   * alongside whatever the endpoint already has. */
+  const adding = Object.keys(extraEnv).length > 0;
+  const current = await endpointEnv(apiKey, endpointId);
+  if (adding && current === null) throw new Error('エンドポイントの環境変数が読めないため、上書きしません（既存の設定を消さないため）');
+  const env = current === null ? null : { ...current, ...extraEnv };
 
   const input = {
     id: endpointId,
@@ -358,6 +419,9 @@ export async function attachModel(apiKey, endpointId, refs) {
     flashBootType: e.flashBootType || 'OFF',
     modelReferences: refs,
   };
+  // EndpointInput.env is [{key, value}] (RunPod's own generated clients).
+  // Sent whenever it could be read, so the full replace keeps it.
+  if (env) input.env = Object.entries(env).map(([key, value]) => ({ key, value: String(value) }));
   const saved = await graphql(
     apiKey,
     'mutation SaveEndpoint($input: EndpointInput!) { saveEndpoint(input: $input) { id modelReferences } }',
@@ -439,11 +503,11 @@ function llamacppTemplate(s) {
     LAZY_MODE: s.lazyMode || '',
     SERVED_MODEL_NAME: 'breakthrough',
   };
-  if (s.ownRepo) {
-    env.OWN_MODEL_REPO = s.ownRepo;
-    // A private repository needs a token; RunPod fills it in from the secret.
-    env.HF_TOKEN = '{{ RUNPOD_SECRET_' + HF_TOKEN_SECRET + ' }}';
-  }
+  /* A private copy is read with HF_TOKEN, which is not put here: RunPod's
+   * check of a cached model reads the endpoint's env, not the template's,
+   * and does not expand secret references. It goes on the endpoint, with
+   * the cache (attachModel), and the worker inherits it from there. */
+  if (s.ownRepo) env.OWN_MODEL_REPO = s.ownRepo;
   if (s.hfToken) env.HF_TOKEN = s.hfToken;
   if (s.useR2) {
     env.R2_BUCKET = s.r2Bucket;
@@ -493,7 +557,7 @@ export function endpointBody(templateId, spec = {}) {
  *
  * @returns {Promise<{endpointId: string, templateId: string, base: string, model: string, modelCache: object|null}>}
  */
-export async function provision(apiKey, spec = {}) {
+export async function provision(apiKey, spec = {}, { hfToken = null } = {}) {
   const s = resolveSpec(spec);
   const template = await call(apiKey, '/templates', { method: 'POST', body: templateBody(s) });
   const templateId = template?.id;
@@ -513,7 +577,7 @@ export async function provision(apiKey, spec = {}) {
   let modelCache = null;
   if (s.engine === 'llamacpp' && s.cacheModel) {
     const ref = modelReference(s);
-    modelCache = await attachModel(apiKey, endpointId, [ref])
+    modelCache = await attachModel(apiKey, endpointId, [ref], { env: cacheEnv(s, hfToken) })
       .then((refs) => modelCacheResult(refs, ref))
       .catch((e) => ({ ok: false, error: e.message, value: ref }));
   }
@@ -797,11 +861,19 @@ export async function probeJob(apiKey, endpointId, { onProgress, timeoutMs = 900
  * unhealthy worker count and, usually, a detail string in the raw body. Both
  * are collected here rather than guessed at.
  */
+/** An env for display: anything that may be a credential, shown only as set. */
+export function maskEnv(env) {
+  const entries = Array.isArray(env) ? env.map((v) => [v.key, v.value]) : Object.entries(env || {});
+  return Object.fromEntries(entries.map(([k, v]) => [k, /TOKEN|KEY|SECRET|PASSWORD/i.test(k) ? '（設定あり）' : v]));
+}
+
 export async function diagnose(apiKey, endpointId, spec = {}) {
   const out = { endpointId };
   const s = resolveSpec(spec);
 
   out.endpoint = await call(apiKey, '/endpoints/' + endpointId).catch((e) => ({ error: e.message }));
+  // The endpoint's env can hold a real HF_TOKEN now; this goes to the browser.
+  if (out.endpoint?.env && typeof out.endpoint.env === 'object') out.endpoint = { ...out.endpoint, env: maskEnv(out.endpoint.env) };
   if (out.endpoint?.templateId) {
     const t = await call(apiKey, '/templates/' + out.endpoint.templateId).catch((e) => ({ error: e.message }));
     out.template = t?.error
@@ -809,9 +881,7 @@ export async function diagnose(apiKey, endpointId, spec = {}) {
       : {
           imageName: t?.imageName,
           // A token would be a secret; the rest is configuration.
-          env: Object.fromEntries(
-            Object.entries(t?.env || {}).map(([k, v]) => [k, /TOKEN|KEY/i.test(k) ? '（設定あり）' : v])
-          ),
+          env: maskEnv(t?.env || {}),
         };
     if (out.template.env) {
       const expected = templateBody(s);
