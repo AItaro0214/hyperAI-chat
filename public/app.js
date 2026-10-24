@@ -2203,6 +2203,23 @@ async function renderEventsTab(body) {
 
 let btTimer = null;
 
+/* The app's own copy of the model in R2, for when Hugging Face stops serving
+ * it. Off until the RunPod secrets exist: a template naming a secret that is
+ * not there may fail to start. */
+function r2Note(bt) {
+  if (!bt.r2) return '';
+  const r2 = bt.r2;
+  return (
+    '<div style="margin-top:12px">' +
+    '<label class="row" style="gap:6px"><input type="checkbox" id="bt-r2"' + (r2.enabled ? ' checked' : '') + '>' +
+    '<span class="sm">Hugging Face から消えたら R2 の控えから起動する</span></label>' +
+    '<p class="xs muted">控えの場所: <code>r2://' + esc(r2.bucket) + '/' + esc(r2.prefix) + '/</code>（GitHub Actions の「mirror model to R2」で作成）。' +
+    '有効にする前に、RunPod の Settings → Secrets に次の 3 つを作ってください: ' +
+    r2.secrets.map((s) => '<code>' + esc(s) + '</code>').join('・') +
+    '。設定は次にエンドポイントを作るときから効きます。</p></div>'
+  );
+}
+
 /* Whether RunPod is caching the model, and if not, what to put in the
  * console's Model field to make it. */
 function modelCacheNote(bt) {
@@ -2321,6 +2338,7 @@ async function renderBreakthroughTab(body) {
         '</div>' +
         '<p class="xs muted">RunPod の API キーは「キー」タブで <code>RUNPOD_API_KEY</code> として登録してください。</p>' +
         '<button class="btn primary" id="bt-create" style="margin-top:12px">エンドポイントを作成して起動</button>') +
+    r2Note(bt) +
     '<p class="xs" id="bt-msg"></p></div>' +
     '<div class="card"><h3>ウェブ検索</h3>' +
     '<p class="sm muted">自前モデルには内蔵検索がないので、ここで選んだ方式を使います。' +
@@ -2447,6 +2465,16 @@ async function renderBreakthroughTab(body) {
       msg(err.message, 'warn');
       e.target.disabled = false;
     }
+  });
+
+  $('#bt-r2')?.addEventListener('change', async (e) => {
+    await api('/api/admin/settings', { method: 'POST', body: JSON.stringify({ runpodUseR2: e.target.checked }) });
+    msg(
+      e.target.checked
+        ? 'R2 の控えを使います。次にエンドポイントを作るときから有効です（今のエンドポイントは作り直すまで変わりません）'
+        : 'R2 の控えを使わない設定にしました（次に作るエンドポイントから）',
+      'ok'
+    );
   });
 
   $('#bt-on')?.addEventListener('change', async (e) => {

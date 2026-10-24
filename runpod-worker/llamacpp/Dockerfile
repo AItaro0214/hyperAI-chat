@@ -12,11 +12,11 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends python3 python3-venv ca-certificates \
  && rm -rf /var/lib/apt/lists/* \
  && python3 -m venv /opt/venv \
- && /opt/venv/bin/pip install --no-cache-dir "runpod>=1.7,<2" "huggingface_hub>=0.30" "httpx>=0.27"
+ && /opt/venv/bin/pip install --no-cache-dir "runpod>=1.7,<2" "huggingface_hub>=0.30" "httpx>=0.27" "boto3>=1.36"
 
 # Bumped with every change to handler.py. The image tag is <build>-<this>, so
 # RunPod's hosts cannot keep running an older handler under an unchanged tag.
-ENV WORKER_VERSION=4 \
+ENV WORKER_VERSION=5 \
     LLAMA_SERVER=/app/llama-server \
     PYTHONUNBUFFERED=1
 

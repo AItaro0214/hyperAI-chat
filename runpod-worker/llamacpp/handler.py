@@ -7,18 +7,26 @@ llama-server, so nothing in the app has to know which engine is behind it.
 
 Configuration comes from the template's environment (see src/lib/runpod.js):
   MODEL_REPO, MODEL_FILE                   what to load
+  MODEL_REVISION                           the commit to load it at
   MODEL_CACHE                              "on": look in RunPod's model cache first
   MODEL_INCLUDE                            what to download when it is not there
+  R2_ENDPOINT, R2_ACCESS_KEY_ID,           the app's own copy in Cloudflare R2, for
+  R2_SECRET_ACCESS_KEY, R2_BUCKET,         when Hugging Face no longer serves the files
+  R2_PREFIX                                (scripts/mirror_model.py made it)
   CTX_SIZE, PARALLEL, LAZY_MODE            the llama-server flags that vary
   SERVED_MODEL_NAME                        the name the app sends as `model`
   HF_TOKEN                                 only for gated repositories
+
+The weights come from, in order: RunPod's model cache, Hugging Face, R2.
 """
 
 import collections
 import glob
+import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import threading
 import time
@@ -86,8 +94,10 @@ def from_cache():
     absent or still filling, and either way it cannot be used yet."""
     repo = "models--" + env("MODEL_REPO").replace("/", "--")
     snapshots = glob.glob(os.path.join(HF_CACHE, repo, "snapshots", "*"))
-    # Newest first, in case an older revision is still around.
-    for snap in sorted(snapshots, key=os.path.getmtime, reverse=True):
+    # The pinned commit first; then newest first, in case another is around.
+    pinned = env("MODEL_REVISION")
+    ordered = sorted(snapshots, key=lambda s: (os.path.basename(s) != pinned, -os.path.getmtime(s)))
+    for snap in ordered:
         first = os.path.join(snap, env("MODEL_FILE"))
         if all(os.path.isfile(p) for p in shards(first)):
             return first
@@ -108,6 +118,8 @@ def download():
     started = time.time()
     root = snapshot_download(
         repo_id=env("MODEL_REPO"),
+        # Pinned, so a download gets exactly what the R2 copy holds.
+        revision=env("MODEL_REVISION") or None,
         allow_patterns=[env("MODEL_INCLUDE")],
         local_dir=MODELS,
         token=env("HF_TOKEN") or None,
@@ -117,9 +129,81 @@ def download():
     return os.path.join(root, env("MODEL_FILE"))
 
 
+def r2_settings():
+    """The R2 copy's settings, or None if they are not all there. A RunPod
+    secret that was referenced but never created arrives as its literal
+    "{{ RUNPOD_SECRET_… }}" placeholder, which counts as missing."""
+    names = ["R2_ENDPOINT", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY", "R2_BUCKET", "R2_PREFIX"]
+    values = {n: env(n).strip() for n in names}
+    if any(not v or v.startswith("{{") for v in values.values()):
+        return None
+    return values
+
+
+def r2_client(cfg):
+    import boto3
+    from botocore.config import Config
+
+    return boto3.client(
+        "s3",
+        endpoint_url=cfg["R2_ENDPOINT"],
+        aws_access_key_id=cfg["R2_ACCESS_KEY_ID"],
+        aws_secret_access_key=cfg["R2_SECRET_ACCESS_KEY"],
+        region_name="auto",
+        # R2 does not take the CRC checksums newer boto3 sends by default.
+        config=Config(
+            retries={"max_attempts": 10, "mode": "standard"},
+            request_checksum_calculation="when_required",
+            response_checksum_validation="when_required",
+        ),
+    )
+
+
+def from_r2(cfg):
+    """This quant's files from the R2 copy, onto container disk where a
+    Hugging Face download would have put them.
+
+    The copy was checked against Hugging Face's sha256 when it was made; here
+    each file's size is checked against the manifest, and its hash too when
+    R2_VERIFY=1 (minutes for 78 GiB, so off by default)."""
+    from boto3.s3.transfer import TransferConfig
+
+    started = time.time()
+    s3 = r2_client(cfg)
+    bucket, prefix = cfg["R2_BUCKET"], cfg["R2_PREFIX"].strip("/")
+    manifest = json.loads(s3.get_object(Bucket=bucket, Key=f"{prefix}/manifest.json")["Body"].read())
+    folder = env("MODEL_INCLUDE").split("/")[0]
+    files = [f for f in manifest.get("files", []) if f["path"].startswith(folder + "/")]
+    if not files:
+        raise RuntimeError(f"R2 の控えに {folder} がありません（{bucket}/{prefix}）")
+
+    # Whatever a failed Hugging Face download left behind, out of the way.
+    shutil.rmtree(os.path.join(MODELS, ".cache"), ignore_errors=True)
+    transfer = TransferConfig(multipart_chunksize=64 * 1024 * 1024, max_concurrency=16)
+    for f in files:
+        dest = os.path.join(MODELS, f["path"])
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        print(f"[worker] R2: {f['path']} ({f['size'] / 1e9:.1f} GB)", flush=True)
+        s3.download_file(bucket, f"{prefix}/{f['path']}", dest, Config=transfer)
+        size = os.path.getsize(dest)
+        if size != f["size"]:
+            raise RuntimeError(f"R2 から取った {f['path']} の大きさが違います（{size} / {f['size']}）")
+        if env("R2_VERIFY") == "1":
+            digest = hashlib.sha256()
+            with open(dest, "rb") as fh:
+                for chunk in iter(lambda: fh.read(16 * 1024 * 1024), b""):
+                    digest.update(chunk)
+            if digest.hexdigest() != f["sha256"]:
+                raise RuntimeError(f"R2 から取った {f['path']} の sha256 が違います")
+    INFO["seconds"]["download"] = round(time.time() - started)
+    print(f"[worker] R2 copy downloaded in {INFO['seconds']['download']}s", flush=True)
+    return os.path.join(MODELS, env("MODEL_FILE"))
+
+
 def locate():
-    """RunPod's cache when it has the files; otherwise only this quant, fetched
-    onto container disk — slower, but it still starts."""
+    """RunPod's cache when it has the files; otherwise only this quant, from
+    Hugging Face; and if Hugging Face no longer has it — deleted, made
+    private, or down — from the app's own copy in R2."""
     if env("MODEL_CACHE", "on") == "on":
         cached = from_cache()
         if cached:
@@ -127,8 +211,18 @@ def locate():
             return cached
         INFO["cacheMissing"] = True
         print("[worker] not in RunPod's model cache; downloading " + env("MODEL_INCLUDE"), flush=True)
-    INFO["source"] = "download"
-    return download()
+    try:
+        path = download()
+        INFO["source"] = "download"
+        return path
+    except Exception as e:  # noqa: BLE001 — 404, 401, a network failure: all mean "try the copy"
+        INFO["hfError"] = f"{type(e).__name__}: {str(e)[:300]}"
+        print("[worker] Hugging Face failed: " + INFO["hfError"], flush=True)
+        cfg = r2_settings()
+        if not cfg:
+            raise RuntimeError("Hugging Face から取れず、R2 の控えも設定されていません: " + INFO["hfError"]) from e
+    INFO["source"] = "r2"
+    return from_r2(cfg)
 
 
 def command(model_path):

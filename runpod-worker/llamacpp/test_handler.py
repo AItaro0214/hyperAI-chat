@@ -170,5 +170,141 @@ with tempfile.TemporaryDirectory() as root:
     handler.locate, handler.command, handler.LLAMA_SERVER = saved
     handler.PROC = None
 
+# ----------------------------- the R2 copy ---------------------------------
+# Hugging Face gone (deleted, private, down): the worker starts from the app's
+# own copy in R2. boto3 is stubbed; the fake bucket holds the two shards and
+# the manifest mirror_model.py writes.
+import hashlib  # noqa: E402
+import io  # noqa: E402
+import time  # noqa: E402
+
+SHARD1 = b"first shard " * 50
+SHARD2 = b"second shard " * 30
+PREFIX = REPO + "/eec4e10a2c29b440a2ae85591fa11569ce752963"
+FILE2 = FILE.replace("00001-of", "00002-of")
+
+
+class FakeS3:
+    def __init__(self, objects):
+        self.objects, self.downloads = objects, []
+
+    def get_object(self, Bucket, Key):
+        return {"Body": io.BytesIO(self.objects[Key])}
+
+    def download_file(self, bucket, key, dest, Config=None):
+        self.downloads.append(key)
+        with open(dest, "wb") as fh:
+            fh.write(self.objects[key])
+
+
+def bucket(manifest_overrides=None, shard2=SHARD2):
+    files = [
+        {"path": FILE, "size": len(SHARD1), "sha256": hashlib.sha256(SHARD1).hexdigest()},
+        {"path": FILE2, "size": len(SHARD2), "sha256": hashlib.sha256(SHARD2).hexdigest()},
+    ]
+    for f in files:
+        f.update((manifest_overrides or {}).get(f["path"], {}))
+    return FakeS3({
+        PREFIX + "/manifest.json": json.dumps({"files": files}).encode(),
+        PREFIX + "/" + FILE: SHARD1,
+        PREFIX + "/" + FILE2: shard2,
+    })
+
+
+boto3 = types.ModuleType("boto3")
+boto3.s3 = types.ModuleType("boto3.s3")
+boto3.s3.transfer = types.ModuleType("boto3.s3.transfer")
+boto3.s3.transfer.TransferConfig = lambda **kw: kw
+botocore = types.ModuleType("botocore")
+botocore.config = types.ModuleType("botocore.config")
+botocore.config.Config = lambda **kw: kw
+sys.modules.update({
+    "boto3": boto3, "boto3.s3": boto3.s3, "boto3.s3.transfer": boto3.s3.transfer,
+    "botocore": botocore, "botocore.config": botocore.config,
+})
+CURRENT = {"s3": None}
+boto3.client = lambda *a, **kw: CURRENT["s3"]
+
+
+def hf_gone(**kw):
+    raise RuntimeError("404 Client Error: Repository Not Found")
+
+
+R2_ENV = {
+    "R2_ENDPOINT": "https://acct.r2.cloudflarestorage.com",
+    "R2_ACCESS_KEY_ID": "id",
+    "R2_SECRET_ACCESS_KEY": "secret",
+    "R2_BUCKET": "hyperai-models",
+    "R2_PREFIX": PREFIX,
+}
+
+with tempfile.TemporaryDirectory() as root:
+    handler.HF_CACHE = os.path.join(root, "hub")  # empty: no RunPod cache
+    handler.MODELS = os.path.join(root, "models")
+    saved_download = handler.snapshot_download
+    handler.snapshot_download = hf_gone
+    os.environ.update(R2_ENV)
+    os.environ.pop("R2_VERIFY", None)
+
+    CURRENT["s3"] = bucket()
+    handler.INFO.update(source=None)
+    handler.INFO.pop("hfError", None)
+    path = handler.locate()
+    check("HF が消えたら R2 の控えから取る", handler.INFO["source"] == "r2" and path == os.path.join(handler.MODELS, FILE), handler.INFO["source"])
+    check("  2 本とも、HF と同じ場所に置く", open(os.path.join(handler.MODELS, FILE2), "rb").read() == SHARD2)
+    check("  HF の失敗の理由を残す", "404" in handler.INFO.get("hfError", ""), handler.INFO.get("hfError"))
+
+    # A size that does not match the manifest is not started on.
+    CURRENT["s3"] = bucket(shard2=SHARD2[:-5])
+    try:
+        handler.locate()
+        err = ""
+    except RuntimeError as e:
+        err = str(e)
+    check("  大きさが違えば起動しない", "大きさ" in err, err)
+
+    # With R2_VERIFY=1, the hash too.
+    os.environ["R2_VERIFY"] = "1"
+    CURRENT["s3"] = bucket({FILE2: {"sha256": "0" * 64}})
+    try:
+        handler.locate()
+        err = ""
+    except RuntimeError as e:
+        err = str(e)
+    check("  R2_VERIFY=1 なら sha256 も照合する", "sha256" in err, err)
+    CURRENT["s3"] = bucket()
+    check("  正しければ通る", handler.locate() == os.path.join(handler.MODELS, FILE))
+    os.environ.pop("R2_VERIFY", None)
+
+    # A RunPod secret referenced but never created arrives as its placeholder.
+    os.environ["R2_SECRET_ACCESS_KEY"] = "{{ RUNPOD_SECRET_hyperai_r2_secret_access_key }}"
+    check("未作成の RunPod secret は設定なしとみなす", handler.r2_settings() is None)
+    try:
+        handler.locate()
+        err = ""
+    except RuntimeError as e:
+        err = str(e)
+    check("  HF も R2 も無ければ、両方の理由で失敗する", "R2" in err and "404" in err, err)
+
+    # Hugging Face still there: R2 is not touched.
+    os.environ.update(R2_ENV)
+    handler.snapshot_download = saved_download
+    CURRENT["s3"] = bucket()
+    handler.INFO.update(source=None)
+    handler.locate()
+    check("HF が使えるうちは R2 を使わない", handler.INFO["source"] == "download" and CURRENT["s3"].downloads == [])
+
+    # RunPod's cache: the pinned commit is preferred over a newer snapshot.
+    os.environ["MODEL_REVISION"] = "eec4e10a2c29b440a2ae85591fa11569ce752963"
+    snaps = os.path.join(handler.HF_CACHE, "models--SC117--Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF", "snapshots")
+    for rev in ("eec4e10a2c29b440a2ae85591fa11569ce752963", "ffff000000000000000000000000000000000000"):
+        touch(os.path.join(snaps, rev, FILE))
+        touch(os.path.join(snaps, rev, FILE2))
+        time.sleep(0.01)
+    check("キャッシュ: 固定したコミットを優先する", "eec4e10a" in (handler.from_cache() or ""), handler.from_cache())
+    for k in R2_ENV:
+        os.environ.pop(k, None)
+    os.environ.pop("MODEL_REVISION", None)
+
 print(f"\n{sum(results)}/{len(results)} passed")
 sys.exit(0 if all(results) else 1)

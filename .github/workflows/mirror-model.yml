@@ -1,0 +1,82 @@
+# Copies the breakthrough model's files from Hugging Face into R2, so the
+# worker can still start if the upload is deleted or made private (the worker
+# falls back to this copy; see runpod-worker/llamacpp/handler.py).
+#
+# Run by hand only: it moves ~84 GB. Nothing is written to the runner's disk;
+# each file streams from Hugging Face into an R2 multipart upload, is checked
+# against the sha256 Hugging Face records for it, and is read back from R2 and
+# checked again. Rerunning skips files already verified.
+#
+# Needs repository secrets R2_ACCOUNT_ID, R2_ACCESS_KEY_ID and
+# R2_SECRET_ACCESS_KEY (an R2 token with read and write on the bucket).
+name: mirror model to R2
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: Hugging Face repository
+        default: SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF
+      revision:
+        description: Commit sha (40 characters, not a branch)
+        default: eec4e10a2c29b440a2ae85591fa11569ce752963
+      folder:
+        description: Quant folder
+        default: IQ3_S
+      bucket:
+        description: R2 bucket
+        default: hyperai-models
+      dry_run:
+        description: List the files and check access only
+        type: boolean
+        default: true
+      verify:
+        description: Read each file back from R2 and hash it again (free egress; doubles the time)
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mirror-model
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    # Two passes over 84 GB; GitHub's own ceiling is six hours.
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Test the copier
+        run: python -I scripts/test_mirror_model.py
+
+      - name: Install
+        run: pip install "boto3>=1.36" "requests>=2.31"
+
+      - name: Copy
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          REPO: ${{ inputs.repo }}
+          REVISION: ${{ inputs.revision }}
+          FOLDER: ${{ inputs.folder }}
+          BUCKET: ${{ inputs.bucket }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          VERIFY: ${{ inputs.verify }}
+        run: |
+          set -euo pipefail
+          for v in R2_ACCOUNT_ID R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY; do
+            if [ -z "${!v}" ]; then echo "::error::secret $v is not set"; exit 1; fi
+          done
+          args=(--repo "$REPO" --revision "$REVISION" --folder "$FOLDER" --bucket "$BUCKET")
+          if [ "$DRY_RUN" = "true" ]; then args+=(--dry-run); fi
+          if [ "$VERIFY" != "true" ]; then args+=(--no-verify); fi
+          python scripts/mirror_model.py "${args[@]}"

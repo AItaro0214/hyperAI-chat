@@ -90,6 +90,9 @@ export const DEFAULT_SETTINGS = {
   runpodModel: '',
   // The endpoint's MAX_MODEL_LEN; context trimming reads it.
   runpodMaxLen: 0,
+  /* New endpoints may fall back to the R2 copy of the model. Off until the
+   * RunPod secrets it reads have been created (R2_SECRETS in runpod.js). */
+  runpodUseR2: false,
   // A self-hosted model has no built-in search; xAI runs it as a tool instead.
   breakthroughSearch: true,
   // Raw results, not another model's summary — see search.js.

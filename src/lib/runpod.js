@@ -42,7 +42,7 @@ export const VLLM_IMAGE = 'runpod/worker-v1-vllm:v2.27.1';
  * .github/workflows/llamacpp-worker.yml. The tag is the llama.cpp build it is
  * based on and the handler's WORKER_VERSION, pinned for the same reason as the
  * vLLM one; the workflow refuses to build if this does not match. */
-export const LLAMACPP_IMAGE = 'ghcr.io/aitaro0214/hyperai-llamacpp-worker:b11804-4';
+export const LLAMACPP_IMAGE = 'ghcr.io/aitaro0214/hyperai-llamacpp-worker:b11804-5';
 
 /* The previous model, on vLLM. Kept whole so going back is passing this as the
  * spec rather than reconstructing it from git. */
@@ -115,8 +115,16 @@ export const LLAMACPP_SPEC = {
   engine: 'llamacpp',
   model: 'SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF',
   quantization: 'IQ3_S',
+  /* The commit in use, pinned: RunPod's cache resolved ":main" to it, and the
+   * R2 copy is of it. A later push to the repository changes nothing here. */
+  revision: 'eec4e10a2c29b440a2ae85591fa11569ce752963',
   // The first shard; llama.cpp finds the second beside it.
   modelFile: 'IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_S-00001-of-00002.gguf',
+  /* The app's own copy, for when Hugging Face no longer serves the files
+   * (scripts/mirror_model.py makes it; the worker falls back to it). Off
+   * until the RunPod secrets it reads exist — see R2_SECRETS. */
+  useR2: false,
+  r2Bucket: 'hyperai-models',
   /* A100 first, H100 when no A100 is free; 48GB cards cannot hold IQ3_S. The
    * H100 NVL (94GB) is left out to keep the choice to the two 80GB parts. */
   gpu: ['NVIDIA A100 80GB PCIe', 'NVIDIA A100-SXM4-80GB', 'NVIDIA H100 80GB HBM3', 'NVIDIA H100 PCIe'],
@@ -195,8 +203,29 @@ export function vramEstimate({ ctx, seqs = 2, kv = 'f16' } = {}) {
 /* What each quant's two shards add up to, in GB as RunPod sizes disks. */
 const QUANT_DISK_GB = { Q2_0: 67, IQ2_XS: 69, IQ3_XXS: 77, IQ3_S: 84 };
 
-/** The value RunPod's console takes in an endpoint's Model field. */
-export const modelReference = (spec = {}) => 'https://huggingface.co/' + resolveSpec(spec).model + ':main';
+/** The value RunPod's console takes in an endpoint's Model field: pinned to
+ * the commit in use, as the download and the R2 copy are. */
+export const modelReference = (spec = {}) => {
+  const s = resolveSpec(spec);
+  return 'https://huggingface.co/' + s.model + ':' + (s.revision || 'main');
+};
+
+/* The R2 copy's credentials, as RunPod secrets the template refers to — so
+ * they are never in the template, the app or the repository. RunPod fills
+ * {{ RUNPOD_SECRET_<name> }} in when a worker starts. A template referring to
+ * a secret that does not exist may not start, which is why useR2 is opt-in.
+ * The token needs only read access to the bucket. */
+export const R2_SECRETS = {
+  R2_ENDPOINT: 'hyperai_r2_endpoint',
+  R2_ACCESS_KEY_ID: 'hyperai_r2_access_key_id',
+  R2_SECRET_ACCESS_KEY: 'hyperai_r2_secret_access_key',
+};
+
+/** Where the copy of a spec's files is kept in R2. */
+export const r2Prefix = (spec = {}) => {
+  const s = resolveSpec(spec);
+  return s.model + '/' + s.revision;
+};
 
 /* "https://huggingface.co/<org>/<model>:<revision>" without the revision. */
 const refRepo = (ref) => String(ref || '').replace(/:[^:/]*$/, '').toLowerCase();
@@ -388,6 +417,7 @@ function llamacppTemplate(s) {
   const env = {
     MODEL_REPO: s.model,
     MODEL_FILE: s.modelFile,
+    MODEL_REVISION: s.revision || '',
     // Looked for under /runpod-volume/huggingface-cache first; off skips it.
     MODEL_CACHE: s.cacheModel ? 'on' : 'off',
     // For the fallback: both shards of the chosen quant, not the 281 GiB repo.
@@ -398,6 +428,11 @@ function llamacppTemplate(s) {
     SERVED_MODEL_NAME: 'breakthrough',
   };
   if (s.hfToken) env.HF_TOKEN = s.hfToken;
+  if (s.useR2) {
+    env.R2_BUCKET = s.r2Bucket;
+    env.R2_PREFIX = r2Prefix(s);
+    for (const [name, secret] of Object.entries(R2_SECRETS)) env[name] = '{{ RUNPOD_SECRET_' + secret + ' }}';
+  }
 
   return {
     name: 'hyperai-breakthrough-' + Date.now().toString(36),
@@ -673,13 +708,13 @@ export function describeStartup(worker, turnStarted) {
   const readyAt = Number(worker.readyAt);
   // A worker that never said when it was ready cannot be placed either way.
   if (!(readyAt > 0) || !(Number(turnStarted) > 0)) return null;
-  const source = worker.source === 'cache' || worker.source === 'download' ? worker.source : null;
+  const source = ['cache', 'download', 'r2'].includes(worker.source) ? worker.source : null;
   const seconds = Number.isFinite(Number(worker.startupSeconds)) && worker.startupSeconds !== null ? Number(worker.startupSeconds) : null;
 
   if (readyAt < Number(turnStarted) - STARTUP_SKEW_SEC) {
     return { cold: false, source, seconds, label: '起動済みのワーカー' };
   }
-  const how = source === 'cache' ? '事前保存から起動' : source === 'download' ? 'ダウンロードして起動' : '起動';
+  const how = { cache: '事前保存から起動', download: 'ダウンロードして起動', r2: 'R2 の控えから起動' }[source] || '起動';
   return { cold: true, source, seconds, label: how + (seconds !== null ? '（' + fmtDuration(seconds) + '）' : '') };
 }
 

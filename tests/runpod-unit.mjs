@@ -48,7 +48,8 @@ check('  A100 80GB を先に、H100 80GB を次に', /^NVIDIA A100/.test(DEFAULT
   DEFAULT_SPEC.gpu.findIndex((g) => /H100/.test(g)) > DEFAULT_SPEC.gpu.findLastIndex((g) => /A100/.test(g)), DEFAULT_SPEC.gpu.join(', '));
 check('  80GB 以外を含めない', DEFAULT_SPEC.gpu.every((g) => /A100.*80GB|H100 (80GB|PCIe)/.test(g)), DEFAULT_SPEC.gpu.join(', '));
 check('  RunPod のキャッシュを使う', DEFAULT_SPEC.cacheModel === true);
-check('  Model 欄に入れる値', modelReference() === 'https://huggingface.co/SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF:main', modelReference());
+check('  Model 欄に入れる値（使っているコミットに固定）',
+  modelReference() === 'https://huggingface.co/SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF:eec4e10a2c29b440a2ae85591fa11569ce752963', modelReference());
 check('イメージは固定タグ', /:v\d+\.\d+/.test(VLLM_IMAGE) && !/latest/.test(VLLM_IMAGE), VLLM_IMAGE);
 check('  llama.cpp はビルド番号とワーカー版で固定', /:b\d+-\d+$/.test(LLAMACPP_IMAGE), LLAMACPP_IMAGE);
 // The workflow builds what the Dockerfile says; the app must name the same tag.
@@ -62,6 +63,16 @@ check('部分指定は同じエンジンの既定で補う', resolveSpec({ engin
 /* ------------------------- template: llama.cpp --------------------------- */
 const l = templateBody();
 check('llama.cpp ワーカーを使う', l.imageName === LLAMACPP_IMAGE);
+check('  コミットを固定して渡す', l.env.MODEL_REVISION === 'eec4e10a2c29b440a2ae85591fa11569ce752963');
+check('  R2 は既定では使わない（RunPod の secret が要る）', !Object.keys(l.env).some((k) => k.startsWith('R2_')));
+const withR2 = templateBody({ useR2: true });
+check('  R2 を使うときは場所を渡す', withR2.env.R2_BUCKET === 'hyperai-models' &&
+  withR2.env.R2_PREFIX === 'SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF/eec4e10a2c29b440a2ae85591fa11569ce752963', withR2.env.R2_PREFIX);
+check('  認証情報は RunPod の secret の参照だけ（値は入れない）',
+  withR2.env.R2_ACCESS_KEY_ID === '{{ RUNPOD_SECRET_hyperai_r2_access_key_id }}' &&
+  withR2.env.R2_SECRET_ACCESS_KEY === '{{ RUNPOD_SECRET_hyperai_r2_secret_access_key }}' &&
+  withR2.env.R2_ENDPOINT === '{{ RUNPOD_SECRET_hyperai_r2_endpoint }}');
+check('  R2 の起動表示', describeStartup({ source: 'r2', startupSeconds: 600, readyAt: 2000 }, 1000)?.label === 'R2 の控えから起動（10分）');
 check('  サーバーレス用として作る', l.isServerless === true);
 check('  ボリュームを付けない', l.volumeInGb === 0, 'ストレージ課金が発生しない条件');
 check('  代替のダウンロード 84GB が入るディスク', l.containerDiskInGb >= 89, l.containerDiskInGb + 'GB');
@@ -237,7 +248,7 @@ function fakeFetch(plan) {
   return calls;
 }
 const realFetch = globalThis.fetch;
-const REF = 'https://huggingface.co/SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF:main';
+const REF = 'https://huggingface.co/SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF:eec4e10a2c29b440a2ae85591fa11569ce752963';
 
 let calls = fakeFetch({
   'POST /templates': { id: 'tpl_9' },
@@ -307,7 +318,8 @@ const SHA_REF = 'https://huggingface.co/SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliter
 check('キャッシュ: SHA に解決されていても成功', matchModelRef([SHA_REF], REF) === SHA_REF);
 check('  同じ値でも成功', matchModelRef([REF], REF) === REF);
 check('  別のリポジトリは失敗', matchModelRef(['https://huggingface.co/other/model:main'], REF) === null);
-check('  名前の一部だけ一致は失敗', matchModelRef([REF.replace('GGUF:main', 'GGUF-v2:main')], REF) === null);
+check('  名前の一部だけ一致は失敗', matchModelRef([REF.replace('GGUF:', 'GGUF-v2:')], REF) === null);
+check('  :main と送って SHA が返っても成功（以前の記録）', matchModelRef([SHA_REF], REF.replace(/:[0-9a-f]+$/, ':main')) === SHA_REF);
 check('  一覧が無ければ失敗', matchModelRef(null, REF) === null && matchModelRef([], REF) === null);
 const stored = modelCacheResult([SHA_REF], REF);
 check('  解決後の値を残す（画面に出す）', stored.ok === true && stored.resolved === SHA_REF && stored.value === REF, JSON.stringify(stored));

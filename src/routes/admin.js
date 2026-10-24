@@ -54,6 +54,8 @@ import {
   attachModel,
   modelReference,
   modelCacheResult,
+  r2Prefix,
+  R2_SECRETS,
   DEFAULT_SPEC,
 } from '../lib/runpod.js';
 import { SEARCH_MODES, BACKEND_NOTES, MODE_LABELS, availableEngines } from '../lib/search.js';
@@ -330,6 +332,11 @@ admin.get('/breakthrough', async (c) => {
     image: imageFor(DEFAULT_SPEC),
     // What RunPod's console takes in the Model field, for setting it by hand.
     modelReference: DEFAULT_SPEC.cacheModel ? modelReference(DEFAULT_SPEC) : null,
+    // The R2 copy: where it is, which RunPod secrets it needs, whether new
+    // endpoints use it.
+    r2: DEFAULT_SPEC.engine === 'llamacpp'
+      ? { enabled: !!settings.runpodUseR2, bucket: DEFAULT_SPEC.r2Bucket, prefix: r2Prefix(DEFAULT_SPEC), secrets: Object.values(R2_SECRETS) }
+      : null,
     /* Re-judged from the stored references: records written before a
      * resolved ":<sha>" counted as a match still say ok:false. */
     modelCache: settings.runpodModelCache?.refs
@@ -341,14 +348,15 @@ admin.get('/breakthrough', async (c) => {
 
 admin.post('/breakthrough/provision', async (c) => {
   const body = await c.req.json().catch(() => ({}));
-  const spec = resolveSpec(body.spec || {});
+  const settings = await getSettings(c.env);
+  // The R2 fallback is a setting, applied when an endpoint is made.
+  const spec = resolveSpec({ useR2: !!settings.runpodUseR2, ...(body.spec || {}) });
   const problems = validateSpec(spec);
   if (problems.length) return c.json({ error: problems.join(' / ') }, 400);
 
   const key = await getApiKey(c.env, 'RUNPOD_API_KEY');
   if (!key) return c.json({ error: 'RUNPOD_API_KEY が未登録です' }, 400);
 
-  const settings = await getSettings(c.env);
   if (settings.runpodEndpointId) {
     return c.json({ error: '既にエンドポイントがあります（' + settings.runpodEndpointId + '）。作り直すなら先に破棄してください。' }, 409);
   }
