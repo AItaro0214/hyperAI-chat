@@ -20,7 +20,7 @@ results = []
 
 
 def check(name, ok, extra=""):
-    results.append(ok)
+    results.append(bool(ok))
     print(("PASS" if ok else "FAIL") + " - " + name + (" :: " + str(extra) if extra else ""))
 
 
