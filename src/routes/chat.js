@@ -4,18 +4,8 @@ import { now } from '../lib/auth.js';
 import { requireAuth } from '../lib/guard.js';
 import { getSettings, logUsage } from '../lib/store.js';
 import { getCatalog, findModel, estimateChatCost } from '../lib/models.js';
-import { openaiBase as runpodBase, describeStartup } from '../lib/runpod.js';
-import { runpodChatFetch, webhookUrl, queueNotice, noteAppJob } from '../lib/runpod-jobs.js';
-import {
-  webSearch as webSearch2,
-  webFetch as webFetch2,
-  formatResults,
-  availableEngines,
-  searchRecord,
-  ENGINE_STRENGTHS,
-  CHOOSE,
-} from '../lib/search.js';
-import { resolveTools, thinkingFor, chatTools, promptBudgetFor, shrinkToolResults } from '../lib/chat-tools.js';
+import { openaiBase as runpodBase } from '../lib/runpod.js';
+import { saveTurn, runTurn, PAGE_PHASE } from '../lib/breakthrough-turn.js';
 import {
   buildMessages,
   buildRequest,
@@ -345,6 +335,21 @@ chat.post('/chat', async (c) => {
     req.notices.push('コンテキスト長に収めるため、古い ' + fitted.dropped + ' 件の発言を今回の送信から除きました');
   }
 
+  /* Breakthrough turns run on their own (lib/breakthrough-turn.js), not in
+   * this request: it only starts one and relays the row it writes. */
+  if (breakthroughOn) {
+    return startBreakthrough(c, {
+      room,
+      userId,
+      roomTitle,
+      provider,
+      req,
+      settings,
+      contextTokens: modelMeta.context,
+      metaBase: { webSearch, webSearchEngine, imageMode, reasoningEffort, imageOutput },
+    });
+  }
+
   const { readable, writable } = new TransformStream();
   const writer = writable.getWriter();
   const assistantId = newId('msg');
@@ -365,27 +370,6 @@ chat.post('/chat', async (c) => {
     let phase = 'connecting';
     let lastSaved = 0;
     let savedText = '';
-    // Breakthrough only: how the worker that answered had started.
-    let startup = null;
-    // Breakthrough only: each search and page read, and what it ran on.
-    const searches = [];
-    /* Breakthrough only: the RunPod job the reply is being written by. Saved
-     * the moment it exists, so the reply can be collected without this Worker
-     * (see runpod-jobs.js); `detached` means this Worker stopped following it
-     * and the reply is still to come. */
-    let runpodJob = null;
-    let detached = false;
-    /* Breakthrough only: where the turn is — 'deciding' (search decisions)
-     * until the reply job exists. Saved, so a turn that stopped before its
-     * reply can say so instead of having a decision taken for its answer. */
-    let turnPhase = null;
-    // The search decisions' jobs: never a reply, whatever their text.
-    const decisionJobs = [];
-
-    /* The browser going away is noticed on the next write, and aborts the
-     * search decisions: a Worker gets 30 seconds after a disconnect, and the
-     * reply job has to be submitted within them (see the decision phase). */
-    const disconnect = new AbortController();
 
     // Once the browser goes away, keep draining the provider so the answer is
     // still saved to the room instead of being lost mid-flight.
@@ -395,7 +379,6 @@ chat.post('/chat', async (c) => {
         await sse(writer, event, data);
       } catch {
         clientGone = true;
-        disconnect.abort();
       }
     };
     const setPhase = async (next) => {
@@ -439,20 +422,9 @@ chat.post('/chat', async (c) => {
         reasoningEffort,
         notices: noticesOut(final),
         imageOutput,
-        // A reply this Worker stopped following is not finished, whatever it says.
-        partial: !final || detached,
+        partial: !final,
         elapsed: now() - startedAt,
       };
-      if (startup) base.startup = startup;
-      if (turnPhase && !final) base.phase = turnPhase;
-      if (decisionJobs.length) base.decisionJobs = decisionJobs.slice(0, 20);
-      if (runpodJob) {
-        base.runpodJob = {
-          ...runpodJob,
-          status: final && !detached ? (failed ? 'FAILED' : 'COMPLETED') : runpodJob.status,
-        };
-      }
-      if (searches.length) base.searches = searches.slice(0, MAX_TOOL_RECORDS * 2);
       let json = JSON.stringify({ ...base, tools });
       if (json.length > MAX_META_BYTES) {
         json = JSON.stringify({ ...base, tools: tools.slice(0, 4), toolsTruncated: tools.length });
@@ -499,177 +471,11 @@ chat.post('/chat', async (c) => {
         reasoningEffort,
         title: roomTitle,
       });
-      /* Breakthrough requests run as RunPod jobs rather than sync requests,
-       * so a long queue or a slow startup — up to two hours in all — does not
-       * drop them. The wait is shown as it goes, every ten seconds at most. */
-      let lastWaitNote = 0;
-      const onWaitStatus = (s) => {
-        if (s.output || Date.now() - lastWaitNote < 10000) return;
-        lastWaitNote = Date.now();
-        emit('meta', { notices: [queueNotice(s)] }).catch(() => {});
-      };
-      const decisionFetch = breakthroughOn
-        ? runpodChatFetch(apiKey, settings.runpodEndpointId, {
-            onStatus: onWaitStatus,
-            // Stops waiting when the browser goes; the reply goes out instead.
-            signal: disconnect.signal,
-            /* Recorded on the message and as an app job, so recovery by time
-             * can never take a decision's text — a model that answered
-             * instead of calling a tool, cut off at 700 tokens — for the
-             * reply. That is how a half-answer became one in production. */
-            onJob: async (jobId) => {
-              decisionJobs.push(jobId);
-              await noteAppJob(c.env, jobId).catch(() => {});
-            },
-          })
-        : undefined;
-      const replyFetch = breakthroughOn
-        ? runpodChatFetch(apiKey, settings.runpodEndpointId, {
-            webhook: await webhookUrl(c.env, assistantId),
-            onJob: async (jobId) => {
-              runpodJob = { id: jobId, endpointId: settings.runpodEndpointId, submittedAt: Date.now(), status: 'IN_QUEUE' };
-              turnPhase = 'replying';
-              await savePartial(false, { force: true });
-            },
-            onStatus: (s) => {
-              if (runpodJob && s.status) runpodJob.status = s.status;
-              onWaitStatus(s);
-            },
-            onDetach: () => {
-              detached = true;
-            },
-          })
-        : null;
-      const sendReply = () =>
-        replyFetch ? replyFetch(req.url, { body: JSON.stringify(req.body) }) : postJson(req.url, req.headers, req.body);
-
-      /* The model decides whether to search, rather than searching always.
-       * One non-streaming round trip with the tools offered; if it asks for
-       * none, nothing is spent and the reply streams as usual. */
-      if (breakthroughOn && webSearch) {
-        await setPhase('searching');
-        // Saved now, so a turn that stops here is known to have stopped here.
-        turnPhase = 'deciding';
-        await savePartial(false, { force: true });
-        /* A disconnect is noticed only on a write, and the decisions can sit
-         * in RunPod's queue for many minutes with nothing to write. This
-         * writes every five seconds, so it is noticed within the 30 seconds a
-         * Worker has left — enough to cancel the decision and send the reply. */
-        const heartbeat = setInterval(() => emit('ping', {}).catch(() => {}), 5000);
-        const searchMode = settings.searchBackend || 'ollama';
-        // Under CHOOSE the model is offered whichever of Brave and Exa have keys.
-        const engines = searchMode === CHOOSE ? await availableEngines(c.env).catch(() => []) : [];
-        const promptBudget = promptBudgetFor(modelMeta.context);
-        /* Whatever happens to the decisions, the reply goes out after them:
-         * a decision's own text is never the answer (resolveTools drops it),
-         * and a phase that throws or is cut short still leads to the reply. */
-        const phase = await resolveTools({
-          url: req.url,
-          headers: req.headers,
-          body: req.body,
-          tools: chatTools({ engines, strengths: ENGINE_STRENGTHS }),
-          maxRounds: Number(settings.searchRounds) || 2,
-          promptBudget,
-          fetchImpl: decisionFetch,
-          signal: disconnect.signal,
-          /* The decisions come back whole rather than streamed, and carry the
-           * worker's startup details too — and on a cold start the first of
-           * them is the request that woke it. */
-          onReply: async (json) => {
-            if (startup || !json?.hyperai_worker) return;
-            startup = describeStartup(json.hyperai_worker, startedAt);
-            if (startup) await emit('worker', startup);
-          },
-          onPhase: (kind, detail) => {
-            const text =
-              kind === 'deciding'
-                ? '検索が必要か判断しています（' + detail.round + '/' + detail.of + '）'
-                : '検索: ' + (detail?.args?.query || detail?.args?.url || '');
-            return emit('meta', { notices: [text] }).catch(() => {});
-          },
-          execute: async (name, args) => {
-            /* A failed search is reported to the reader as well as to the
-             * model. Left to the tool result alone it is invisible: the model
-             * quietly answers from memory and the reply reads as merely wrong
-             * rather than uninformed. */
-            if (name === 'web_search') {
-              try {
-                const found = await webSearch2(c.env, {
-                  query: args.query,
-                  maxResults: args.max_results || Number(settings.webSearchMaxResults) || 5,
-                  backend: searchMode,
-                  engine: args.engine,
-                });
-                searches.push(searchRecord({ kind: 'search', found, args }));
-                await emit('meta', {
-                  notices: [
-                    '検索（' + found.backend + (found.mode === CHOOSE ? '・モデルが選択' : '') + '）: ' +
-                      found.results.length + '件 — ' + String(args.query).slice(0, 60),
-                  ],
-                });
-                return formatResults(found);
-              } catch (err) {
-                searches.push(searchRecord({ kind: 'search', args, mode: searchMode, error: err.message }));
-                const why = '検索に失敗しました（' + searchMode + '）: ' + String(err.message).slice(0, 200);
-                await emit('meta', { notices: [why] });
-                return why + ' 検索結果は得られませんでした。分かる範囲で答えるか、分からないと伝えてください。';
-              }
-            }
-            if (name === 'web_fetch') {
-              try {
-                const page = await webFetch2(c.env, { url: args.url, backend: searchMode });
-                searches.push(searchRecord({ kind: 'fetch', page, args }));
-                return [page.title, page.url, '', page.content].join('\n');
-              } catch (err) {
-                searches.push(searchRecord({ kind: 'fetch', args, error: err.message }));
-                const why = 'ページを取得できませんでした: ' + String(err.message).slice(0, 200);
-                await emit('meta', { notices: [why] });
-                return why;
-              }
-            }
-            return '未知のツールです: ' + name;
-          },
-        })
-          .catch((e) => ({ messages: req.body.messages, calls: [], failed: String(e?.message || e).slice(0, 300) }))
-          .finally(() => clearInterval(heartbeat));
-        req.body.messages = phase.messages;
-        // The reply is sent with every result so far; it has to fit as well.
-        if (shrinkToolResults(req.body.messages, promptBudget)) {
-          req.notices.push('検索結果が長いため、一部を省略して回答します');
-        }
-        /* Kept in req.notices, which is saved with the reply — what happened
-         * during the search should still be readable after a reload, a
-         * failure most of all. */
-        const phaseNotes = [];
-        if (phase.calls.length) phaseNotes.push('ウェブを ' + phase.calls.length + ' 回調べました');
-        if (phase.stoppedBecause === '接続が切れた') {
-          phaseNotes.push('接続が切れたため検索を打ち切り、回答を作ります（終わると自動でここに入ります）');
-        } else if (phase.stoppedBecause) {
-          phaseNotes.push('検索を打ち切りました（' + phase.stoppedBecause + '）');
-        }
-        if (phase.failed) {
-          phaseNotes.push(
-            (phase.calls.length ? '検索の途中で' : '検索するかの判断で') +
-              'モデルがエラーを返しました（' + phase.failed + '）。ここまでの情報で回答します'
-          );
-        }
-        if (phaseNotes.length) {
-          req.notices.push(...phaseNotes);
-          await emit('meta', { notices: req.notices });
-        }
-      }
-
+      const sendReply = () => postJson(req.url, req.headers, req.body);
       await setPhase(webSearch ? 'searching' : 'connecting');
 
-      /* A cold GPU, or a queue behind one, can keep the reply waiting for a
-       * long time; the job's status is shown as it changes (onWaitStatus), so
-       * the screen never sits silent long enough to look hung. */
       let upstream = await sendReply();
-      if (!upstream.ok && detached) {
-        // Not a failure: the job carries on, and the reply arrives without us.
-        req.notices.push('応答の追跡を打ち切りました。RunPod で処理が続いており、終わると自動で入ります（開き直すと表示されます）');
-        await emit('meta', { notices: req.notices });
-      } else if (!upstream.ok) {
+      if (!upstream.ok) {
         const detail = await readProviderError(upstream);
         // Fetched web pages can blow past the window; one retry with just the
         // latest turns usually succeeds instead of failing outright.
@@ -696,9 +502,7 @@ chat.post('/chat', async (c) => {
           });
           upstream = await sendReply();
         }
-        if (!upstream.ok && detached) {
-          req.notices.push('応答の追跡を打ち切りました。RunPod で処理が続いており、終わると自動で入ります');
-        } else if (!upstream.ok) {
+        if (!upstream.ok) {
           const body = isContextError(detail) ? await readProviderError(upstream) : detail;
           if (upstream.status === 429) {
             failed = 'レート制限 (429): ' + body + rateLimitHint(provider, req.effectiveModel);
@@ -708,7 +512,7 @@ chat.post('/chat', async (c) => {
           await emit('error', { message: failed });
         }
       }
-      if (!failed && !detached && !upstream.body) {
+      if (!failed && !upstream.body) {
         failed = 'プロバイダから応答本文が返りませんでした';
         await emit('error', { message: failed });
       }
@@ -755,13 +559,6 @@ chat.post('/chat', async (c) => {
           },
           onUsage: (u) => {
             usage = { ...(usage || {}), ...u };
-          },
-          // Its own event rather than 'meta', which the page reads as the
-          // full list of notices.
-          onWorker: async (w) => {
-            if (!breakthroughOn || startup) return;
-            startup = describeStartup(w, startedAt);
-            if (startup) await emit('worker', startup);
           },
           onImages: async (imgs) => {
             await setPhase('drawing');
@@ -865,6 +662,185 @@ chat.post('/chat', async (c) => {
     },
   });
 });
+
+/* ------------------------------ breakthrough ------------------------------
+ * The turn runs as a Workflow (BREAKTHROUGH) and writes its row as it goes;
+ * this request starts it and turns that row back into the SSE the page has
+ * always read. The browser going away stops only the relaying. Without the
+ * binding the turn runs in this request's waitUntil instead, as it used to,
+ * with a Worker's 30 seconds after a disconnect. */
+async function startBreakthrough(c, { room, userId, roomTitle, provider, req, settings, contextTokens, metaBase }) {
+  const env = c.env;
+  const messageId = newId('msg');
+  const startedAt = now();
+  const turn = {
+    messageId,
+    roomId: room.id,
+    userId,
+    startedAt,
+    endpointId: settings.runpodEndpointId,
+    model: req.effectiveModel,
+    body: req.body,
+    notices: req.notices,
+    webSearch: metaBase.webSearch,
+    searchMode: settings.searchBackend || 'ollama',
+    searchRounds: Number(settings.searchRounds) || 2,
+    webSearchMaxResults: Number(settings.webSearchMaxResults) || 5,
+    contextTokens,
+    metaBase,
+    workflowId: env.BREAKTHROUGH ? messageId : null,
+  };
+  const firstMeta = {
+    ...metaBase,
+    notices: req.notices,
+    partial: true,
+    progress: { phase: 'waiting', text: '準備しています', at: Date.now() },
+    ...(turn.workflowId ? { workflow: turn.workflowId } : {}),
+  };
+  await env.DB.prepare(
+    'INSERT INTO messages (id, room_id, user_id, role, content, provider, model, attachments, annotations, meta, created_at) ' +
+      'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+  )
+    .bind(messageId, room.id, userId, 'assistant', '', provider, req.effectiveModel, '[]', '[]', JSON.stringify(firstMeta), startedAt)
+    .run();
+  await saveTurn(env, turn);
+
+  let started = false;
+  if (env.BREAKTHROUGH) {
+    try {
+      await env.BREAKTHROUGH.create({ id: messageId, params: { messageId } });
+      started = true;
+    } catch (e) {
+      console.error('breakthrough workflow create failed', e);
+      turn.workflowId = null;
+      turn.notices = [...turn.notices, 'Workflow を開始できなかったため、この接続の中で処理します（切れると止まることがあります）'];
+      await saveTurn(env, turn);
+    }
+  }
+  if (!started) c.executionCtx.waitUntil(runTurn({ env, messageId }).catch((e) => console.error('breakthrough turn failed', e)));
+
+  const { readable, writable } = new TransformStream();
+  const writer = writable.getWriter();
+  c.executionCtx.waitUntil(
+    relayTurn(env, writer, { messageId, roomId: room.id, provider, model: req.effectiveModel, notices: turn.notices, metaBase, roomTitle })
+  );
+  return new Response(readable, {
+    headers: {
+      'content-type': 'text/event-stream; charset=utf-8',
+      'cache-control': 'no-cache, no-transform',
+      connection: 'keep-alive',
+      'x-accel-buffering': 'no',
+    },
+  });
+}
+
+/* A Worker invocation may make about a thousand D1 queries; the relay stops
+ * well short of that and says so, and the page follows the row from there. */
+export const RELAY_MAX_READS = 800;
+
+/**
+ * Reads a breakthrough row until it is finished and sends what changed as SSE:
+ * new text as `delta`, reasoning as `reasoning`, the stage as `status`, its
+ * description and the notices as `meta`, the startup as `worker`.
+ */
+export async function relayTurn(env, writer, { messageId, roomId, provider, model, notices, metaBase, roomTitle, everyMs = 1000, maxReads = RELAY_MAX_READS }) {
+  let gone = false;
+  const emit = async (event, data) => {
+    if (gone) return;
+    try {
+      await sse(writer, event, data);
+    } catch {
+      gone = true;
+    }
+  };
+  await emit('meta', { roomId, messageId, provider, model, notices, ...metaBase, title: roomTitle });
+
+  let sentText = '';
+  let sentReasoning = 0;
+  let phase = null;
+  let progressText = null;
+  let progressStage = null;
+  let progressAt = 0;
+  let noticeKey = JSON.stringify(notices || []);
+  let startupSent = false;
+  let idle = 0;
+  for (let reads = 0; !gone; reads++) {
+    if (reads >= maxReads) {
+      // The turn carries on; the page reads the row itself from here.
+      await emit('done', { messageId, roomId, error: null, pending: true, notices: [] });
+      break;
+    }
+    const row = await env.DB.prepare('SELECT content, reasoning, meta, error, prompt_tokens, completion_tokens FROM messages WHERE id = ?')
+      .bind(messageId)
+      .first()
+      .catch(() => null);
+    if (!row) {
+      await sleep(everyMs * 2);
+      continue;
+    }
+    let meta = {};
+    try {
+      meta = JSON.parse(row.meta || '{}') || {};
+    } catch {
+      /* half-written: next read */
+    }
+    if (meta.startup?.label && !startupSent) {
+      startupSent = true;
+      await emit('worker', meta.startup);
+    }
+    const key = JSON.stringify(meta.notices || []);
+    if (key !== noticeKey) {
+      noticeKey = key;
+      await emit('meta', { notices: meta.notices || [] });
+    }
+    const content = String(row.content || '');
+    const reasoningText = String(row.reasoning || '');
+    let next = PAGE_PHASE[meta.progress?.phase] || phase;
+    if (reasoningText.length > sentReasoning) {
+      await emit('reasoning', { text: reasoningText.slice(sentReasoning) });
+      sentReasoning = reasoningText.length;
+      if (!content) next = 'thinking';
+    }
+    if (content.length > sentText.length) {
+      // Text the turn replaced rather than extended is left to the reload at the end.
+      if (content.startsWith(sentText)) await emit('delta', { text: content.slice(sentText.length) });
+      sentText = content;
+      next = 'writing';
+      idle = 0;
+    } else idle++;
+    if (next && next !== phase) {
+      phase = next;
+      await emit('status', { phase });
+    }
+    /* What it is doing, as the page has always shown it: a new stage at once,
+     * the waiting clock ("待機中… 3分12秒") every ten seconds at most. */
+    const stage = meta.progress?.phase;
+    if (meta.partial && meta.progress?.text && meta.progress.text !== progressText && next !== 'writing' &&
+        (stage !== progressStage || Date.now() - progressAt >= 10000)) {
+      progressText = meta.progress.text;
+      progressStage = stage;
+      progressAt = Date.now();
+      await emit('meta', { notices: [progressText] });
+    }
+    if (!meta.partial) {
+      if (row.error) await emit('error', { message: row.error });
+      await emit('meta', { notices: meta.notices || [] });
+      const usage = row.prompt_tokens || row.completion_tokens ? { prompt_tokens: row.prompt_tokens, completion_tokens: row.completion_tokens } : null;
+      await emit('usage', { usage, cost: null });
+      await emit('done', { messageId, roomId, error: row.error || null, notices: meta.notices || [] });
+      break;
+    }
+    // Quick while text is arriving, slower while it is not.
+    await sleep(idle > 3 ? everyMs * 2 : everyMs);
+  }
+  try {
+    await writer.close();
+  } catch {
+    /* client disconnected */
+  }
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /**
  * Titles are throwaway work, so pick a small current model from the live

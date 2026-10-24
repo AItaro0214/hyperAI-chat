@@ -1,6 +1,7 @@
 import {
   submitChatJob,
-  runpodChatFetch,
+  waitForJob,
+  followReply,
   itemToSse,
   queueNotice,
   webhookUrl,
@@ -12,7 +13,7 @@ import {
   JOB_EXECUTION_MS,
   JOB_TTL_MS,
 } from '../src/lib/runpod-jobs.js';
-import { consumeChatStream, buildRequest, BREAKTHROUGH_MAX_TOKENS } from '../src/lib/chat.js';
+import { buildRequest, BREAKTHROUGH_MAX_TOKENS } from '../src/lib/chat.js';
 import { errorText } from '../src/lib/chat-tools.js';
 import hook from '../src/routes/runpod-hook.js';
 
@@ -51,7 +52,7 @@ try {
 }
 check('  送れなければ理由つきで失敗', err.includes('/run 400'), err);
 
-/* ---------------------- fetch drop-in: no streaming ---------------------- */
+/* ------------------- following by id: a decision (no stream) ------------------- */
 const fakeRunPod = (plan) => {
   const calls = [];
   globalThis.fetch = async (url) => {
@@ -75,45 +76,52 @@ let calls = fakeRunPod({
   ],
 });
 const order = [];
-let res = await runpodChatFetch('k', 'ep', {
-  poll: FAST,
-  onJob: (j) => order.push('job:' + j),
-  onStatus: (s) => order.push(s.status),
-})('u', { body: JSON.stringify({ stream: false }) });
-const body = await res.json();
-check('非ストリーム: 終わったら完了の JSON を返す', res.ok && body.choices[0].message.content === '判断' && body.hyperai_worker.source === 'cache');
-check('  ジョブ ID は待つ前に渡す', order[0] === 'job:job-9', order.join(','));
+let done = await waitForJob('k', 'ep', 'job-9', { poll: FAST, onStatus: (s) => order.push(s.status) });
+check('判断: 終わったら完了の JSON を返す', done.ok && done.httpStatus === 200 && done.body.choices[0].message.content === '判断' && done.body.hyperai_worker.source === 'cache');
+check('  投げ直さず、ID で読むだけ', !calls.some((c) => c.endsWith('/run')) && calls.every((c) => c.startsWith('/status/job-9')), calls.join(' '));
 check('  待っている間の状態を知らせる', order.includes('IN_QUEUE') && order.includes('IN_PROGRESS'));
 
 calls = fakeRunPod({ status: [{ status: 'FAILED', error: '{"error":{"message":"request (34479 tokens) exceeds the available context size"}}' }] });
-res = await runpodChatFetch('k', 'ep', { poll: FAST })('u', { body: JSON.stringify({ stream: false }) });
-const failBody = await res.text();
-check('  失敗は エラーの状態コードと理由', res.status === 500 && errorText(failBody).startsWith('request (34479 tokens)'), errorText(failBody));
+done = await waitForJob('k', 'ep', 'job-9', { poll: FAST });
+check('  失敗は エラーの状態コードと理由', !done.ok && done.httpStatus === 500 && errorText(JSON.stringify(done.body)).startsWith('request (34479 tokens)'),
+  errorText(JSON.stringify(done.body)));
 
-/* ------------------------ fetch drop-in: streaming ----------------------- */
+calls = fakeRunPod({ status: [{ status: 'IN_QUEUE' }] });
+done = await waitForJob('k', 'ep', 'job-9', { poll: FAST, deadline: Date.now() + 20 });
+check('  2 時間を過ぎたらジョブを止めて失敗にする', done.httpStatus === 504 && calls.some((c) => c.startsWith('/cancel/job-9')), calls.slice(-2).join(' '));
+
+/* ------------------- following by id: the reply (streamed) ------------------- */
 const frame = (o) => 'data: ' + JSON.stringify(o) + '\n\n';
+const WORKER = frame({ choices: [], hyperai_worker: { source: 'cache', readyAt: 1 } });
+const STORED = {
+  status: 'COMPLETED',
+  output: [WORKER, frame({ choices: [{ delta: { content: 'こん' } }] }), frame({ choices: [{ delta: { content: 'にちは' } }] }),
+    frame({ choices: [], usage: { prompt_tokens: 10, completion_tokens: 3 } })],
+};
 calls = fakeRunPod({
   stream: [
     { status: 'IN_QUEUE', stream: [] },
-    { status: 'IN_PROGRESS', stream: [{ output: frame({ choices: [], hyperai_worker: { source: 'cache', readyAt: 1 } }) }, { output: frame({ choices: [{ delta: { content: 'こん' } }] }) }] },
+    { status: 'IN_PROGRESS', stream: [{ output: WORKER }, { output: frame({ choices: [{ delta: { content: 'こん' } }] }) }] },
     { status: 'IN_PROGRESS', stream: [] },
     { status: 'COMPLETED', stream: [{ output: frame({ choices: [{ delta: { content: 'にちは' } }] }) }] },
   ],
+  status: [STORED],
 });
-res = await runpodChatFetch('k', 'ep', { poll: FAST })('u', { body: JSON.stringify({ stream: true }) });
-let text = '';
-const workers = [];
-await consumeChatStream(res, { onText: (t) => (text += t), onWorker: (w) => workers.push(w.source) });
-check('ストリーム: /stream の出力を順につなぐ', text === 'こんにちは', text);
-check('  起動情報のフレームも通る', workers.join() === 'cache');
-check('  /status ではなく /stream を読む', calls.filter((c) => c.startsWith('/stream/')).length === 4, calls.join(' '));
+const seen = [];
+let reply = await followReply('k', 'ep', 'job-9', { poll: FAST, onProgress: (p) => seen.push(p.text) });
+check('返答: /stream を順につないで知らせる', seen.includes('こん') && seen.at(-1) === 'こんにちは', seen.join('|'));
+check('  終わったら本文・使用量・起動情報を返す', reply.status === 'COMPLETED' && reply.text === 'こんにちは' && reply.usage?.prompt_tokens === 10 && reply.worker?.source === 'cache',
+  JSON.stringify(reply));
+check('  投げ直さない', !calls.some((c) => c.endsWith('/run')));
 
+/* Run again after an eviction: /stream has already handed out the earlier
+ * increments, so only the end is left in it — the reply comes from /status. */
 calls = fakeRunPod({
-  stream: [{ status: 'FAILED', stream: [] }],
-  status: [{ status: 'FAILED', error: 'llama-server 500: CUDA error' }],
+  stream: [{ status: 'COMPLETED', stream: [{ output: frame({ choices: [{ delta: { content: 'にちは' } }] }) }] }],
+  status: [STORED],
 });
-res = await runpodChatFetch('k', 'ep', { poll: FAST })('u', { body: JSON.stringify({ stream: true }) });
-check('  何も書かずに失敗したら、エラーの状態コードで返す（再試行の判定が効く）', res.status === 500 && (await res.text()).includes('CUDA error'));
+reply = await followReply('k', 'ep', 'job-9', { poll: FAST });
+check('  やり直しでも全文を返す（保存された出力から）', reply.text === 'こんにちは' && reply.worker?.source === 'cache', reply.text);
 
 calls = fakeRunPod({
   stream: [
@@ -122,38 +130,14 @@ calls = fakeRunPod({
   ],
   status: [{ status: 'FAILED', error: 'worker died' }],
 });
-res = await runpodChatFetch('k', 'ep', { poll: FAST })('u', { body: JSON.stringify({ stream: true }) });
-text = '';
-let streamErr = '';
-await consumeChatStream(res, { onText: (t) => (text += t), onError: (m) => (streamErr = m) });
-check('  途中で失敗したら、書いた分と理由を返す', text === '途中' && streamErr.includes('worker died'), streamErr);
+reply = await followReply('k', 'ep', 'job-9', { poll: FAST });
+check('  途中で失敗したら、書いた分と理由を返す', reply.status === 'FAILED' && reply.text === '途中' && /worker died/.test(reply.error), JSON.stringify(reply));
+
+calls = fakeRunPod({ stream: [{ status: 'IN_QUEUE', stream: [] }] });
+reply = await followReply('k', 'ep', 'job-9', { poll: FAST, deadline: Date.now() + 20 });
+check('  2 時間を過ぎたらジョブを止める', reply.status === 'TIMED_OUT' && calls.some((c) => c.startsWith('/cancel/job-9')), calls.slice(-2).join(' '));
 
 check('ハンドラのエラー出力も SSE のエラーにする', itemToSse({ error: 'boom' }).includes('"error"') && itemToSse('data: x\n\n') === 'data: x\n\n');
-
-// Two hours: the job is cancelled, not left running on the GPU.
-calls = fakeRunPod({ stream: [{ status: 'IN_QUEUE', stream: [] }] });
-res = await runpodChatFetch('k', 'ep', { poll: FAST, waitMs: 20 })('u', { body: JSON.stringify({ stream: true }) });
-check('2 時間を過ぎたらジョブを止めて失敗にする', res.status === 504 && calls.some((c) => c.startsWith('/cancel/job-9')), calls.slice(-2).join(' '));
-
-// Out of poll budget: stop following, but leave the job to finish.
-calls = fakeRunPod({ stream: [{ status: 'IN_QUEUE', stream: [] }] });
-let detached = false;
-res = await runpodChatFetch('k', 'ep', { poll: { minMs: 1, maxMs: 1, budget: 3 }, onDetach: () => (detached = true) })('u', {
-  body: JSON.stringify({ stream: true }),
-});
-check('追跡の上限: 切り離すがジョブは止めない', detached && !calls.some((c) => c.startsWith('/cancel/')), calls.join(' '));
-
-// The caller gives up (the browser went away during a decision): the wait
-// ends at once and the job is cancelled, not left holding the queue.
-calls = fakeRunPod({ status: [{ status: 'IN_QUEUE' }] });
-const stop = new AbortController();
-setTimeout(() => stop.abort(), 30);
-const abortStarted = Date.now();
-res = await runpodChatFetch('k', 'ep', { poll: { minMs: 10000, maxMs: 10000, budget: 50 }, signal: stop.signal })('u', {
-  body: JSON.stringify({ stream: false }),
-});
-check('打ち切り: 待たずに返し、ジョブを取り消す', res.status === 499 && Date.now() - abortStarted < 2000 && calls.some((c) => c.startsWith('/cancel/job-9')),
-  (Date.now() - abortStarted) + 'ms ' + calls.join(' '));
 
 check('待ち行列の表示', queueNotice({ status: 'IN_QUEUE', waitedMs: 754000 }).includes('待ち行列') && queueNotice({ status: 'IN_QUEUE', waitedMs: 754000 }).includes('12分34秒'));
 check('  起動中の表示', queueNotice({ status: 'IN_PROGRESS', waitedMs: 30000 }).includes('起動・読み込み中'));

@@ -317,10 +317,12 @@ async function runWarm(env, key, endpointId) {
 }
 
 /* The spec the settings call for: where to fetch the model from (your own
- * copy, R2) is chosen in the admin tab, the rest is LLAMACPP_SPEC. */
+ * copy, R2) and whether RunPod caches it are chosen in the admin tab, the
+ * rest is LLAMACPP_SPEC. */
 const appSpec = (settings, extra = {}) =>
   resolveSpec({
     useR2: !!settings.runpodUseR2,
+    cacheModel: !!settings.runpodUseCache,
     ownRepo: String(settings.runpodOwnRepo || '').trim(),
     ...extra,
   });
@@ -379,6 +381,7 @@ admin.get('/breakthrough', async (c) => {
       : null,
     // The R2 copy: where it is, which RunPod secrets it needs, whether new
     // endpoints use it.
+    useCache: spec.engine === 'llamacpp' ? !!settings.runpodUseCache : null,
     r2: spec.engine === 'llamacpp'
       ? { enabled: !!settings.runpodUseR2, bucket: spec.r2Bucket, prefix: r2Prefix(spec), secrets: Object.values(R2_SECRETS) }
       : null,

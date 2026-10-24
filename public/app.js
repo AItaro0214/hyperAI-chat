@@ -403,6 +403,8 @@ async function newRoom() {
 }
 $('#new-room').addEventListener('click', () => newRoom().catch((e) => toast(e.message, 'err')));
 
+// Turns being followed from their rows, so reopening a room does not double up.
+const following = new Set();
 async function openRoom(id) {
   const res = await api('/api/rooms/' + id);
   state.roomId = id;
@@ -420,6 +422,13 @@ async function openRoom(id) {
   renderRooms();
   renderMessages();
   closeSidebar();
+  /* A breakthrough turn still running on the server: show it as it goes,
+   * from the row it writes. */
+  const running = [...res.messages].reverse().find(runningTurn);
+  if (running && !state.streaming && !following.has(running.id)) {
+    following.add(running.id);
+    followUnfinished(id, running.id, { quiet: true, tries: 0, until: turnDeadline(running) }).finally(() => following.delete(running.id));
+  }
 }
 
 $('#room-title').addEventListener('change', async (e) => {
@@ -789,6 +798,12 @@ function messageNode(msg) {
     n.innerHTML = '<i>' + icon('warning', 15) + '</i>';
     const label = job.status === 'IN_QUEUE' ? '待ち行列で待機中' : job.status === 'IN_PROGRESS' ? '処理中' : '確認中';
     n.appendChild(el('span', null, 'RunPod で' + label + 'です。終わると自動でここに入ります（最大2時間）。'));
+    wrap.appendChild(n);
+  } else if (msg.meta?.partial && msg.meta.progress?.text) {
+    // A breakthrough turn still deciding or searching, on the server.
+    const n = el('div', 'notice');
+    n.innerHTML = '<i>' + icon('warning', 15) + '</i>';
+    n.appendChild(el('span', null, msg.meta.progress.text + '（処理はサーバーで続いています）'));
     wrap.appendChild(n);
   }
 
@@ -1209,6 +1224,12 @@ function createStreamView(model) {
 /* How long a breakthrough job can still produce a reply: the server's two
  * hours (JOB_WAIT_MS in runpod.js) from submission, plus a little. */
 const jobDeadline = (job) => Number(job.submittedAt) + 2 * 3600 * 1000 + 5 * 60 * 1000;
+/* A breakthrough turn running on the server (a Workflow): until its job's
+ * deadline, or two hours from the turn's start while it is still searching. */
+const runningTurn = (row) =>
+  row?.role === 'assistant' && row.meta?.partial === true && (row.meta.progress || row.meta.runpodJob?.submittedAt);
+const turnDeadline = (row) =>
+  row.meta.runpodJob?.submittedAt ? jobDeadline(row.meta.runpodJob) : Number(row.createdAt) * 1000 + 2 * 3600 * 1000 + 5 * 60 * 1000;
 
 /**
  * Waits for a reply the connection dropped in the middle of.
@@ -1224,8 +1245,9 @@ async function followUnfinished(roomId, messageId, { tries = 120, everyMs = 3000
    * two hours; the server settles it whenever the room is read, so reading
    * the room now and then is all following it takes. */
   let deadline = until;
+  let writing = false;
   for (let i = 0; i < tries || Date.now() < deadline; i++) {
-    await new Promise((r) => setTimeout(r, deadline ? 15000 : everyMs));
+    await new Promise((r) => setTimeout(r, deadline ? (writing ? 4000 : 15000) : everyMs));
     let res;
     try {
       res = await api('/api/rooms/' + roomId);
@@ -1244,8 +1266,8 @@ async function followUnfinished(roomId, messageId, { tries = 120, everyMs = 3000
     }
 
     const partial = row.meta?.partial === true;
-    const job = row.meta?.runpodJob;
-    if (partial && job?.submittedAt && !deadline) deadline = jobDeadline(job);
+    if (runningTurn(row) && !deadline) deadline = turnDeadline(row);
+    writing = partial && !!row.content;
     if (!partial) {
       if (row.meta?.abandoned && !row.content) {
         toast('応答は完了しませんでした（生成が長すぎて記録が途切れました）。もう一度お試しください。', 'err');
@@ -1412,8 +1434,8 @@ async function send({ content = '', attachments = [], regenerate = false }) {
         /* The stream ended but the reply did not: a RunPod job still running
          * after this Worker stopped following it. Keep checking, quietly. */
         const row = res.messages.find((m) => m.id === pendingMessageId);
-        if (sawDone && row?.meta?.partial && row.meta.runpodJob?.submittedAt) {
-          followUnfinished(state.roomId, pendingMessageId, { quiet: true, tries: 0, until: jobDeadline(row.meta.runpodJob) });
+        if (sawDone && runningTurn(row)) {
+          followUnfinished(state.roomId, pendingMessageId, { quiet: true, tries: 0, until: turnDeadline(row) });
         }
       } catch {
         /* keep what is on screen */
@@ -2226,6 +2248,20 @@ function ownRepoNote(bt) {
   );
 }
 
+/* RunPod's cached models: off unless chosen here. */
+function cacheChoiceNote(bt) {
+  if (bt.useCache === null || bt.useCache === undefined) return '';
+  return (
+    '<div style="margin-top:12px">' +
+    '<label class="row" style="gap:6px"><input type="checkbox" id="bt-usecache"' + (bt.useCache ? ' checked' : '') + '>' +
+    '<span class="sm">RunPod の事前保存（Cached models）を使う</span></label>' +
+    '<p class="xs muted">既定はオフです。オンにすると RunPod がモデルのリポジトリ全体をホストに保存し、保存後の起動は速くなります。' +
+    'ただし<b>保存が終わるまでワーカーが起動せず</b>、「No workers available」のまま30分ほど待つことがありました。' +
+    'オフのときは起動のたびにワーカーが必要な分（約78GiB）をダウンロードします（実測ではワーカーが約1分20秒でダウンロードを始めました）。' +
+    '設定は次にエンドポイントを作るときから効きます（今のエンドポイントに付けるなら、オンにしてから「モデルのキャッシュを設定」）。</p></div>'
+  );
+}
+
 function r2Note(bt) {
   if (!bt.r2) return '';
   const r2 = bt.r2;
@@ -2351,8 +2387,10 @@ async function renderBreakthroughTab(body) {
         (bt.modelReference ? '<button class="btn" id="bt-cache">モデルのキャッシュを設定</button>' : '') +
         '<button class="btn danger" id="bt-destroy">破棄</button></div>' +
         modelCacheNote(bt) +
-        '<p class="xs muted">初回は RunPod がモデルをホストに保存するまで待ちます（この間は課金されません）。' +
-        '保存後の起動は重みの読み込みで<b>1〜2分</b>です。' +
+        '<p class="xs muted">' +
+        (bt.modelReference
+          ? '初回は RunPod がモデルをホストに保存するまで待ちます（この間は課金されません）。保存後の起動は重みの読み込みで<b>1〜2分</b>です。'
+          : '起動のたびにワーカーがモデル（約78GiB）をダウンロードしてから読み込みます。') +
         'ここで起動を済ませておくと、チャットは待たずに応答します。</p>'
       : '<div class="kv"><dt>モデル</dt><dd><code>' + esc(bt.spec.model) + '</code></dd>' +
         '<dt>GPU</dt><dd>' + esc(bt.spec.gpu) + ' / ' + esc(bt.spec.quantization.toUpperCase()) + '</dd>' +
@@ -2362,6 +2400,7 @@ async function renderBreakthroughTab(body) {
         '<p class="xs muted">RunPod の API キーは「キー」タブで <code>RUNPOD_API_KEY</code> として登録してください。</p>' +
         '<button class="btn primary" id="bt-create" style="margin-top:12px">エンドポイントを作成して起動</button>') +
     ownRepoNote(bt) +
+    cacheChoiceNote(bt) +
     r2Note(bt) +
     '<p class="xs" id="bt-msg"></p></div>' +
     '<div class="card"><h3>ウェブ検索</h3>' +
@@ -2513,6 +2552,17 @@ async function renderBreakthroughTab(body) {
     await api('/api/admin/settings', { method: 'POST', body: JSON.stringify({ runpodOwnRepo: repo }) });
     await renderBreakthroughTab(body);
     msg(repo ? '自分のリポジトリを設定しました。エンドポイントを作り直すと使われます' : '元のリポジトリに戻しました', 'ok');
+  });
+
+  $('#bt-usecache')?.addEventListener('change', async (e) => {
+    await api('/api/admin/settings', { method: 'POST', body: JSON.stringify({ runpodUseCache: e.target.checked }) });
+    await renderBreakthroughTab(body);
+    msg(
+      e.target.checked
+        ? '事前保存を使う設定にしました。次に作るエンドポイントから有効です（今のエンドポイントは「モデルのキャッシュを設定」で付けられます）'
+        : '事前保存を使わない設定にしました（次に作るエンドポイントから。今のエンドポイントに付いている分は RunPod のコンソールで外せます）',
+      'ok'
+    );
   });
 
   $('#bt-r2')?.addEventListener('change', async (e) => {

@@ -65,7 +65,7 @@ check('  どの候補でも 262K で 10 GiB 以上余る',
   DEFAULT_SPEC.gpu.map((g) => g.replace('NVIDIA ', '') + ' ' + vramEstimate({ ctx: 262144, gpu: g }).spare.toFixed(1)).join(', '));
 check('  CUDA 12.8 以上のホストだけ（A100/H100 は PTX を読み込み時に変換する）', DEFAULT_SPEC.minCudaVersion === '12.8' && endpointBody('t').minCudaVersion === '12.8');
 check('  以前の vLLM 構成には付けない', !('minCudaVersion' in endpointBody('t', VLLM_SPEC)));
-check('  RunPod のキャッシュを使う', DEFAULT_SPEC.cacheModel === true);
+check('  RunPod の事前保存は既定では使わない（管理画面で選ぶ）', DEFAULT_SPEC.cacheModel === false);
 check('  Model 欄に入れる値（使っているコミットに固定）',
   modelReference() === 'https://huggingface.co/SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF:eec4e10a2c29b440a2ae85591fa11569ce752963', modelReference());
 check('イメージは固定タグ', /:v\d+\.\d+/.test(VLLM_IMAGE) && !/latest/.test(VLLM_IMAGE), VLLM_IMAGE);
@@ -95,8 +95,8 @@ check('  サーバーレス用として作る', l.isServerless === true);
 check('  ボリュームを付けない', l.volumeInGb === 0, 'ストレージ課金が発生しない条件');
 check('  代替のダウンロード 84GB が入るディスク', l.containerDiskInGb >= 89, l.containerDiskInGb + 'GB');
 check('  リポジトリを渡す', l.env.MODEL_REPO === DEFAULT_SPEC.model);
-check('  キャッシュを先に探させる', l.env.MODEL_CACHE === 'on');
-check('  キャッシュ不使用も指定できる', templateBody({ cacheModel: false }).env.MODEL_CACHE === 'off');
+check('  既定ではキャッシュを探させない', l.env.MODEL_CACHE === 'off');
+check('  事前保存を選べばキャッシュを先に探させる', templateBody({ cacheModel: true }).env.MODEL_CACHE === 'on');
 check('  代替では選んだ量子化のフォルダだけ取得', l.env.MODEL_INCLUDE === 'IQ3_S/*', l.env.MODEL_INCLUDE);
 check('  読み込むファイル', l.env.MODEL_FILE === DEFAULT_SPEC.modelFile);
 check('  文脈長はモデル本来の 262K', l.env.CTX_SIZE === '262144', l.env.CTX_SIZE);
@@ -232,8 +232,10 @@ check('回収: 起動情報のフレームを無視する', recovered.text === '
 const appSrc = readFileSync(new URL('../public/app.js', import.meta.url), 'utf8');
 check('画面: ストリーム中に表示する', /event === 'worker'[\s\S]{0,80}setStartup\(p\)/.test(appSrc));
 check('  保存された返答の下にも出す', /msg\.meta\?\.startup\?\.label/.test(appSrc));
+const turnSrc = readFileSync(new URL('../src/lib/breakthrough-turn.js', import.meta.url), 'utf8');
 const routeSrc = readFileSync(new URL('../src/routes/chat.js', import.meta.url), 'utf8');
-check('  メッセージの meta に保存する', /base\.startup = startup/.test(routeSrc) && /emit\('worker', startup\)/.test(routeSrc));
+check('  メッセージの meta に保存し、行から画面へ送る',
+  /st\.startup = describeStartup/.test(turnSrc) && /startup: st\.startup/.test(turnSrc) && /emit\('worker', meta\.startup\)/.test(routeSrc));
 
 /* ------------------------------- lifecycle ------------------------------- */
 // Enough of the REST and GraphQL APIs to see the call sequence without
@@ -274,7 +276,7 @@ let calls = fakeFetch({
   'GQL EndpointConfig': { myself: { endpoint: GQL_ENDPOINT } },
   'GQL SaveEndpoint': { saveEndpoint: { id: 'ep_9', modelReferences: [REF] } },
 });
-const out = await provision('key');
+const out = await provision('key', { cacheModel: true });
 check('テンプレート→エンドポイントの順で作る', calls[0].startsWith('POST /templates') && calls[1].startsWith('POST /endpoints'), calls.join(' → '));
 check('  ベースURLを組み立てて返す', out.base === openaiBase('ep_9'), out.base);
 check('  短縮モデル名を返す', out.model === 'breakthrough');
@@ -296,7 +298,7 @@ calls = fakeFetch({
   'GQL EndpointConfig': { myself: { endpoint: GQL_ENDPOINT } },
   'GQL SaveEndpoint': new Error('modelReferences is not allowed'),
 });
-const partial = await provision('key');
+const partial = await provision('key', { cacheModel: true });
 check('キャッシュに失敗してもエンドポイントは残す', partial.endpointId === 'ep_9' && !calls.some((c) => c.startsWith('DELETE')), calls.join(' → '));
 check('  失敗と、手で入れる値を返す', partial.modelCache?.ok === false && /not allowed/.test(partial.modelCache.error) && partial.modelCache.value === REF);
 
@@ -308,6 +310,11 @@ try {
   refused = true;
 }
 check('GPU 指定が読めなければ上書きしない', refused && !calls.includes('GQL SaveEndpoint'), calls.join(' → '));
+
+// Off by default: the endpoint is made without RunPod's cache, and nothing is attached.
+calls = fakeFetch({ 'POST /templates': { id: 'tpl_d' }, 'POST /endpoints': { id: 'ep_d' } });
+const plain = await provision('key');
+check('既定では作成時にキャッシュを付けない', plain.modelCache === null && !calls.some((c) => c.startsWith('GQL')), calls.join(' → '));
 
 calls = fakeFetch({ 'POST /templates': { id: 'tpl_v' }, 'POST /endpoints': { id: 'ep_v' } });
 const old = await provision('key', VLLM_SPEC);
@@ -584,7 +591,7 @@ calls = fakeFetch({
   'GQL EndpointConfig': { myself: { endpoint: GQL_ENDPOINT } },
   'GQL SaveEndpoint': { saveEndpoint: { id: 'ep_o', modelReferences: [OWN_REF] } },
 });
-const createdOwn = await provision('key', { ownRepo: OWN }, { hfToken: TOKEN });
+const createdOwn = await provision('key', { ownRepo: OWN, cacheModel: true }, { hfToken: TOKEN });
 sentInput = calls.gql.find((g) => g.op === 'SaveEndpoint').variables.input;
 check('作成時: 事前保存と一緒にトークンを渡す', asMap(sentInput.env).HF_TOKEN === TOKEN && createdOwn.modelCache.ok === true);
 check('  返す値にトークンが入らない', !JSON.stringify(createdOwn).includes(TOKEN));

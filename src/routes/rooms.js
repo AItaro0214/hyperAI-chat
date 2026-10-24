@@ -3,7 +3,7 @@ import { newId } from '../lib/crypto.js';
 import { now } from '../lib/auth.js';
 import { requireAuth } from '../lib/guard.js';
 import { getSettings, getApiKey, getJsonSetting } from '../lib/store.js';
-import { recoverReply, OWN_JOBS_KEY } from '../lib/runpod.js';
+import { recoverReply, OWN_JOBS_KEY, JOB_WAIT_MS } from '../lib/runpod.js';
 import { pendingReplies, settleMessage } from '../lib/runpod-jobs.js';
 
 const rooms = new Hono();
@@ -26,11 +26,15 @@ function parseJson(value, fallback) {
 
 /** Fifteen minutes: longer than any reply, shorter than forever. */
 const PARTIAL_GRACE_SEC = 900;
+/* A breakthrough turn runs on its own (a Workflow) for up to two hours, and
+ * says so in meta.progress or meta.runpodJob. */
+const TURN_GRACE_SEC = JOB_WAIT_MS / 1000 + 900;
 
 function staleMeta(row) {
   const meta = row.meta && row.meta.length > 20000 ? { truncated: true } : parseJson(row.meta, null);
   if (!meta?.partial) return meta;
-  if (now() - Number(row.created_at || 0) < PARTIAL_GRACE_SEC) return meta;
+  const grace = meta.progress || meta.runpodJob ? TURN_GRACE_SEC : PARTIAL_GRACE_SEC;
+  if (now() - Number(row.created_at || 0) < grace) return meta;
   return { ...meta, partial: false, abandoned: true };
 }
 
@@ -327,11 +331,23 @@ rooms.post('/:id/messages/:mid/recover', async (c) => {
     });
   }
 
-  /* Stopped while still deciding whether to search: no reply job was ever
-   * sent, so there is no reply to find — only decisions, whose text is a
-   * half-answer cut off at 700 tokens. Matching by time would take one. */
   const msgMeta = parseJson(msg.meta, {}) || {};
-  if (msgMeta.phase === 'deciding' && !msgMeta.runpodJob) {
+  /* A turn still running as a Workflow, before its reply job: it is
+   * deciding or searching, and will write the reply itself. */
+  if (msgMeta.workflow && msgMeta.partial && c.env.BREAKTHROUGH) {
+    const status = await c.env.BREAKTHROUGH.get(msgMeta.workflow)
+      .then((w) => w.status())
+      .catch(() => null);
+    if (status && ['queued', 'running', 'waiting', 'paused', 'waitingForPause'].includes(status.status)) {
+      return c.json({ ok: false, pending: 1, reason: '処理中です（' + (msgMeta.progress?.text || status.status) + '）。終わると自動で入ります。' });
+    }
+  }
+
+  /* Stopped before any reply job was sent — while deciding whether to
+   * search, or searching: there is no reply to find, only decisions, whose
+   * text is a half-answer cut off at 700 tokens. Matching by time would
+   * take one. */
+  if ((msgMeta.phase === 'deciding' || msgMeta.progress) && !msgMeta.runpodJob) {
     const why = '検索の判断の途中で止まったため、返答は作られていません。もう一度送ってください。';
     await c.env.DB.prepare('UPDATE messages SET error = ?, meta = ? WHERE id = ?')
       .bind(msg.error || why, JSON.stringify({ ...msgMeta, partial: false }), msg.id)

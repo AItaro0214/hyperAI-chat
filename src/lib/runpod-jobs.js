@@ -11,7 +11,8 @@
  * anything else happens. From then on there are four ways for the answer to
  * reach the database, and any one of them is enough:
  *
- *   1. the Worker that sent it follows /stream and writes as it goes;
+ *   1. the turn itself (a Workflow, lib/breakthrough-turn.js) follows
+ *      /stream and writes as it goes;
  *   2. RunPod calls the webhook when the job ends, and the app reads the job;
  *   3. opening the room reads any job its replies are still waiting on;
  *   4. the hourly cron does the same for every waiting reply.
@@ -46,12 +47,12 @@ const HOUR = 3600 * 1000;
 const FINAL = new Set(['COMPLETED', 'FAILED', 'CANCELLED', 'TIMED_OUT']);
 export const isFinal = (status) => FINAL.has(String(status || '').toUpperCase());
 
-/* Following a job costs one request per poll, and a Worker invocation may
- * make 10,000 (Workers Paid). Fast while text is arriving, slower while
- * nothing is: 2,500 is some forty minutes of text at one poll a second, or
- * hours of waiting at fifteen, and leaves room for the search decisions in
- * the same turn. Past it the Worker stops following and leaves the job to
- * the webhook and the sweeps — it does not cancel it. */
+/* Following a job costs one request per poll, and a Worker invocation or a
+ * Workflow instance may make 10,000 (Workers Paid). Fast while text is
+ * arriving, slower while nothing is: 2,500 is some forty minutes of text at
+ * one poll a second, or hours of waiting at fifteen. Past it the following
+ * goes on at fifteen seconds, which leaves room for the decisions, the
+ * searches and the row's writes in the same turn. */
 export const POLL = { minMs: 1000, maxMs: 15000, budget: 2500 };
 
 const authHeaders = (apiKey) => ({ authorization: 'Bearer ' + apiKey, 'content-type': 'application/json' });
@@ -83,6 +84,124 @@ export async function cancelJob(apiKey, endpointId, jobId) {
   }).catch(() => {});
 }
 
+/* ---------------- following a job by its id (for workflows) ----------------
+ * A Workflow step can be run again after the instance is evicted. Following
+ * by id — never by submitting — makes that harmless: the job is submitted in
+ * one step, and these read it in the next, as often as they are run. */
+
+async function readJob(apiKey, endpointId, path, jobId) {
+  const res = await fetch(RUN_BASE + '/' + endpointId + path + '/' + encodeURIComponent(jobId), {
+    headers: authHeaders(apiKey),
+    signal: AbortSignal.timeout(30000),
+  }).catch(() => null);
+  return (await res?.json().catch(() => null)) || { status: 'UNKNOWN' };
+}
+
+/**
+ * Waits for a non-streamed job (a search decision) to end.
+ * @param {number} deadline  epoch ms; past it the job is cancelled
+ * @returns {Promise<{ok: boolean, status: string, httpStatus: number, body: object}>}
+ */
+export async function waitForJob(apiKey, endpointId, jobId, { deadline, onStatus, poll = POLL } = {}) {
+  let delay = poll.minMs;
+  for (let calls = 0; ; calls++) {
+    const job = await readJob(apiKey, endpointId, '/status', jobId);
+    await onStatus?.({ status: job.status });
+    if (job.status === 'COMPLETED') {
+      const out = Array.isArray(job.output) ? job.output.find((o) => o && typeof o === 'object') : job.output;
+      if (out?.error) return { ok: false, status: 'FAILED', httpStatus: 500, body: { error: { message: failedReason({ error: out.error }) } } };
+      return { ok: true, status: 'COMPLETED', httpStatus: 200, body: out || {} };
+    }
+    if (isFinal(job.status)) {
+      return { ok: false, status: job.status, httpStatus: job.status === 'TIMED_OUT' ? 504 : 500, body: { error: { message: failedReason(job) } } };
+    }
+    if (deadline && Date.now() > deadline) {
+      await cancelJob(apiKey, endpointId, jobId);
+      return { ok: false, status: 'TIMED_OUT', httpStatus: 504, body: { error: { message: '2時間以内に終わらなかったため、ジョブを止めました' } } };
+    }
+    await sleep(delay);
+    delay = Math.min(poll.maxMs, Math.ceil(delay * 1.5));
+  }
+}
+
+/* The frames of a stream item, as parsed chunks. */
+function framesOf(output) {
+  const chunks = [];
+  for (const line of itemToSse(output).split('\n')) {
+    const t = line.trim();
+    if (!t.startsWith('data:')) continue;
+    const body = t.slice(5).trim();
+    if (!body || body === '[DONE]') continue;
+    try {
+      chunks.push(JSON.parse(body));
+    } catch {
+      /* a frame split across items: the final text comes from /status anyway */
+    }
+  }
+  return chunks;
+}
+
+/**
+ * Follows a streamed reply job to its end, reporting text as it arrives.
+ *
+ * What is streamed is for showing; what is returned comes from the finished
+ * job's stored output (/status), so a follow that is run again after an
+ * eviction — and so missed the increments /stream already handed out —
+ * still returns the whole reply.
+ *
+ * @param {(p: {text?: string, reasoning?: string, worker?: object, status?: string}) => Promise<void>} [onProgress]
+ * @returns {Promise<{status: string, text?: string, reasoning?: string, usage?: object, worker?: object, error?: string}>}
+ */
+export async function followReply(apiKey, endpointId, jobId, { deadline, onProgress, poll = POLL } = {}) {
+  let text = '';
+  let reasoning = '';
+  let worker = null;
+  let usage = null;
+  let delay = poll.minMs;
+  for (let calls = 0; ; calls++) {
+    const s = await readJob(apiKey, endpointId, '/stream', jobId);
+    const items = Array.isArray(s.stream) ? s.stream : [];
+    let streamError = null;
+    for (const item of items) {
+      for (const chunk of framesOf(item?.output)) {
+        if (chunk.hyperai_worker && !worker) worker = chunk.hyperai_worker;
+        if (chunk.usage) usage = chunk.usage;
+        if (chunk.error) streamError = chunk.error.message || JSON.stringify(chunk.error);
+        const delta = chunk.choices?.[0]?.delta || {};
+        if (typeof delta.content === 'string') text += delta.content;
+        const r = delta.reasoning ?? delta.reasoning_content;
+        if (typeof r === 'string') reasoning += r;
+      }
+    }
+    await onProgress?.({ text, reasoning, worker, status: s.status, fresh: items.length > 0 });
+
+    if (isFinal(s.status)) {
+      const job = await readJob(apiKey, endpointId, '/status', jobId);
+      if (s.status !== 'COMPLETED') return { status: s.status, error: streamError || failedReason(job), text, reasoning, worker };
+      const done = extractCompletion(job);
+      // The worker's startup details travel as their own frame.
+      const stored = (Array.isArray(job.output) ? job.output : [job.output]).flatMap((o) => framesOf(o));
+      const storedWorker = stored.find((c) => c?.hyperai_worker)?.hyperai_worker || null;
+      return {
+        status: 'COMPLETED',
+        text: done.text.length >= text.length ? done.text : text,
+        reasoning: done.reasoning || reasoning,
+        usage: done.usage || usage,
+        worker: worker || storedWorker,
+        finishReason: done.finishReason,
+      };
+    }
+    if (deadline && Date.now() > deadline) {
+      await cancelJob(apiKey, endpointId, jobId);
+      return { status: 'TIMED_OUT', error: '2時間以内に終わらなかったため、ジョブを止めました（待ち行列・起動・生成の合計）', text, reasoning, worker };
+    }
+    await sleep(delay);
+    /* Past the budget, slow: an instance may make 10,000 subrequests, and
+     * the row's writes and the decisions share them. */
+    delay = calls >= poll.budget ? poll.maxMs : items.length ? poll.minMs : Math.min(poll.maxMs, Math.ceil(delay * 1.5));
+  }
+}
+
 /* One stream item, as the SSE text consumeChatStream reads. The handler
  * yields SSE strings for a stream and objects otherwise; a failure is an
  * object with `error`. */
@@ -93,168 +212,7 @@ export function itemToSse(output) {
   return 'data: ' + JSON.stringify(output) + '\n\n';
 }
 
-const sleep = (ms, signal) =>
-  new Promise((resolve) => {
-    if (signal?.aborted) return resolve();
-    const t = setTimeout(resolve, ms);
-    signal?.addEventListener('abort', () => {
-      clearTimeout(t);
-      resolve();
-    }, { once: true });
-  });
-
-/**
- * A drop-in for fetch(url, {body}) that runs the chat completion as a /run
- * job instead of a sync request, and hands back an ordinary Response:
- *
- *   stream: an SSE body fed from /stream, opened once the first output (or
- *           the job's end) arrives — so a job that fails before writing
- *           anything comes back as an error status, as a sync request would;
- *   else:   the completion as JSON once the job ends, or an error status.
- *
- * @param {object} o
- * @param {(jobId: string) => Promise<void>|void} [o.onJob]   called once, before any waiting
- * @param {(s: {status: string, waitedMs: number, output: boolean}) => void} [o.onStatus]
- * @param {() => void} [o.onDetach]  the poll budget ran out; the job carries on unfollowed
- */
-export function runpodChatFetch(apiKey, endpointId, { webhook, onJob, onStatus, onDetach, signal, waitMs = JOB_WAIT_MS, poll = POLL } = {}) {
-  return async (_url, init = {}) => {
-    const body = typeof init.body === 'string' ? JSON.parse(init.body) : init.body || {};
-    const jobId = await submitChatJob(apiKey, endpointId, body, { webhook });
-    await onJob?.(jobId);
-    const started = Date.now();
-    let calls = 0;
-    let delay = poll.minMs;
-
-    const get = async (path) => {
-      calls++;
-      const res = await fetch(RUN_BASE + '/' + endpointId + path + '/' + encodeURIComponent(jobId), {
-        headers: authHeaders(apiKey),
-        signal: AbortSignal.timeout(30000),
-      }).catch(() => null);
-      return (await res?.json().catch(() => null)) || { status: 'UNKNOWN' };
-    };
-    const overTime = () => Date.now() - started > waitMs;
-    const outOfBudget = () => calls >= poll.budget;
-    const failure = (status, job) =>
-      new Response(JSON.stringify({ error: { message: failedReason(job) || status } }), {
-        status: status === 'TIMED_OUT' ? 504 : 500,
-        headers: { 'content-type': 'application/json', 'x-runpod-job': jobId },
-      });
-    const timedOut = async () => {
-      await cancelJob(apiKey, endpointId, jobId);
-      return failure('TIMED_OUT', { error: '2時間以内に終わらなかったため、ジョブを止めました（待ち行列・起動・生成の合計）' });
-    };
-    /* Called off by the caller (the browser went away during a search
-     * decision): the job is cancelled — it would only hold the queue — and
-     * an error status comes back at once, so the caller can move on. */
-    const aborted = async () => {
-      await cancelJob(apiKey, endpointId, jobId);
-      return new Response(JSON.stringify({ error: { message: '打ち切りました（接続が切れたため）' } }), {
-        status: 499,
-        headers: { 'content-type': 'application/json', 'x-runpod-job': jobId },
-      });
-    };
-
-    if (!body.stream) {
-      for (;;) {
-        if (signal?.aborted) return aborted();
-        const job = await get('/status');
-        onStatus?.({ status: job.status, waitedMs: Date.now() - started, output: false });
-        if (job.status === 'COMPLETED') {
-          const out = Array.isArray(job.output) ? job.output.find((o) => o && typeof o === 'object') : job.output;
-          if (out?.error) return failure('FAILED', { error: out.error });
-          return new Response(JSON.stringify(out || {}), { status: 200, headers: { 'content-type': 'application/json', 'x-runpod-job': jobId } });
-        }
-        if (isFinal(job.status)) return failure(job.status, job);
-        if (overTime()) return timedOut();
-        if (outOfBudget()) {
-          onDetach?.();
-          return failure('DETACHED', { error: '応答の追跡を打ち切りました（ジョブは RunPod で続いています）' });
-        }
-        await sleep(delay, signal);
-        delay = Math.min(poll.maxMs, Math.ceil(delay * 1.5));
-      }
-    }
-
-    // Wait for the first output or the end, so a job that never wrote a word
-    // still comes back as an error status rather than an empty stream.
-    let first = null;
-    for (;;) {
-      if (signal?.aborted) return aborted();
-      const s = await get('/stream');
-      const items = Array.isArray(s.stream) ? s.stream : [];
-      onStatus?.({ status: s.status, waitedMs: Date.now() - started, output: items.length > 0 });
-      if (items.length) {
-        first = { items, status: s.status };
-        break;
-      }
-      if (isFinal(s.status)) {
-        if (s.status !== 'COMPLETED') return failure(s.status, await get('/status'));
-        first = { items: [], status: s.status };
-        break;
-      }
-      if (overTime()) return timedOut();
-      if (outOfBudget()) {
-        onDetach?.();
-        return failure('DETACHED', { error: '応答の追跡を打ち切りました（ジョブは RunPod で続いています）' });
-      }
-      await sleep(delay, signal);
-      delay = Math.min(poll.maxMs, Math.ceil(delay * 1.5));
-    }
-
-    const enc = new TextEncoder();
-    let pending = first;
-    let ended = false;
-    const stream = new ReadableStream({
-      async pull(controller) {
-        for (;;) {
-          if (pending) {
-            const { items, status } = pending;
-            pending = null;
-            const text = items.map((i) => itemToSse(i?.output)).join('');
-            if (isFinal(status)) {
-              if (status !== 'COMPLETED') {
-                const job = await get('/status');
-                controller.enqueue(enc.encode(text + 'data: ' + JSON.stringify({ error: { message: failedReason(job) } }) + '\n\n'));
-              } else if (text) {
-                controller.enqueue(enc.encode(text));
-              }
-              controller.enqueue(enc.encode('data: [DONE]\n\n'));
-              ended = true;
-              controller.close();
-              return;
-            }
-            if (text) {
-              controller.enqueue(enc.encode(text));
-              return;
-            }
-          }
-          if (ended) return;
-          if (overTime()) {
-            await cancelJob(apiKey, endpointId, jobId);
-            controller.enqueue(enc.encode('data: ' + JSON.stringify({ error: { message: '2時間以内に終わらなかったため、ジョブを止めました' } }) + '\n\ndata: [DONE]\n\n'));
-            controller.close();
-            return;
-          }
-          if (outOfBudget()) {
-            onDetach?.();
-            controller.enqueue(enc.encode('data: [DONE]\n\n'));
-            controller.close();
-            return;
-          }
-          await sleep(delay);
-          const s = await get('/stream');
-          const items = Array.isArray(s.stream) ? s.stream : [];
-          onStatus?.({ status: s.status, waitedMs: Date.now() - started, output: items.length > 0 });
-          delay = items.length ? poll.minMs : Math.min(poll.maxMs, Math.ceil(delay * 1.5));
-          pending = { items, status: s.status };
-        }
-      },
-    });
-    return new Response(stream, { status: 200, headers: { 'content-type': 'text/event-stream', 'x-runpod-job': jobId } });
-  };
-}
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /* What a reply waiting on RunPod looks like on the screen. */
 export function queueNotice({ status, waitedMs }) {

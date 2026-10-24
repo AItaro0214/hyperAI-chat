@@ -300,10 +300,11 @@ check('  長い検索語は切る', searchRecord({ kind: 'search', args: { query
 
 // ...and reaches the saved reply and the screen.
 const { readFileSync } = await import('node:fs');
-const routeSrc = readFileSync(new URL('../src/routes/chat.js', import.meta.url), 'utf8');
+// The breakthrough turn runs in lib/breakthrough-turn.js, not the chat route.
+const turnSrc = readFileSync(new URL('../src/lib/breakthrough-turn.js', import.meta.url), 'utf8');
 const appSrc = readFileSync(new URL('../public/app.js', import.meta.url), 'utf8');
-check('  チャットの経路が engine を渡す', /engine: args\.engine/.test(routeSrc) && /backend: searchMode/.test(routeSrc));
-check('  返答の meta に保存する', /base\.searches = searches/.test(routeSrc) && /searches\.push\(searchRecord\(/.test(routeSrc));
+check('  ブレイクスルーのターンが engine を渡す', /engine: args\.engine/.test(turnSrc) && /backend: searchMode/.test(turnSrc));
+check('  返答の meta に保存する', /searches: st\.searches/.test(turnSrc) && /record: searchRecord\(/.test(turnSrc));
 check('  画面に出す', /msg\.meta\?\.searches\?\.length/.test(appSrc) && /function searchLog/.test(appSrc));
 
 void realGet;

@@ -95,6 +95,8 @@ export const DEFAULT_SETTINGS = {
   /* New endpoints may fall back to the R2 copy of the model. Off until the
    * RunPod secrets it reads have been created (R2_SECRETS in runpod.js). */
   runpodUseR2: false,
+  // RunPod's cached models for new endpoints (LLAMACPP_SPEC.cacheModel).
+  runpodUseCache: false,
   /* Your own Hugging Face copy of the quant (owner/name), for RunPod's cache
    * and the worker's first download. Empty: the original repository only. */
   runpodOwnRepo: '',

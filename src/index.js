@@ -17,6 +17,7 @@ import runpodHookRoutes from './routes/runpod-hook.js';
 // The Durable Object class the container binding runs against.
 export { Sandbox } from '@cloudflare/sandbox';
 export { AgentWorkflow } from './workflows/agent.js';
+export { BreakthroughWorkflow } from './workflows/breakthrough.js';
 
 const app = new Hono();
 

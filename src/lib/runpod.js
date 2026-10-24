@@ -167,8 +167,14 @@ export const LLAMACPP_SPEC = {
    * loads from local disk instead of downloading 78 GiB. The download is not
    * billed. It is the whole repository — 281 GiB, every quant — because
    * RunPod cannot yet select files; the worker falls back to fetching only
-   * this quant itself when the cache is not there. */
-  cacheModel: true,
+   * this quant itself when the cache is not there.
+   *
+   * Off unless the admin tab turns it on (runpodUseCache). While RunPod is
+   * still storing the repository, no worker starts on the endpoint at all —
+   * that was half an hour of "No workers available" in production — whereas
+   * without it a worker started and began downloading its one quant within
+   * about a minute and a half. */
+  cacheModel: false,
   /* The model's own trained length, 262,144 — memory is not what limits it.
    * See QWEN38_MEMORY: at this length the KV cache is 7.5 GiB in f16, and an
    * 80GB card still has some 15 GiB to spare, so the cache stays f16 (q8_0

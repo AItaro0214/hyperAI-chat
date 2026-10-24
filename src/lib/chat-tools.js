@@ -200,11 +200,8 @@ export async function resolveTools({
   timeoutMs = 900000,
   budgetMs = DEFAULT_BUDGET_MS,
   promptBudget = 0,
-  // A self-hosted model's decisions go through RunPod jobs (runpodChatFetch).
+  // A self-hosted model's decisions go through RunPod jobs (lib/breakthrough-turn.js).
   fetchImpl = fetch,
-  // Aborted when the browser goes away: stop deciding, so the reply is sent
-  // while the Worker still can be (see the chat route).
-  signal = null,
 }) {
   const messages = body.messages.slice();
   const calls = [];
@@ -221,10 +218,6 @@ export async function resolveTools({
   const roundBudget = promptBudget > 0 ? Math.max(1000, promptBudget - 700) : 0;
 
   for (rounds = 1; rounds <= limit; rounds++) {
-    if (signal?.aborted) {
-      stoppedBecause = '接続が切れた';
-      break;
-    }
     if (started !== null && Date.now() - started > budgetMs) {
       stoppedBecause = '時間切れ';
       break;
@@ -264,10 +257,6 @@ export async function resolveTools({
       // A cold GPU answers the first request in minutes, not seconds.
       signal: AbortSignal.timeout(timeoutMs),
     });
-    if (signal?.aborted) {
-      stoppedBecause = '接続が切れた';
-      break;
-    }
     /* A failure here is not fatal: fall through and answer with what there
      * is. But it says why — "HTTP 400" alone was all there was to go on when
      * the reason was a context overflow. */
