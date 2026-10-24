@@ -5,9 +5,18 @@ import {
   validateSpec,
   provision,
   destroy,
+  resolveSpec,
+  imageFor,
+  modelReference,
+  attachModel,
+  workerInfo,
   DEFAULT_SPEC,
+  VLLM_SPEC,
   VLLM_IMAGE,
+  LLAMACPP_IMAGE,
 } from '../src/lib/runpod.js';
+import { buildRequest } from '../src/lib/chat.js';
+import { readFileSync } from 'node:fs';
 
 const results = [];
 const check = (name, ok, extra = '') => {
@@ -19,16 +28,46 @@ const check = (name, ok, extra = '') => {
 check('OpenAI 互換のベースURL', openaiBase('abc123') === 'https://api.runpod.ai/v2/abc123/openai/v1', openaiBase('abc123'));
 
 /* ------------------------------- defaults -------------------------------- */
-check('既定は量子化版を指す', DEFAULT_SPEC.quantization === 'awq', DEFAULT_SPEC.quantization);
-check('  bf16 を既定にしていない', /awq/i.test(DEFAULT_SPEC.model), DEFAULT_SPEC.model);
+check('既定は llama.cpp', DEFAULT_SPEC.engine === 'llamacpp', DEFAULT_SPEC.engine);
+check('  指定のモデル', DEFAULT_SPEC.model === 'SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF', DEFAULT_SPEC.model);
+check('  配布元推奨の IQ3_S', DEFAULT_SPEC.quantization === 'IQ3_S', DEFAULT_SPEC.quantization);
+check('  1 本目のシャードを指す', /^IQ3_S\/.*-00001-of-00002\.gguf$/.test(DEFAULT_SPEC.modelFile), DEFAULT_SPEC.modelFile);
+check('  A100 80GB を先に、H100 80GB を次に', /^NVIDIA A100/.test(DEFAULT_SPEC.gpu[0]) &&
+  DEFAULT_SPEC.gpu.findIndex((g) => /H100/.test(g)) > DEFAULT_SPEC.gpu.findLastIndex((g) => /A100/.test(g)), DEFAULT_SPEC.gpu.join(', '));
+check('  80GB 以外を含めない', DEFAULT_SPEC.gpu.every((g) => /A100.*80GB|H100 (80GB|PCIe)/.test(g)), DEFAULT_SPEC.gpu.join(', '));
+check('  RunPod のキャッシュを使う', DEFAULT_SPEC.cacheModel === true);
+check('  Model 欄に入れる値', modelReference() === 'https://huggingface.co/SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF:main', modelReference());
 check('イメージは固定タグ', /:v\d+\.\d+/.test(VLLM_IMAGE) && !/latest/.test(VLLM_IMAGE), VLLM_IMAGE);
+check('  llama.cpp はビルド番号とワーカー版で固定', /:b\d+-\d+$/.test(LLAMACPP_IMAGE), LLAMACPP_IMAGE);
+// The workflow builds what the Dockerfile says; the app must name the same tag.
+const dockerfile = readFileSync(new URL('../runpod-worker/llamacpp/Dockerfile', import.meta.url), 'utf8');
+const dfTag = dockerfile.match(/^FROM .*:server-cuda-(b\d+)/m)?.[1] + '-' + dockerfile.match(/^ENV WORKER_VERSION=(\d+)/m)?.[1];
+check('  Dockerfile と同じタグ', LLAMACPP_IMAGE.endsWith(':' + dfTag), dfTag);
+check('エンジンでイメージを選ぶ', imageFor(DEFAULT_SPEC) === LLAMACPP_IMAGE && imageFor(VLLM_SPEC) === VLLM_IMAGE);
+// A partial vLLM spec must not inherit llama.cpp's parsers-less defaults.
+check('部分指定は同じエンジンの既定で補う', resolveSpec({ engine: 'vllm' }).toolParser === 'qwen3_coder');
 
-/* ------------------------------- template -------------------------------- */
-const t = templateBody();
+/* ------------------------- template: llama.cpp --------------------------- */
+const l = templateBody();
+check('llama.cpp ワーカーを使う', l.imageName === LLAMACPP_IMAGE);
+check('  サーバーレス用として作る', l.isServerless === true);
+check('  ボリュームを付けない', l.volumeInGb === 0, 'ストレージ課金が発生しない条件');
+check('  代替のダウンロード 84GB が入るディスク', l.containerDiskInGb >= 89, l.containerDiskInGb + 'GB');
+check('  リポジトリを渡す', l.env.MODEL_REPO === DEFAULT_SPEC.model);
+check('  キャッシュを先に探させる', l.env.MODEL_CACHE === 'on');
+check('  キャッシュ不使用も指定できる', templateBody({ cacheModel: false }).env.MODEL_CACHE === 'off');
+check('  代替では選んだ量子化のフォルダだけ取得', l.env.MODEL_INCLUDE === 'IQ3_S/*', l.env.MODEL_INCLUDE);
+check('  読み込むファイル', l.env.MODEL_FILE === DEFAULT_SPEC.modelFile);
+check('  文脈長を渡す', l.env.CTX_SIZE === '32768');
+check('  モデル名を短縮名に固定', l.env.SERVED_MODEL_NAME === 'breakthrough');
+check('  vLLM の変数を混ぜない', !('MODEL_NAME' in l.env) && !('QUANTIZATION' in l.env));
+
+/* --------------------------- template: vLLM ------------------------------ */
+const t = templateBody(VLLM_SPEC);
 check('vLLM ワーカーを使う', t.imageName === VLLM_IMAGE);
 check('サーバーレス用として作る', t.isServerless === true);
 check('ボリュームを付けない', t.volumeInGb === 0, 'ストレージ課金が発生しない条件');
-check('モデルを環境変数で渡す', t.env.MODEL_NAME === DEFAULT_SPEC.model);
+check('モデルを環境変数で渡す', t.env.MODEL_NAME === VLLM_SPEC.model);
 check('量子化を渡す', t.env.QUANTIZATION === 'awq');
 check('文脈長を渡す', t.env.MAX_MODEL_LEN === '32768');
 
@@ -39,10 +78,10 @@ check('ツール呼び出しを有効化する', t.env.ENABLE_AUTO_TOOL_CHOICE =
 check('  パーサを指定する', t.env.TOOL_CALL_PARSER === 'qwen3_coder', t.env.TOOL_CALL_PARSER);
 check('モデル名を短縮名に固定', t.env.OPENAI_SERVED_MODEL_NAME_OVERRIDE === 'breakthrough');
 
-const noQuant = templateBody({ quantization: null, model: 'a/b' });
+const noQuant = templateBody({ engine: 'vllm', quantization: null, model: 'a/b' });
 check('量子化なしなら渡さない', !('QUANTIZATION' in noQuant.env));
 const gated = templateBody({ hfToken: 'hf_x' });
-check('HF トークンは渡されたときだけ', gated.env.HF_TOKEN === 'hf_x' && !('HF_TOKEN' in t.env));
+check('HF トークンは渡されたときだけ', gated.env.HF_TOKEN === 'hf_x' && !('HF_TOKEN' in t.env) && !('HF_TOKEN' in l.env));
 
 /* ------------------------------- endpoint -------------------------------- */
 const e = endpointBody('tpl_1');
@@ -50,29 +89,73 @@ check('テンプレートを参照する', e.templateId === 'tpl_1');
 check('最小ワーカーは 0', e.workersMin === 0, 'アイドル課金が発生しない条件');
 check('  ネットワークボリュームを付けない', !('networkVolumeId' in e), '付けると月額が発生する');
 check('FlashBoot を有効化', e.flashboot === true, 'コールドスタート短縮');
-// 20GB of weights do not fit 24GB once the KV cache is accounted for.
-check('GPU は 48GB 以上', /A6000|A40|L40S/.test(e.gpuTypeIds[0]), e.gpuTypeIds.join(', '));
+// 51 GiB of resident weights need an 80GB card; the order is the preference.
+check('GPU は A100 80GB から', e.gpuTypeIds[0] === 'NVIDIA A100 80GB PCIe', e.gpuTypeIds.join(', '));
 check('  在庫切れに備えて複数指定', e.gpuTypeIds.length > 1, String(e.gpuTypeIds.length));
 check('実行タイムアウトに余裕', e.executionTimeoutMs >= 600000, String(e.executionTimeoutMs) + 'ms');
-// A short idle timeout spends minutes of GPU re-loading 16GB to save cents.
-check('アイドル待機が短すぎない', e.idleTimeout >= 120, e.idleTimeout + '秒');
+// An 80GB card waiting is the expensive part; a reload from cache is a minute.
+check('アイドル待機は短く', e.idleTimeout <= 30, e.idleTimeout + '秒');
+check('  ただしエージェントの検索の合間よりは長く', e.idleTimeout >= 10, e.idleTimeout + '秒');
 check('  重み読み込み分を見込む', e.executionTimeoutMs / 60000 >= 10, Math.round(e.executionTimeoutMs / 60000) + '分');
+const ev = endpointBody('tpl_1', VLLM_SPEC);
+check('以前の構成は 48GB のまま', /A6000/.test(ev.gpuTypeIds[0]) && ev.idleTimeout === 300, ev.gpuTypeIds[0]);
 
 /* ------------------------------ validation ------------------------------- */
 check('妥当な既定は通る', validateSpec().length === 0, validateSpec().join(' / '));
+check('以前の vLLM 構成も通る', validateSpec(VLLM_SPEC).length === 0, validateSpec(VLLM_SPEC).join(' / '));
 
-const badFit = validateSpec({ model: 'huihui-ai/Huihui-Qwen3.8-27B-abliterated', quantization: null, gpu: 'NVIDIA GeForce RTX 4090' });
+const badFit = validateSpec({ engine: 'vllm', model: 'huihui-ai/Huihui-Qwen3.8-27B-abliterated', quantization: null, gpu: 'NVIDIA GeForce RTX 4090' });
 check('24GB に 27B 無量子化は止める', badFit.some((p) => p.includes('24GB')), badFit.join(' / '));
 
 check('不正なモデル名を弾く', validateSpec({ model: 'notapath' }).some((p) => p.includes('owner/name')));
-check('未知の量子化を弾く', validateSpec({ quantization: 'magic' }).some((p) => p.includes('quantization')));
-check('パーサ未設定を警告', validateSpec({ toolParser: '' }).some((p) => p.includes('ツール')));
+check('未知の量子化を弾く', validateSpec({ engine: 'vllm', quantization: 'magic' }).some((p) => p.includes('quantization')));
+check('パーサ未設定を警告', validateSpec({ engine: 'vllm', toolParser: '' }).some((p) => p.includes('ツール')));
+check('未知のエンジンを弾く', validateSpec({ engine: 'tgi' }).some((p) => p.includes('engine')));
+check('GGUF 以外の量子化名を弾く', validateSpec({ quantization: 'awq' }).some((p) => p.includes('GGUF')));
+check('量子化とファイルの食い違いを弾く', validateSpec({ quantization: 'IQ2_XS' }).some((p) => p.includes('一致')));
+check('.gguf でないファイルを弾く', validateSpec({ modelFile: 'IQ3_S/model.bin' }).some((p) => p.includes('modelFile')));
+check('ディスク不足を弾く', validateSpec({ containerDiskInGb: 80 }).some((p) => p.includes('containerDiskInGb')));
+check('IQ2_XS への切り替えは通る', validateSpec({
+  quantization: 'IQ2_XS',
+  modelFile: 'IQ2_XS/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ2_XS-00001-of-00002.gguf',
+  containerDiskInGb: 80,
+}).length === 0);
+
+/* ------------------------- the request it sends -------------------------- */
+const bt = { baseUrl: openaiBase('ep_1'), model: 'breakthrough' };
+const req = (reasoning) => buildRequest({ provider: 'runpod', model: 'breakthrough', messages: [], options: { reasoning }, apiKey: 'k', breakthrough: bt }).body;
+check('思考は既定でオフ', req('').chat_template_kwargs.enable_thinking === false && !('reasoning_effort' in req('').chat_template_kwargs));
+check('  オフなら深さを送らない', !('reasoning_effort' in req('off').chat_template_kwargs));
+check('  low はそのまま', req('low').chat_template_kwargs.reasoning_effort === 'low');
+check('  medium はそのまま', req('medium').chat_template_kwargs.reasoning_effort === 'medium');
+check('  high はテンプレートの xhigh', req('high').chat_template_kwargs.reasoning_effort === 'xhigh');
+
+/* ----------------------------- worker report ----------------------------- */
+check('ワーカーの起動元を読む', workerInfo({ choices: [], worker: { source: 'cache' } })?.source === 'cache');
+check('  ストリームの出力（配列）からも読む', workerInfo([{ worker: { source: 'download' } }])?.source === 'download');
+check('  vLLM の出力では null', workerInfo([{ choices: [] }]) === null && workerInfo(null) === null);
 
 /* ------------------------------- lifecycle ------------------------------- */
-// Enough of the REST API to see the call sequence without spending money.
+// Enough of the REST and GraphQL APIs to see the call sequence without
+// spending money. GraphQL calls are recorded by operation name.
+const GQL_ENDPOINT = {
+  id: 'ep_9', name: 'hyperai-breakthrough', templateId: 'tpl_9', gpuIds: 'AMPERE_80,ADA_80_PRO,-NVIDIA H100 NVL',
+  gpuCount: 1, instanceIds: [], workersMin: 0, workersMax: 1, locations: '', networkVolumeId: '',
+  networkVolumeIds: [], idleTimeout: 15, scalerType: 'QUEUE_DELAY', scalerValue: 4, executionTimeoutMs: 1800000,
+  minCudaVersion: '', flashBootType: 'FLASHBOOT',
+};
 function fakeFetch(plan) {
   const calls = [];
   globalThis.fetch = async (url, options = {}) => {
+    if (String(url) === 'https://api.runpod.io/graphql') {
+      const body = JSON.parse(options.body);
+      const op = body.query.match(/(?:query|mutation) (\w+)/)[1];
+      calls.push('GQL ' + op);
+      calls.gql = (calls.gql || []).concat([{ op, variables: body.variables, headers: options.headers }]);
+      const hit = plan['GQL ' + op];
+      const payload = hit instanceof Error ? { errors: [{ message: hit.message }] } : { data: hit ?? {} };
+      return { ok: true, status: 200, json: async () => payload, text: async () => JSON.stringify(payload) };
+    }
     const path = String(url).replace('https://rest.runpod.io/v1', '');
     calls.push((options.method || 'GET') + ' ' + path);
     const hit = plan[(options.method || 'GET') + ' ' + path.split('/').slice(0, 2).join('/')];
@@ -83,12 +166,51 @@ function fakeFetch(plan) {
   return calls;
 }
 const realFetch = globalThis.fetch;
+const REF = 'https://huggingface.co/SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF:main';
 
-let calls = fakeFetch({ 'POST /templates': { id: 'tpl_9' }, 'POST /endpoints': { id: 'ep_9' } });
+let calls = fakeFetch({
+  'POST /templates': { id: 'tpl_9' },
+  'POST /endpoints': { id: 'ep_9' },
+  'GQL EndpointConfig': { myself: { endpoint: GQL_ENDPOINT } },
+  'GQL SaveEndpoint': { saveEndpoint: { id: 'ep_9', modelReferences: [REF] } },
+});
 const out = await provision('key');
 check('テンプレート→エンドポイントの順で作る', calls[0].startsWith('POST /templates') && calls[1].startsWith('POST /endpoints'), calls.join(' → '));
 check('  ベースURLを組み立てて返す', out.base === openaiBase('ep_9'), out.base);
 check('  短縮モデル名を返す', out.model === 'breakthrough');
+check('  そのあとキャッシュを付ける', calls[2] === 'GQL EndpointConfig' && calls[3] === 'GQL SaveEndpoint', calls.join(' → '));
+check('  付けられたと報告する', out.modelCache?.ok === true && out.modelCache.value === REF, JSON.stringify(out.modelCache));
+const saved = calls.gql.find((g) => g.op === 'SaveEndpoint').variables.input;
+check('  モデルの参照を送る', JSON.stringify(saved.modelReferences) === JSON.stringify([REF]));
+// saveEndpoint replaces the whole config; anything not echoed would be reset.
+check('  GPU の指定をそのまま戻す', saved.gpuIds === GQL_ENDPOINT.gpuIds, saved.gpuIds);
+check('  ほかの設定もそのまま戻す', saved.templateId === 'tpl_9' && saved.workersMax === 1 && saved.idleTimeout === 15 &&
+  saved.executionTimeoutMs === 1800000 && saved.flashBootType === 'FLASHBOOT' && saved.id === 'ep_9');
+check('  GraphQL も Bearer で認証', calls.gql[0].headers.authorization === 'Bearer key');
+
+// The endpoint works without the cache, so a failed attach must not undo it.
+calls = fakeFetch({
+  'POST /templates': { id: 'tpl_9' },
+  'POST /endpoints': { id: 'ep_9' },
+  'GQL EndpointConfig': { myself: { endpoint: GQL_ENDPOINT } },
+  'GQL SaveEndpoint': new Error('modelReferences is not allowed'),
+});
+const partial = await provision('key');
+check('キャッシュに失敗してもエンドポイントは残す', partial.endpointId === 'ep_9' && !calls.some((c) => c.startsWith('DELETE')), calls.join(' → '));
+check('  失敗と、手で入れる値を返す', partial.modelCache?.ok === false && /not allowed/.test(partial.modelCache.error) && partial.modelCache.value === REF);
+
+calls = fakeFetch({ 'GQL EndpointConfig': { myself: { endpoint: { ...GQL_ENDPOINT, gpuIds: '' } } } });
+let refused = false;
+try {
+  await attachModel('key', 'ep_9', [REF]);
+} catch {
+  refused = true;
+}
+check('GPU 指定が読めなければ上書きしない', refused && !calls.includes('GQL SaveEndpoint'), calls.join(' → '));
+
+calls = fakeFetch({ 'POST /templates': { id: 'tpl_v' }, 'POST /endpoints': { id: 'ep_v' } });
+const old = await provision('key', VLLM_SPEC);
+check('vLLM ではキャッシュを付けない', old.modelCache === null && !calls.some((c) => c.startsWith('GQL')), calls.join(' → '));
 
 // A template left behind with no endpoint is clutter nobody will find.
 calls = fakeFetch({ 'POST /templates': { id: 'tpl_x' }, 'POST /endpoints': new Error('no GPU capacity') });

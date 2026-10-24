@@ -271,6 +271,14 @@ export function clampEffort(provider, modelId, effort) {
   return { effort, notice: null };
 }
 
+/* The three depths the self-hosted template knows, from the app's wider set. */
+function templateEffort(effort) {
+  const e = String(effort || '').toLowerCase();
+  if (e === 'low') return 'low';
+  if (e === 'medium') return 'medium';
+  return 'xhigh';
+}
+
 export function buildRequest({ provider, model, messages, options = {}, apiKey, stream = true, modelMeta, breakthrough }) {
   const notices = [];
   let effectiveModel = model;
@@ -307,10 +315,14 @@ export function buildRequest({ provider, model, messages, options = {}, apiKey, 
     btBody.max_tokens = Number(options.maxTokens) > 0 ? Number(options.maxTokens) : 16384;
     /* The one reasoning control a self-hosted Qwen has: thinking on or off,
      * passed through the chat template rather than as a top-level field. */
-    /* Off unless asked for. Qwen thinks by default, and on a 27B model on one
-     * GPU that is minutes of monologue before a greeting gets answered. */
+    /* Off unless asked for. Qwen thinks by default, and on one rented GPU
+     * that is minutes of monologue before a greeting gets answered. */
     const thinking = thinkingFor(options.reasoning) ?? false;
     btBody.chat_template_kwargs = { enable_thinking: thinking };
+    /* Qwen3.8-Flash-Next's template also reads a depth, and defaults it to
+     * xhigh — the longest. Passed only when thinking is on; templates that do
+     * not know the variable ignore it. */
+    if (thinking) btBody.chat_template_kwargs.reasoning_effort = templateEffort(options.reasoning);
     if (thinking) notices.push('思考モードを有効にしました（応答が遅くなります）');
     notices.push('ブレイクスルーモード（自前GPU）で実行します');
     return {

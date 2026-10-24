@@ -4,6 +4,7 @@ node_modules/
 .dev.vars
 .env
 *.log
+__pycache__/
 
 # Local Cloudflare resource ids and the single allowed account live here.
 wrangler.jsonc

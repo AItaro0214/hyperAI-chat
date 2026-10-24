@@ -48,8 +48,11 @@ import {
   getEndpoint,
   diagnose,
   validateSpec,
+  resolveSpec,
+  imageFor,
+  attachModel,
+  modelReference,
   DEFAULT_SPEC,
-  VLLM_IMAGE,
 } from '../lib/runpod.js';
 import { BACKENDS, BACKEND_NOTES } from '../lib/search.js';
 import { keyUsage, accountCredits, utcWindows } from '../lib/generation.js';
@@ -301,14 +304,17 @@ admin.get('/breakthrough', async (c) => {
       notes: BACKEND_NOTES,
     },
     spec: DEFAULT_SPEC,
-    image: VLLM_IMAGE,
+    image: imageFor(DEFAULT_SPEC),
+    // What RunPod's console takes in the Model field, for setting it by hand.
+    modelReference: DEFAULT_SPEC.cacheModel ? modelReference(DEFAULT_SPEC) : null,
+    modelCache: settings.runpodModelCache || null,
     warming: await describeWarming(c.env, live),
   });
 });
 
 admin.post('/breakthrough/provision', async (c) => {
   const body = await c.req.json().catch(() => ({}));
-  const spec = { ...DEFAULT_SPEC, ...(body.spec || {}) };
+  const spec = resolveSpec(body.spec || {});
   const problems = validateSpec(spec);
   if (problems.length) return c.json({ error: problems.join(' / ') }, 400);
 
@@ -332,6 +338,8 @@ admin.post('/breakthrough/provision', async (c) => {
     runpodModel: created.model,
     // Remembered because context trimming needs the real window, not a guess.
     runpodMaxLen: spec.maxModelLen,
+    // Kept so the tab can still say, after it re-renders, whether it took.
+    runpodModelCache: created.modelCache ? { ...created.modelCache, at: Date.now() } : null,
     breakthrough: true,
   });
 
@@ -383,6 +391,21 @@ admin.post('/breakthrough/reset', async (c) => {
   return c.json({ ok: true, ...done });
 });
 
+/* Attaches the cached model to the endpoint that exists — for one created
+ * before this was automatic, or when the attempt during creation failed. */
+admin.post('/breakthrough/cache', async (c) => {
+  const settings = await getSettings(c.env);
+  const key = await getApiKey(c.env, 'RUNPOD_API_KEY');
+  if (!key) return c.json({ error: 'RUNPOD_API_KEY が未登録です' }, 400);
+  if (!settings.runpodEndpointId) return c.json({ error: 'エンドポイントがありません' }, 400);
+  const value = modelReference(DEFAULT_SPEC);
+  const result = await attachModel(key, settings.runpodEndpointId, [value])
+    .then((refs) => ({ ok: refs.includes(value), refs, value }))
+    .catch((e) => ({ ok: false, error: e.message, value }));
+  await saveSettings(c.env, { runpodModelCache: { ...result, at: Date.now() } });
+  return c.json(result, result.ok ? 200 : 502);
+});
+
 admin.post('/breakthrough/diagnose', async (c) => {
   const settings = await getSettings(c.env);
   const key = await getApiKey(c.env, 'RUNPOD_API_KEY');
@@ -421,7 +444,14 @@ admin.post('/breakthrough/destroy', async (c) => {
     return c.json({ error: e.message }, 502);
   }
   await writeWarming(c.env, null);
-  await saveSettings(c.env, { runpodEndpointId: '', runpodTemplateId: '', runpodModel: '', runpodMaxLen: 0, breakthrough: false });
+  await saveSettings(c.env, {
+    runpodEndpointId: '',
+    runpodTemplateId: '',
+    runpodModel: '',
+    runpodMaxLen: 0,
+    runpodModelCache: null,
+    breakthrough: false,
+  });
   return c.json({ ok: true });
 });
 

@@ -16,12 +16,23 @@
 
 const REST = 'https://rest.runpod.io/v1';
 const RUN = 'https://api.runpod.ai/v2';
+const GRAPHQL = 'https://api.runpod.io/graphql';
 
 /* The maintained vLLM worker. Pinned rather than :latest so a breaking change
  * upstream cannot alter a working setup without being asked for. */
 export const VLLM_IMAGE = 'runpod/worker-v1-vllm:v2.27.1';
 
-export const DEFAULT_SPEC = {
+/* llama.cpp, for models vLLM cannot load. RunPod publishes no llama.cpp
+ * worker, so this is built from runpod-worker/llamacpp in this repository by
+ * .github/workflows/llamacpp-worker.yml. The tag is the llama.cpp build it is
+ * based on and the handler's WORKER_VERSION, pinned for the same reason as the
+ * vLLM one; the workflow refuses to build if this does not match. */
+export const LLAMACPP_IMAGE = 'ghcr.io/aitaro0214/hyperai-llamacpp-worker:b11804-1';
+
+/* The previous model, on vLLM. Kept whole so going back is passing this as the
+ * spec rather than reconstructing it from git. */
+export const VLLM_SPEC = {
+  engine: 'vllm',
   // 27B at bf16 is ~54GB and will not fit a 24GB card; the AWQ build is ~16GB.
   model: 'shawnw3i/Huihui-Qwen3.8-27B-abliterated-AWQ-MTP',
   quantization: 'awq',
@@ -69,7 +80,70 @@ export const DEFAULT_SPEC = {
    * over. */
   idleTimeout: 300,
   executionTimeoutMs: 900000,
+  containerDiskInGb: 30,
 };
+
+/* Qwen3.8-Flash-Next, abliterated: a 177B MoE (10 of 512 experts per token),
+ * shipped only as GGUF for llama.cpp's qwen4exp architecture — which vLLM does
+ * not load, hence the second engine.
+ *
+ * Each quant is two shards. The first is the transformer and has to be
+ * resident in VRAM; the second is a 26.8 GiB n-gram embedding table that
+ * llama.cpp reads through mmap, so it costs disk rather than VRAM. First
+ * shards:
+ *   Q2_0     35.4 GiB
+ *   IQ2_XS   36.9 GiB  — the most a 48GB card holds with room for the KV cache
+ *   IQ3_XXS  44.1 GiB
+ *   IQ3_S    51.3 GiB  — the publisher's recommendation: matches the base model
+ * IQ3_S on an 80GB card leaves ~28 GiB for KV cache, buffers and CUDA. */
+export const LLAMACPP_SPEC = {
+  engine: 'llamacpp',
+  model: 'SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF',
+  quantization: 'IQ3_S',
+  // The first shard; llama.cpp finds the second beside it.
+  modelFile: 'IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_S-00001-of-00002.gguf',
+  /* A100 first, H100 when no A100 is free; 48GB cards cannot hold IQ3_S. The
+   * H100 NVL (94GB) is left out to keep the choice to the two 80GB parts. */
+  gpu: ['NVIDIA A100 80GB PCIe', 'NVIDIA A100-SXM4-80GB', 'NVIDIA H100 80GB HBM3', 'NVIDIA H100 PCIe'],
+  /* RunPod's cached models: the host keeps the repository, so a cold start
+   * loads from local disk instead of downloading 78 GiB. The download is not
+   * billed. It is the whole repository — 281 GiB, every quant — because
+   * RunPod cannot yet select files; the worker falls back to fetching only
+   * this quant itself when the cache is not there. */
+  cacheModel: true,
+  // QSA and DeltaNet layers keep the KV cache small; 32K is what the app trims to.
+  maxModelLen: 32768,
+  // Slots sharing that one pool (--kv-unified): an agent's side calls can
+  // overlap a reply without either losing context.
+  maxNumSeqs: 2,
+  /* Only applied if the build knows the flag (the worker checks --help):
+   * reads the n-gram table from disk on demand instead of holding it in RAM. */
+  lazyMode: 'auto',
+  workersMax: 1,
+  /* Stop as soon as it is idle. A restart reloads 51 GiB from the host's disk,
+   * about a minute, and that is preferred to paying for an 80GB card to wait.
+   * Not the 1-second minimum: an agent turn pauses between rounds while it
+   * searches, and dropping the worker inside one turn would reload it twice. */
+  idleTimeout: 15,
+  /* Generous: with the cache missing, the first request waits on a 78 GiB
+   * download as well as on loading. */
+  executionTimeoutMs: 1800000,
+  // Only used by the fallback download: 78 GiB of shards, plus headroom.
+  containerDiskInGb: 100,
+};
+
+/* What each quant's two shards add up to, in GB as RunPod sizes disks. */
+const QUANT_DISK_GB = { Q2_0: 67, IQ2_XS: 69, IQ3_XXS: 77, IQ3_S: 84 };
+
+/** The value RunPod's console takes in an endpoint's Model field. */
+export const modelReference = (spec = {}) => 'https://huggingface.co/' + resolveSpec(spec).model + ':main';
+
+export const DEFAULT_SPEC = LLAMACPP_SPEC;
+
+export const imageFor = (spec = {}) => ((spec.engine || DEFAULT_SPEC.engine) === 'llamacpp' ? LLAMACPP_IMAGE : VLLM_IMAGE);
+
+/* GGUF quant names llama.cpp understands, plus the new Q2_0. */
+const GGUF_QUANTS = /^(?:I?Q[1-8]_(?:0|1|K)(?:_[SMLX]{1,2})?|IQ[1-4]_(?:XXS|XS|S|M|NL)|F16|BF16|F32)$/i;
 
 /** The OpenAI-compatible base URL for a deployed endpoint. */
 export const openaiBase = (endpointId) => RUN + '/' + endpointId + '/openai/v1';
@@ -98,6 +172,94 @@ async function call(apiKey, path, { method = 'GET', body } = {}) {
   return json;
 }
 
+/* GraphQL, for the one thing REST cannot do: REST's endpoint has no field for
+ * cached models, which only the saveEndpoint mutation takes. This follows
+ * runpodctl's own implementation (internal/api/endpoints.go), which is how the
+ * console and `runpodctl serverless update --model-reference` set it. */
+async function graphql(apiKey, query, variables) {
+  const res = await fetch(GRAPHQL, {
+    method: 'POST',
+    headers: { authorization: 'Bearer ' + apiKey, 'content-type': 'application/json' },
+    body: JSON.stringify({ query, variables }),
+    signal: AbortSignal.timeout(60000),
+  });
+  const json = await res.json().catch(() => null);
+  if (!res.ok || json?.errors?.length) {
+    const detail = json?.errors?.[0]?.message || res.status;
+    throw new Error('RunPod GraphQL → ' + String(detail).slice(0, 300));
+  }
+  return json.data;
+}
+
+/* saveEndpoint is a full replace, so everything it takes is read back and
+ * sent again unchanged — gpuIds especially, which GraphQL holds as a pool
+ * string with exclusions rather than the type ids REST was given. */
+const ENDPOINT_FIELDS =
+  'id name templateId gpuIds gpuCount instanceIds workersMin workersMax locations networkVolumeId ' +
+  'networkVolumeIds { networkVolumeId } idleTimeout scalerType scalerValue executionTimeoutMs ' +
+  'minCudaVersion flashBootType';
+
+/**
+ * Points an endpoint at a Hugging Face repository for RunPod to cache on its
+ * hosts. Pass an empty list to detach.
+ * @returns {Promise<string[]>} the references the endpoint now has
+ */
+export async function attachModel(apiKey, endpointId, refs) {
+  const read = await graphql(
+    apiKey,
+    'query EndpointConfig($id: String!) { myself { endpoint(id: $id) { ' + ENDPOINT_FIELDS + ' } } }',
+    { id: endpointId }
+  );
+  const e = read?.myself?.endpoint;
+  if (!e) throw new Error('エンドポイント ' + endpointId + ' が見つかりません');
+  // An empty gpuIds would be written back as "no GPU" — refuse rather than guess.
+  if (!e.gpuIds && !(e.instanceIds || []).length) throw new Error('gpuIds が読めないため、設定を上書きしません');
+
+  const input = {
+    id: endpointId,
+    name: e.name,
+    templateId: e.templateId,
+    gpuIds: e.gpuIds,
+    gpuCount: e.gpuCount,
+    instanceIds: e.instanceIds,
+    workersMin: e.workersMin,
+    workersMax: e.workersMax,
+    locations: e.locations,
+    networkVolumeId: e.networkVolumeId,
+    networkVolumeIds: (e.networkVolumeIds || []).map((v) => ({ networkVolumeId: v.networkVolumeId })),
+    idleTimeout: e.idleTimeout,
+    scalerType: e.scalerType,
+    scalerValue: e.scalerValue,
+    executionTimeoutMs: e.executionTimeoutMs,
+    minCudaVersion: e.minCudaVersion,
+    // The enum rejects an empty string.
+    flashBootType: e.flashBootType || 'OFF',
+    modelReferences: refs,
+  };
+  const saved = await graphql(
+    apiKey,
+    'mutation SaveEndpoint($input: EndpointInput!) { saveEndpoint(input: $input) { id modelReferences } }',
+    { input }
+  );
+  return saved?.saveEndpoint?.modelReferences || [];
+}
+
+/** What the endpoint is set to cache, or null if that cannot be read. */
+export async function cachedModels(apiKey, endpointId) {
+  const data = await graphql(
+    apiKey,
+    'query EndpointModels($id: String!) { myself { endpoint(id: $id) { id modelReferences } } }',
+    { id: endpointId }
+  );
+  return data?.myself?.endpoint?.modelReferences ?? null;
+}
+
+/** A spec filled in from the defaults of its own engine, not the other one's. */
+export function resolveSpec(spec = {}) {
+  const engine = spec.engine || DEFAULT_SPEC.engine;
+  return { ...(engine === 'vllm' ? VLLM_SPEC : LLAMACPP_SPEC), ...spec, engine };
+}
+
 /* --------------------------- the vLLM template --------------------------- */
 
 /**
@@ -106,7 +268,8 @@ async function call(apiKey, path, { method = 'GET', body } = {}) {
  * is how the tool-call parser gets set.
  */
 export function templateBody(spec = {}) {
-  const s = { ...DEFAULT_SPEC, ...spec };
+  const s = resolveSpec(spec);
+  if (s.engine === 'llamacpp') return llamacppTemplate(s);
   const env = {
     MODEL_NAME: s.model,
     MAX_MODEL_LEN: String(s.maxModelLen),
@@ -128,7 +291,37 @@ export function templateBody(spec = {}) {
   return {
     name: 'hyperai-breakthrough-' + Date.now().toString(36),
     imageName: VLLM_IMAGE,
-    containerDiskInGb: 30,
+    containerDiskInGb: s.containerDiskInGb,
+    volumeInGb: 0,
+    isServerless: true,
+    env,
+  };
+}
+
+/* The llama.cpp worker's variables are its own (see runpod-worker/llamacpp):
+ * which files to load or fetch, and the handful of llama-server flags that
+ * vary. The rest — --jinja for the model's own template and tool calls,
+ * reasoning split out as reasoning_content — is fixed in the worker, because
+ * the app depends on it. */
+function llamacppTemplate(s) {
+  const env = {
+    MODEL_REPO: s.model,
+    MODEL_FILE: s.modelFile,
+    // Looked for under /runpod-volume/huggingface-cache first; off skips it.
+    MODEL_CACHE: s.cacheModel ? 'on' : 'off',
+    // For the fallback: both shards of the chosen quant, not the 281 GiB repo.
+    MODEL_INCLUDE: s.modelFile.split('/')[0] + '/*',
+    CTX_SIZE: String(s.maxModelLen),
+    PARALLEL: String(s.maxNumSeqs),
+    LAZY_MODE: s.lazyMode || '',
+    SERVED_MODEL_NAME: 'breakthrough',
+  };
+  if (s.hfToken) env.HF_TOKEN = s.hfToken;
+
+  return {
+    name: 'hyperai-breakthrough-' + Date.now().toString(36),
+    imageName: LLAMACPP_IMAGE,
+    containerDiskInGb: s.containerDiskInGb,
     volumeInGb: 0,
     isServerless: true,
     env,
@@ -136,7 +329,7 @@ export function templateBody(spec = {}) {
 }
 
 export function endpointBody(templateId, spec = {}) {
-  const s = { ...DEFAULT_SPEC, ...spec };
+  const s = resolveSpec(spec);
   return {
     templateId,
     name: 'hyperai-breakthrough',
@@ -158,24 +351,40 @@ export function endpointBody(templateId, spec = {}) {
 /* ------------------------------ lifecycle ------------------------------- */
 
 /**
- * Creates the template and the endpoint.
- * @returns {Promise<{endpointId: string, templateId: string, base: string, model: string}>}
+ * Creates the template and the endpoint, and asks RunPod to cache the model.
+ *
+ * The endpoint is created over REST, as before, so it keeps the GPU types in
+ * their order of preference; the cache is attached afterwards. A failure there
+ * does not undo the endpoint — the worker downloads for itself instead — and is
+ * returned so the console's Model field can be filled in by hand.
+ *
+ * @returns {Promise<{endpointId: string, templateId: string, base: string, model: string, modelCache: object|null}>}
  */
 export async function provision(apiKey, spec = {}) {
-  const template = await call(apiKey, '/templates', { method: 'POST', body: templateBody(spec) });
+  const s = resolveSpec(spec);
+  const template = await call(apiKey, '/templates', { method: 'POST', body: templateBody(s) });
   const templateId = template?.id;
   if (!templateId) throw new Error('テンプレートの作成に失敗しました（id が返りません）');
 
+  let endpointId;
   try {
-    const endpoint = await call(apiKey, '/endpoints', { method: 'POST', body: endpointBody(templateId, spec) });
-    const endpointId = endpoint?.id;
+    const endpoint = await call(apiKey, '/endpoints', { method: 'POST', body: endpointBody(templateId, s) });
+    endpointId = endpoint?.id;
     if (!endpointId) throw new Error('エンドポイントの作成に失敗しました（id が返りません）');
-    return { endpointId, templateId, base: openaiBase(endpointId), model: 'breakthrough' };
   } catch (e) {
     // A template with no endpoint is invisible clutter; take it back out.
     await call(apiKey, '/templates/' + templateId, { method: 'DELETE' }).catch(() => {});
     throw e;
   }
+
+  let modelCache = null;
+  if (s.engine === 'llamacpp' && s.cacheModel) {
+    const ref = modelReference(s);
+    modelCache = await attachModel(apiKey, endpointId, [ref])
+      .then((refs) => ({ ok: refs.includes(ref), refs, value: ref }))
+      .catch((e) => ({ ok: false, error: e.message, value: ref }));
+  }
+  return { endpointId, templateId, base: openaiBase(endpointId), model: 'breakthrough', modelCache };
 }
 
 /** Removes both, so nothing is left behind in the account. */
@@ -261,7 +470,7 @@ export async function health(apiKey, endpointId) {
  * from RunPod's health in parallel. Whichever settles first decides: the reply
  * arriving means it is warm, and a worker reaching ready means the same.
  */
-export async function warm(apiKey, endpointId, { onProgress, timeoutMs = 900000 } = {}) {
+export async function warm(apiKey, endpointId, { onProgress, timeoutMs = DEFAULT_SPEC.executionTimeoutMs } = {}) {
   const started = Date.now();
   const base = openaiBase(endpointId);
   let done = false;
@@ -316,12 +525,21 @@ export async function warm(apiKey, endpointId, { onProgress, timeoutMs = 900000 
  * the reason. The job API keeps the verdict on the server, so "ran out of GPU
  * memory during startup" is actually readable.
  */
+/* Where the llama.cpp worker got its weights — RunPod's cache or its own
+ * download — as it reported it. A streamed job's output is a list. */
+export function workerInfo(output) {
+  const items = Array.isArray(output) ? output : [output];
+  const found = items.find((o) => o && typeof o === 'object' && o.worker);
+  return found ? found.worker : null;
+}
+
 export async function probeJob(apiKey, endpointId, { onProgress, timeoutMs = 900000 } = {}) {
   const headers = { authorization: 'Bearer ' + apiKey, 'content-type': 'application/json' };
   const submit = await fetch(RUN + '/' + endpointId + '/run', {
     method: 'POST',
     headers,
-    body: JSON.stringify({ input: { prompt: 'ping', sampling_params: { max_tokens: 8 } } }),
+    // worker_info asks the llama.cpp worker how it started; vLLM ignores it.
+    body: JSON.stringify({ input: { prompt: 'ping', sampling_params: { max_tokens: 8 }, worker_info: true } }),
     signal: AbortSignal.timeout(60000),
   });
   const queued = await submit.json().catch(() => null);
@@ -344,6 +562,7 @@ export async function probeJob(apiKey, endpointId, { onProgress, timeoutMs = 900
       jobId: queued.id,
       seconds: elapsed,
       status: state.status,
+      worker: workerInfo(state.output),
       // The whole thing: the useful part is whatever was not expected.
       detail: JSON.stringify(state).slice(0, 2000),
     };
@@ -384,12 +603,23 @@ export async function diagnose(apiKey, endpointId) {
           ),
         };
     if (out.template.env) {
-      const expected = templateBody().env;
-      out.drift = Object.keys(expected).filter((k) => String(out.template.env[k]) !== String(expected[k]));
+      const expected = templateBody();
+      out.drift = Object.keys(expected.env).filter((k) => String(out.template.env[k]) !== String(expected.env[k]));
+      // An endpoint still on the other engine differs in everything; say so once.
+      if (out.template.imageName !== expected.imageName) out.drift.unshift('imageName');
     }
   }
 
   out.health = await health(apiKey, endpointId).catch((e) => ({ error: e.message }));
+
+  // Whether RunPod was asked to cache the model, and the value to enter in
+  // the console's Model field if it was not.
+  if (DEFAULT_SPEC.engine === 'llamacpp' && DEFAULT_SPEC.cacheModel) {
+    const value = modelReference(DEFAULT_SPEC);
+    out.modelCache = await cachedModels(apiKey, endpointId)
+      .then((refs) => ({ attached: Array.isArray(refs) && refs.includes(value), refs, value }))
+      .catch((e) => ({ attached: null, error: e.message, value }));
+  }
 
   /* Bounded well under any browser's patience.
    *
@@ -399,6 +629,9 @@ export async function diagnose(apiKey, endpointId) {
    * surfaces in seconds once the image is cached; anything still queued after
    * the cap is reported as such, with its job id so it can be checked later. */
   out.probe = await probeJob(apiKey, endpointId, { timeoutMs: 40000 }).catch((e) => ({ error: e.message }));
+  // Only a worker that answered can say how it started; a cold one is still
+  // loading, and the next diagnosis will have it.
+  out.weightsFrom = out.probe?.worker?.source || null;
 
   out.expected = DEFAULT_SPEC;
   return out;
@@ -406,10 +639,30 @@ export async function diagnose(apiKey, endpointId) {
 
 /** Sanity checks that would otherwise surface as a puzzling 400 minutes later. */
 export function validateSpec(spec = {}) {
-  const s = { ...DEFAULT_SPEC, ...spec };
+  const s = resolveSpec(spec);
   const problems = [];
+  if (!['vllm', 'llamacpp'].includes(s.engine)) {
+    problems.push('engine は vllm / llamacpp のいずれかです');
+    return problems;
+  }
   if (!s.model || !/^[\w.-]+\/[\w.-]+$/.test(s.model)) {
     problems.push('model は Hugging Face の "owner/name" 形式で指定してください');
+  }
+  if (s.engine === 'llamacpp') {
+    if (!s.modelFile || !/\.gguf$/i.test(s.modelFile) || !s.modelFile.includes('/')) {
+      problems.push('modelFile は量子化フォルダ内の 1 本目の .gguf を指定してください（例: IQ2_XS/…-00001-of-00002.gguf）');
+    }
+    if (!s.quantization || !GGUF_QUANTS.test(s.quantization)) {
+      problems.push('quantization は GGUF の量子化名（IQ2_XS / Q4_K_M など）です');
+    } else if (s.modelFile && !s.modelFile.startsWith(s.quantization + '/')) {
+      problems.push('quantization と modelFile のフォルダが一致しません');
+    }
+    // The fallback download lands on container disk, so it has to fit there.
+    const needed = (QUANT_DISK_GB[String(s.quantization).toUpperCase()] || 80) + 5;
+    if (!(Number(s.containerDiskInGb) >= needed)) {
+      problems.push('containerDiskInGb が小さすぎます。' + s.quantization + ' には ' + needed + 'GB 以上が必要です');
+    }
+    return problems;
   }
   // The combination people get wrong: a 24GB card and an unquantized 27B.
   const firstGpu = Array.isArray(s.gpu) ? s.gpu[0] : s.gpu;

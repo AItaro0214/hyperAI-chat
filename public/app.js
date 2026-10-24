@@ -2111,6 +2111,23 @@ async function renderEventsTab(body) {
 
 let btTimer = null;
 
+/* Whether RunPod is caching the model, and if not, what to put in the
+ * console's Model field to make it. */
+function modelCacheNote(bt) {
+  if (!bt.modelReference) return '';
+  const mc = bt.modelCache;
+  if (mc?.ok) {
+    return '<p class="xs muted"><span class="ok">モデルのキャッシュを設定済み</span>: <code>' + esc(mc.value) + '</code></p>';
+  }
+  return (
+    '<p class="xs"><span class="warn">モデルのキャッシュが' + (mc ? '設定できませんでした' : '未設定です') + '</span>' +
+    (mc?.error ? '（' + esc(mc.error) + '）' : '') +
+    '。「モデルのキャッシュを設定」を押すか、RunPod のコンソールでエンドポイントの <b>Manage → Edit Endpoint</b> を開き、' +
+    '<b>Model</b> 欄に次の値を入れてください:<br><code>' + esc(bt.modelReference) + '</code><br>' +
+    '<span class="muted">未設定でも動きますが、起動のたびに約78GiBをダウンロードします。</span></p>'
+  );
+}
+
 /* Breakthrough mode: a self-hosted model on a rented GPU, plus the search it
  * needs. Provisioning takes minutes, so this polls rather than blocks. */
 async function renderBreakthroughTab(body) {
@@ -2167,12 +2184,17 @@ async function renderBreakthroughTab(body) {
           : '<button class="btn primary" id="bt-activate">有効化する</button>') +
         '<button class="btn" id="bt-reset">キューを空にする</button>' +
         '<button class="btn" id="bt-diag">診断</button>' +
+        (bt.modelReference ? '<button class="btn" id="bt-cache">モデルのキャッシュを設定</button>' : '') +
         '<button class="btn danger" id="bt-destroy">破棄</button></div>' +
-        '<p class="xs muted">初回は重みの読み込みで<b>5〜10分</b>かかります。' +
+        modelCacheNote(bt) +
+        '<p class="xs muted">初回は RunPod がモデルをホストに保存するまで待ちます（この間は課金されません）。' +
+        '保存後の起動は重みの読み込みで<b>1〜2分</b>です。' +
         'ここで起動を済ませておくと、チャットは待たずに応答します。</p>'
       : '<div class="kv"><dt>モデル</dt><dd><code>' + esc(bt.spec.model) + '</code></dd>' +
         '<dt>GPU</dt><dd>' + esc(bt.spec.gpu) + ' / ' + esc(bt.spec.quantization.toUpperCase()) + '</dd>' +
-        '<dt>イメージ</dt><dd><code>' + esc(bt.image) + '</code></dd></div>' +
+        '<dt>イメージ</dt><dd><code>' + esc(bt.image) + '</code></dd>' +
+        (bt.modelReference ? '<dt>キャッシュ</dt><dd><code>' + esc(bt.modelReference) + '</code></dd>' : '') +
+        '</div>' +
         '<p class="xs muted">RunPod の API キーは「キー」タブで <code>RUNPOD_API_KEY</code> として登録してください。</p>' +
         '<button class="btn primary" id="bt-create" style="margin-top:12px">エンドポイントを作成して起動</button>') +
     '<p class="xs" id="bt-msg"></p></div>' +
@@ -2243,6 +2265,18 @@ async function renderBreakthroughTab(body) {
       const r = await api('/api/admin/breakthrough/reset', { method: 'POST', body: '{}' });
       msg('キューを空にしました（アイドル待機: ' + (r.idleTimeout || '?') + '秒）', 'ok');
       setTimeout(() => renderBreakthroughTab(body), 1500);
+    } catch (err) {
+      msg(err.message, 'warn');
+      e.target.disabled = false;
+    }
+  });
+
+  $('#bt-cache')?.addEventListener('click', async (e) => {
+    e.target.disabled = true;
+    msg('設定しています…');
+    try {
+      await api('/api/admin/breakthrough/cache', { method: 'POST', body: '{}' });
+      renderBreakthroughTab(body);
     } catch (err) {
       msg(err.message, 'warn');
       e.target.disabled = false;

@@ -38,6 +38,7 @@
     "test:cost": "node tests/cost-unit.mjs",
     "test:cache": "node tests/cache-unit.mjs",
     "test:runpod": "node tests/runpod-unit.mjs",
+    "test:worker": "python -I runpod-worker/llamacpp/test_handler.py",
     "test:search": "node tests/search-unit.mjs",
     "test:chattools": "node tests/chattools-unit.mjs",
     "test:keytest": "node tests/keytest-unit.mjs",
