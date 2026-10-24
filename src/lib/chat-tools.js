@@ -22,6 +22,12 @@
  * ceiling exists because a model that is not getting what it wants will ask
  * forever, and every attempt costs GPU time whether or not it helps. */
 export const MAX_ROUNDS = 2;
+
+/* A search decision's cap. Its text is never the answer — a model that
+ * answers instead of calling a tool is cut off here, and that half-answer is
+ * dropped in favour of the real reply. runpod.js uses it to tell a
+ * decision's job from a reply when recovering one by time. */
+export const DECISION_MAX_TOKENS = 700;
 export const ROUND_CEILING = 10;
 
 /* A wall clock as well as a count: ten rounds of a slow model is minutes of
@@ -196,6 +202,9 @@ export async function resolveTools({
   promptBudget = 0,
   // A self-hosted model's decisions go through RunPod jobs (runpodChatFetch).
   fetchImpl = fetch,
+  // Aborted when the browser goes away: stop deciding, so the reply is sent
+  // while the Worker still can be (see the chat route).
+  signal = null,
 }) {
   const messages = body.messages.slice();
   const calls = [];
@@ -212,6 +221,10 @@ export async function resolveTools({
   const roundBudget = promptBudget > 0 ? Math.max(1000, promptBudget - 700) : 0;
 
   for (rounds = 1; rounds <= limit; rounds++) {
+    if (signal?.aborted) {
+      stoppedBecause = '接続が切れた';
+      break;
+    }
     if (started !== null && Date.now() - started > budgetMs) {
       stoppedBecause = '時間切れ';
       break;
@@ -241,7 +254,7 @@ export async function resolveTools({
        * switched off here regardless of what the answer itself will use. */
       chat_template_kwargs: { ...(body.chat_template_kwargs || {}), enable_thinking: false },
       // Enough for a tool call and its arguments, and no more.
-      max_tokens: 700,
+      max_tokens: DECISION_MAX_TOKENS,
     };
 
     const res = await fetchImpl(url, {
@@ -251,6 +264,10 @@ export async function resolveTools({
       // A cold GPU answers the first request in minutes, not seconds.
       signal: AbortSignal.timeout(timeoutMs),
     });
+    if (signal?.aborted) {
+      stoppedBecause = '接続が切れた';
+      break;
+    }
     /* A failure here is not fatal: fall through and answer with what there
      * is. But it says why — "HTTP 400" alone was all there was to go on when
      * the reason was a context overflow. */

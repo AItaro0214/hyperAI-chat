@@ -327,6 +327,19 @@ rooms.post('/:id/messages/:mid/recover', async (c) => {
     });
   }
 
+  /* Stopped while still deciding whether to search: no reply job was ever
+   * sent, so there is no reply to find — only decisions, whose text is a
+   * half-answer cut off at 700 tokens. Matching by time would take one. */
+  const msgMeta = parseJson(msg.meta, {}) || {};
+  if (msgMeta.phase === 'deciding' && !msgMeta.runpodJob) {
+    const why = '検索の判断の途中で止まったため、返答は作られていません。もう一度送ってください。';
+    await c.env.DB.prepare('UPDATE messages SET error = ?, meta = ? WHERE id = ?')
+      .bind(msg.error || why, JSON.stringify({ ...msgMeta, partial: false }), msg.id)
+      .run();
+    const updated = await c.env.DB.prepare('SELECT * FROM messages WHERE id = ?').bind(msg.id).first();
+    return c.json({ ok: false, reason: why, message: shapeMessage(updated) });
+  }
+
   const settings = await getSettings(c.env);
   const endpointId = settings.runpodEndpointId;
   if (!endpointId) return c.json({ error: 'ブレイクスルー用のエンドポイントが設定されていません' }, 400);

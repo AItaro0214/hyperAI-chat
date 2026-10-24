@@ -451,6 +451,15 @@ const SHORT_REPLY = {
 check('診断の probe は答えではない', isAppJob(extractCompletion(PROBE_OUT)) === true, JSON.stringify(extractCompletion(PROBE_OUT)).slice(0, 100));
 check('  起動の warm（1 トークンで打ち切り）も答えではない', isAppJob(extractCompletion(WARM_OUT)) === true);
 check('  短くても普通に終わった返答は答え', isAppJob(extractCompletion(SHORT_REPLY)) === false);
+// Production, created_at 1792828078: a search decision that answered instead
+// of calling a tool, cut off at its 700-token cap, was recovered as the reply.
+const DECISION_OUT = {
+  status: 'COMPLETED',
+  output: [{ object: 'chat.completion', created: 1792828080, choices: [{ message: { content: '途中の答え' }, finish_reason: 'length' }], usage: { completion_tokens: 700 } }],
+};
+check('  700 トークンで切れた検索の判断も答えではない', isAppJob(extractCompletion(DECISION_OUT)) === true);
+const LONG_REPLY = { status: 'COMPLETED', output: [{ choices: [{ message: { content: '長い返答' }, finish_reason: 'length' }], usage: { completion_tokens: 16384 } }] };
+check('  上限まで書いて切れた本番の返答は答え', isAppJob(extractCompletion(LONG_REPLY)) === false);
 check('  記録した ID は形に関係なく除く', isAppJob(extractCompletion(SHORT_REPLY), 'j1', new Set(['j1'])) === true);
 check('ID の記録: 新しい順に 40 件まで、重複なし',
   rememberOwnJob(['a', 'b'], 'b').join() === 'b,a' && rememberOwnJob(Array.from({ length: 50 }, (_, i) => 'x' + i), 'n').length === 40);

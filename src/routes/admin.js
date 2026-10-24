@@ -60,11 +60,10 @@ import {
   cachedModels,
   describeModelCache,
   applyGpuChoice,
-  OWN_JOBS_KEY,
-  rememberOwnJob,
   DEFAULT_SPEC,
 } from '../lib/runpod.js';
 import { SEARCH_MODES, BACKEND_NOTES, MODE_LABELS, availableEngines } from '../lib/search.js';
+import { noteAppJob } from '../lib/runpod-jobs.js';
 import { keyUsage, accountCredits, utcWindows } from '../lib/generation.js';
 
 const admin = new Hono();
@@ -295,11 +294,7 @@ async function describeWarming(env, live) {
 
 /* Jobs the app sends for itself are written down, so "RunPod から回収"
  * never takes one of them for a reply (recoverReply's ownJobs). */
-async function noteOwnJob(env, jobId) {
-  if (!jobId) return;
-  const list = await getJsonSetting(env, OWN_JOBS_KEY, []);
-  await setJsonSetting(env, OWN_JOBS_KEY, rememberOwnJob(list, jobId));
-}
+const noteOwnJob = noteAppJob;
 
 /** Drives the warm-up, recording progress where any instance can read it. */
 async function runWarm(env, key, endpointId) {

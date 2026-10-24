@@ -14,6 +14,8 @@
  * chat path, the agent loop, tool calling — works unchanged against a
  * different base URL. */
 
+import { DECISION_MAX_TOKENS } from './chat-tools.js';
+
 const REST = 'https://rest.runpod.io/v1';
 const RUN = 'https://api.runpod.ai/v2';
 export const RUN_BASE = RUN;
@@ -1176,8 +1178,11 @@ export function extractCompletion(job) {
   };
 }
 
-/* The most tokens a job of the app's own (warm-up, diagnosis) asks for. */
-const APP_JOB_MAX_TOKENS = 16;
+/* The most tokens a job of the app's own asks for: the warm-up 1, the
+ * diagnosis 8, a search decision 700. A decision whose model wrote an answer
+ * instead of calling a tool is cut off at exactly that, and its half-answer
+ * was once recovered as the reply (production, created_at 1792828078). */
+const APP_JOB_MAX_TOKENS = DECISION_MAX_TOKENS;
 
 /**
  * Whether a finished job is one the app sent for itself — the diagnosis

@@ -5,7 +5,7 @@ import { requireAuth } from '../lib/guard.js';
 import { getSettings, logUsage } from '../lib/store.js';
 import { getCatalog, findModel, estimateChatCost } from '../lib/models.js';
 import { openaiBase as runpodBase, describeStartup } from '../lib/runpod.js';
-import { runpodChatFetch, webhookUrl, queueNotice } from '../lib/runpod-jobs.js';
+import { runpodChatFetch, webhookUrl, queueNotice, noteAppJob } from '../lib/runpod-jobs.js';
 import {
   webSearch as webSearch2,
   webFetch as webFetch2,
@@ -375,6 +375,17 @@ chat.post('/chat', async (c) => {
      * and the reply is still to come. */
     let runpodJob = null;
     let detached = false;
+    /* Breakthrough only: where the turn is — 'deciding' (search decisions)
+     * until the reply job exists. Saved, so a turn that stopped before its
+     * reply can say so instead of having a decision taken for its answer. */
+    let turnPhase = null;
+    // The search decisions' jobs: never a reply, whatever their text.
+    const decisionJobs = [];
+
+    /* The browser going away is noticed on the next write, and aborts the
+     * search decisions: a Worker gets 30 seconds after a disconnect, and the
+     * reply job has to be submitted within them (see the decision phase). */
+    const disconnect = new AbortController();
 
     // Once the browser goes away, keep draining the provider so the answer is
     // still saved to the room instead of being lost mid-flight.
@@ -384,6 +395,7 @@ chat.post('/chat', async (c) => {
         await sse(writer, event, data);
       } catch {
         clientGone = true;
+        disconnect.abort();
       }
     };
     const setPhase = async (next) => {
@@ -432,6 +444,8 @@ chat.post('/chat', async (c) => {
         elapsed: now() - startedAt,
       };
       if (startup) base.startup = startup;
+      if (turnPhase && !final) base.phase = turnPhase;
+      if (decisionJobs.length) base.decisionJobs = decisionJobs.slice(0, 20);
       if (runpodJob) {
         base.runpodJob = {
           ...runpodJob,
@@ -495,13 +509,26 @@ chat.post('/chat', async (c) => {
         emit('meta', { notices: [queueNotice(s)] }).catch(() => {});
       };
       const decisionFetch = breakthroughOn
-        ? runpodChatFetch(apiKey, settings.runpodEndpointId, { onStatus: onWaitStatus })
+        ? runpodChatFetch(apiKey, settings.runpodEndpointId, {
+            onStatus: onWaitStatus,
+            // Stops waiting when the browser goes; the reply goes out instead.
+            signal: disconnect.signal,
+            /* Recorded on the message and as an app job, so recovery by time
+             * can never take a decision's text — a model that answered
+             * instead of calling a tool, cut off at 700 tokens — for the
+             * reply. That is how a half-answer became one in production. */
+            onJob: async (jobId) => {
+              decisionJobs.push(jobId);
+              await noteAppJob(c.env, jobId).catch(() => {});
+            },
+          })
         : undefined;
       const replyFetch = breakthroughOn
         ? runpodChatFetch(apiKey, settings.runpodEndpointId, {
             webhook: await webhookUrl(c.env, assistantId),
             onJob: async (jobId) => {
               runpodJob = { id: jobId, endpointId: settings.runpodEndpointId, submittedAt: Date.now(), status: 'IN_QUEUE' };
+              turnPhase = 'replying';
               await savePartial(false, { force: true });
             },
             onStatus: (s) => {
@@ -521,10 +548,21 @@ chat.post('/chat', async (c) => {
        * none, nothing is spent and the reply streams as usual. */
       if (breakthroughOn && webSearch) {
         await setPhase('searching');
+        // Saved now, so a turn that stops here is known to have stopped here.
+        turnPhase = 'deciding';
+        await savePartial(false, { force: true });
+        /* A disconnect is noticed only on a write, and the decisions can sit
+         * in RunPod's queue for many minutes with nothing to write. This
+         * writes every five seconds, so it is noticed within the 30 seconds a
+         * Worker has left — enough to cancel the decision and send the reply. */
+        const heartbeat = setInterval(() => emit('ping', {}).catch(() => {}), 5000);
         const searchMode = settings.searchBackend || 'ollama';
         // Under CHOOSE the model is offered whichever of Brave and Exa have keys.
         const engines = searchMode === CHOOSE ? await availableEngines(c.env).catch(() => []) : [];
         const promptBudget = promptBudgetFor(modelMeta.context);
+        /* Whatever happens to the decisions, the reply goes out after them:
+         * a decision's own text is never the answer (resolveTools drops it),
+         * and a phase that throws or is cut short still leads to the reply. */
         const phase = await resolveTools({
           url: req.url,
           headers: req.headers,
@@ -533,6 +571,7 @@ chat.post('/chat', async (c) => {
           maxRounds: Number(settings.searchRounds) || 2,
           promptBudget,
           fetchImpl: decisionFetch,
+          signal: disconnect.signal,
           /* The decisions come back whole rather than streamed, and carry the
            * worker's startup details too — and on a cold start the first of
            * them is the request that woke it. */
@@ -590,7 +629,9 @@ chat.post('/chat', async (c) => {
             }
             return '未知のツールです: ' + name;
           },
-        });
+        })
+          .catch((e) => ({ messages: req.body.messages, calls: [], failed: String(e?.message || e).slice(0, 300) }))
+          .finally(() => clearInterval(heartbeat));
         req.body.messages = phase.messages;
         // The reply is sent with every result so far; it has to fit as well.
         if (shrinkToolResults(req.body.messages, promptBudget)) {
@@ -601,7 +642,11 @@ chat.post('/chat', async (c) => {
          * failure most of all. */
         const phaseNotes = [];
         if (phase.calls.length) phaseNotes.push('ウェブを ' + phase.calls.length + ' 回調べました');
-        if (phase.stoppedBecause) phaseNotes.push('検索を打ち切りました（' + phase.stoppedBecause + '）');
+        if (phase.stoppedBecause === '接続が切れた') {
+          phaseNotes.push('接続が切れたため検索を打ち切り、回答を作ります（終わると自動でここに入ります）');
+        } else if (phase.stoppedBecause) {
+          phaseNotes.push('検索を打ち切りました（' + phase.stoppedBecause + '）');
+        }
         if (phase.failed) {
           phaseNotes.push(
             (phase.calls.length ? '検索の途中で' : '検索するかの判断で') +

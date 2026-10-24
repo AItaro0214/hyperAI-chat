@@ -19,8 +19,25 @@
  * /run results are kept for 30 minutes after the job ends; 2 alone covers
  * that, and 3 and 4 are there for when it does not arrive. */
 
-import { RUN_BASE, JOB_WAIT_MS, JOB_EXECUTION_MS, JOB_TTL_MS, extractCompletion, failedReason } from './runpod.js';
-import { getApiKey } from './store.js';
+import {
+  RUN_BASE,
+  JOB_WAIT_MS,
+  JOB_EXECUTION_MS,
+  JOB_TTL_MS,
+  OWN_JOBS_KEY,
+  extractCompletion,
+  failedReason,
+  rememberOwnJob,
+} from './runpod.js';
+import { getApiKey, getJsonSetting, setJsonSetting } from './store.js';
+
+/* A job the app sent for itself — a search decision, the warm-up, the
+ * diagnosis — written down so recovery by time never takes it for a reply. */
+export async function noteAppJob(env, jobId) {
+  if (!jobId) return;
+  const list = await getJsonSetting(env, OWN_JOBS_KEY, []);
+  await setJsonSetting(env, OWN_JOBS_KEY, rememberOwnJob(list, jobId));
+}
 import { hmacSha256, b64url, timingSafeEqual } from './crypto.js';
 
 export { JOB_WAIT_MS, JOB_EXECUTION_MS, JOB_TTL_MS };
@@ -76,7 +93,15 @@ export function itemToSse(output) {
   return 'data: ' + JSON.stringify(output) + '\n\n';
 }
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const sleep = (ms, signal) =>
+  new Promise((resolve) => {
+    if (signal?.aborted) return resolve();
+    const t = setTimeout(resolve, ms);
+    signal?.addEventListener('abort', () => {
+      clearTimeout(t);
+      resolve();
+    }, { once: true });
+  });
 
 /**
  * A drop-in for fetch(url, {body}) that runs the chat completion as a /run
@@ -92,7 +117,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
  * @param {(s: {status: string, waitedMs: number, output: boolean}) => void} [o.onStatus]
  * @param {() => void} [o.onDetach]  the poll budget ran out; the job carries on unfollowed
  */
-export function runpodChatFetch(apiKey, endpointId, { webhook, onJob, onStatus, onDetach, waitMs = JOB_WAIT_MS, poll = POLL } = {}) {
+export function runpodChatFetch(apiKey, endpointId, { webhook, onJob, onStatus, onDetach, signal, waitMs = JOB_WAIT_MS, poll = POLL } = {}) {
   return async (_url, init = {}) => {
     const body = typeof init.body === 'string' ? JSON.parse(init.body) : init.body || {};
     const jobId = await submitChatJob(apiKey, endpointId, body, { webhook });
@@ -120,9 +145,20 @@ export function runpodChatFetch(apiKey, endpointId, { webhook, onJob, onStatus, 
       await cancelJob(apiKey, endpointId, jobId);
       return failure('TIMED_OUT', { error: '2時間以内に終わらなかったため、ジョブを止めました（待ち行列・起動・生成の合計）' });
     };
+    /* Called off by the caller (the browser went away during a search
+     * decision): the job is cancelled — it would only hold the queue — and
+     * an error status comes back at once, so the caller can move on. */
+    const aborted = async () => {
+      await cancelJob(apiKey, endpointId, jobId);
+      return new Response(JSON.stringify({ error: { message: '打ち切りました（接続が切れたため）' } }), {
+        status: 499,
+        headers: { 'content-type': 'application/json', 'x-runpod-job': jobId },
+      });
+    };
 
     if (!body.stream) {
       for (;;) {
+        if (signal?.aborted) return aborted();
         const job = await get('/status');
         onStatus?.({ status: job.status, waitedMs: Date.now() - started, output: false });
         if (job.status === 'COMPLETED') {
@@ -136,7 +172,7 @@ export function runpodChatFetch(apiKey, endpointId, { webhook, onJob, onStatus, 
           onDetach?.();
           return failure('DETACHED', { error: '応答の追跡を打ち切りました（ジョブは RunPod で続いています）' });
         }
-        await sleep(delay);
+        await sleep(delay, signal);
         delay = Math.min(poll.maxMs, Math.ceil(delay * 1.5));
       }
     }
@@ -145,6 +181,7 @@ export function runpodChatFetch(apiKey, endpointId, { webhook, onJob, onStatus, 
     // still comes back as an error status rather than an empty stream.
     let first = null;
     for (;;) {
+      if (signal?.aborted) return aborted();
       const s = await get('/stream');
       const items = Array.isArray(s.stream) ? s.stream : [];
       onStatus?.({ status: s.status, waitedMs: Date.now() - started, output: items.length > 0 });
@@ -162,7 +199,7 @@ export function runpodChatFetch(apiKey, endpointId, { webhook, onJob, onStatus, 
         onDetach?.();
         return failure('DETACHED', { error: '応答の追跡を打ち切りました（ジョブは RunPod で続いています）' });
       }
-      await sleep(delay);
+      await sleep(delay, signal);
       delay = Math.min(poll.maxMs, Math.ceil(delay * 1.5));
     }
 

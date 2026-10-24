@@ -143,6 +143,18 @@ res = await runpodChatFetch('k', 'ep', { poll: { minMs: 1, maxMs: 1, budget: 3 }
 });
 check('追跡の上限: 切り離すがジョブは止めない', detached && !calls.some((c) => c.startsWith('/cancel/')), calls.join(' '));
 
+// The caller gives up (the browser went away during a decision): the wait
+// ends at once and the job is cancelled, not left holding the queue.
+calls = fakeRunPod({ status: [{ status: 'IN_QUEUE' }] });
+const stop = new AbortController();
+setTimeout(() => stop.abort(), 30);
+const abortStarted = Date.now();
+res = await runpodChatFetch('k', 'ep', { poll: { minMs: 10000, maxMs: 10000, budget: 50 }, signal: stop.signal })('u', {
+  body: JSON.stringify({ stream: false }),
+});
+check('打ち切り: 待たずに返し、ジョブを取り消す', res.status === 499 && Date.now() - abortStarted < 2000 && calls.some((c) => c.startsWith('/cancel/job-9')),
+  (Date.now() - abortStarted) + 'ms ' + calls.join(' '));
+
 check('待ち行列の表示', queueNotice({ status: 'IN_QUEUE', waitedMs: 754000 }).includes('待ち行列') && queueNotice({ status: 'IN_QUEUE', waitedMs: 754000 }).includes('12分34秒'));
 check('  起動中の表示', queueNotice({ status: 'IN_PROGRESS', waitedMs: 30000 }).includes('起動・読み込み中'));
 
