@@ -52,6 +52,7 @@ import {
   imageFor,
   attachModel,
   modelReference,
+  modelCacheResult,
   DEFAULT_SPEC,
 } from '../lib/runpod.js';
 import { SEARCH_MODES, BACKEND_NOTES, MODE_LABELS, availableEngines } from '../lib/search.js';
@@ -329,7 +330,11 @@ admin.get('/breakthrough', async (c) => {
     image: imageFor(DEFAULT_SPEC),
     // What RunPod's console takes in the Model field, for setting it by hand.
     modelReference: DEFAULT_SPEC.cacheModel ? modelReference(DEFAULT_SPEC) : null,
-    modelCache: settings.runpodModelCache || null,
+    /* Re-judged from the stored references: records written before a
+     * resolved ":<sha>" counted as a match still say ok:false. */
+    modelCache: settings.runpodModelCache?.refs
+      ? { ...settings.runpodModelCache, ...modelCacheResult(settings.runpodModelCache.refs, settings.runpodModelCache.value) }
+      : settings.runpodModelCache || null,
     warming: await describeWarming(c.env, live),
   });
 });
@@ -422,7 +427,7 @@ admin.post('/breakthrough/cache', async (c) => {
   if (!settings.runpodEndpointId) return c.json({ error: 'エンドポイントがありません' }, 400);
   const value = modelReference(DEFAULT_SPEC);
   const result = await attachModel(key, settings.runpodEndpointId, [value])
-    .then((refs) => ({ ok: refs.includes(value), refs, value }))
+    .then((refs) => modelCacheResult(refs, value))
     .catch((e) => ({ ok: false, error: e.message, value }));
   await saveSettings(c.env, { runpodModelCache: { ...result, at: Date.now() } });
   return c.json(result, result.ok ? 200 : 502);

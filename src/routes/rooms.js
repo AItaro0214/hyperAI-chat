@@ -309,17 +309,32 @@ rooms.post('/:id/messages/:mid/recover', async (c) => {
     return c.json({ error: 'RunPod に問い合わせできませんでした: ' + String(e?.message || e).slice(0, 300) }, 502);
   }
 
+  const failedJobs = result.failed || [];
   if (!result.found) {
     const waiting = result.pending.length;
+    /* No reply to bring back, but a failed job says why there is none. That
+     * reason is written to the message, so it is still there after RunPod
+     * forgets the job. */
+    if (!waiting && failedJobs.length) {
+      const why = 'RunPod のジョブが失敗していました: ' + failedJobs[0].error;
+      const meta = { ...(parseJson(msg.meta, {}) || {}), partial: false, runpodFailures: failedJobs };
+      await c.env.DB.prepare('UPDATE messages SET error = ?, meta = ? WHERE id = ?')
+        .bind(msg.error || why, JSON.stringify(meta), msg.id)
+        .run();
+      const updated = await c.env.DB.prepare('SELECT * FROM messages WHERE id = ?').bind(msg.id).first();
+      return c.json({ ok: false, failed: failedJobs, reason: why, message: shapeMessage(updated) });
+    }
     return c.json({
       ok: false,
       pending: waiting,
       checked: result.checked,
       reason: waiting
         ? '同じエンドポイントでまだ実行中のジョブが ' + waiting + ' 件あります。完了後にもう一度お試しください。'
-        : result.checked
-          ? '完了済みジョブは ' + result.checked + ' 件見つかりましたが、本文が取り出せませんでした。'
-          : 'RunPod 側に残っているジョブがありません。保持期間（約30分）を過ぎた可能性があります。',
+        : result.decisions
+          ? '残っているのは検索の判断のジョブだけで、返答のジョブは見つかりませんでした。'
+          : result.checked
+            ? '完了済みジョブは ' + result.checked + ' 件見つかりましたが、本文が取り出せませんでした。'
+            : 'RunPod 側に残っているジョブがありません。保持期間（約30分）を過ぎた可能性があります。',
     });
   }
 
@@ -333,7 +348,14 @@ rooms.post('/:id/messages/:mid/recover', async (c) => {
     ...(parseJson(msg.meta, {}) || {}),
     partial: false,
     abandoned: false,
-    recovered: { jobId: reply.jobId, at: now(), matched: !!result.matched },
+    recovered: {
+      jobId: reply.jobId,
+      at: now(),
+      matched: !!result.matched,
+      // The error column is cleared below; what it said is kept here.
+      ...(msg.error ? { previousError: String(msg.error).slice(0, 600) } : {}),
+      ...(failedJobs.length ? { failedJobs } : {}),
+    },
   };
 
   await c.env.DB.prepare(

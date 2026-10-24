@@ -84,6 +84,77 @@ export function chatTools({ engines = [], strengths = {} } = {}) {
 
 export const CHAT_TOOLS = chatTools();
 
+/* ---------------------------- context budget ----------------------------
+ * Every search adds its results to the conversation, and they are sent again
+ * with every later round and with the reply. Ten searches came to 34,479
+ * tokens against a 32,768 window: llama-server refused the request, the job
+ * failed, and the reply was never written. So the tool phase keeps to a
+ * budget, shrinking old results before it would run out.
+ *
+ * The same pessimistic ratio as estimateTokens in chat.js (not imported:
+ * chat.js imports this module). Tool-call arguments count too. */
+const CHARS_PER_TOKEN = 1.5;
+const MIN_TOOL_CHARS = 400;
+
+export function approxTokens(messages) {
+  let chars = 0;
+  for (const m of messages) {
+    chars += 24;
+    if (typeof m.content === 'string') chars += m.content.length;
+    else if (Array.isArray(m.content)) for (const p of m.content) chars += String(p?.text || '').length;
+    for (const call of m.tool_calls || []) chars += String(call.function?.arguments || '').length + 40;
+  }
+  return Math.ceil(chars / CHARS_PER_TOKEN);
+}
+
+/**
+ * The prompt a self-hosted model can take while still leaving the reply room
+ * to be written: its window less a quarter (at most 8K) for the answer.
+ */
+export function promptBudgetFor(context) {
+  const ctx = Number(context) || 32768;
+  return ctx - Math.min(8192, Math.floor(ctx / 4)) - 512;
+}
+
+/**
+ * Cuts tool results down until the conversation fits `budget` tokens: the
+ * longest result is halved first, so nothing is dropped outright while there
+ * is any room. Returns how many cuts it made; the array is changed in place.
+ */
+export function shrinkToolResults(messages, budget) {
+  let cuts = 0;
+  while (approxTokens(messages) > budget) {
+    let longest = null;
+    for (const m of messages) {
+      if (m.role !== 'tool' || typeof m.content !== 'string' || m.content.length <= MIN_TOOL_CHARS) continue;
+      if (!longest || m.content.length > longest.content.length) longest = m;
+    }
+    if (!longest) break;
+    const keep = Math.max(MIN_TOOL_CHARS, Math.floor(longest.content.length / 2));
+    longest.content = longest.content.slice(0, keep) + '\n…（会話の長さの上限のため、以降を省略しました）';
+    cuts++;
+  }
+  return cuts;
+}
+
+/* The useful part of an error body: RunPod and llama-server nest the message
+ * in JSON, sometimes JSON inside a string. */
+export function errorText(raw) {
+  let text = String(raw || '');
+  for (let i = 0; i < 3; i++) {
+    let parsed;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      break;
+    }
+    const next = typeof parsed === 'string' ? parsed : parsed?.error?.message ?? parsed?.error ?? parsed?.message ?? null;
+    if (next === null || next === undefined) break;
+    text = typeof next === 'string' ? next : JSON.stringify(next);
+  }
+  return text.slice(0, 300);
+}
+
 /** Reasoning depth, as the one control a self-hosted Qwen actually has. */
 export function thinkingFor(effort) {
   // Seven levels upstream, a switch here; treating "off"/"none"/"minimal" as
@@ -98,6 +169,8 @@ export function thinkingFor(effort) {
  * @param {object} config
  * @param {(name: string, args: object) => Promise<string>} config.execute
  * @param {(phase: string, detail?: object) => Promise<void>|void} [config.onPhase]
+ * @param {(json: object) => Promise<void>|void} [config.onReply] each decision's raw response
+ * @param {number} [config.promptBudget] tokens the conversation may use; unset = unbounded
  * @returns {Promise<{messages: object[], calls: string[], rounds: number}>}
  */
 export async function resolveTools({
@@ -106,10 +179,12 @@ export async function resolveTools({
   body,
   execute,
   onPhase,
+  onReply,
   tools = CHAT_TOOLS,
   maxRounds = MAX_ROUNDS,
   timeoutMs = 900000,
   budgetMs = DEFAULT_BUDGET_MS,
+  promptBudget = 0,
 }) {
   const messages = body.messages.slice();
   const calls = [];
@@ -119,10 +194,22 @@ export async function resolveTools({
   let rounds = 0;
   let stoppedBecause = null;
 
+  // Each decision asks for up to 700 tokens on top of its prompt.
+  const roundBudget = promptBudget > 0 ? Math.max(1000, promptBudget - 700) : 0;
+
   for (rounds = 1; rounds <= limit; rounds++) {
     if (Date.now() - started > budgetMs) {
       stoppedBecause = '時間切れ';
       break;
+    }
+    /* Out of room: shrink what is there, and if even that is not enough
+     * there is no space for another search's results anyway. */
+    if (roundBudget && approxTokens(messages) > roundBudget) {
+      shrinkToolResults(messages, roundBudget);
+      if (approxTokens(messages) > roundBudget * 0.85) {
+        stoppedBecause = '会話の長さの上限';
+        break;
+      }
     }
     await onPhase?.('deciding', { round: rounds, of: limit });
     const probe = {
@@ -150,11 +237,16 @@ export async function resolveTools({
       // A cold GPU answers the first request in minutes, not seconds.
       signal: AbortSignal.timeout(timeoutMs),
     });
-    // A model or endpoint that cannot do tools should still be able to answer,
-    // so a failure here is not fatal: fall through with what we have.
-    if (!res.ok) return { messages, calls, rounds: rounds - 1, failed: 'HTTP ' + res.status };
+    /* A failure here is not fatal: fall through and answer with what there
+     * is. But it says why — "HTTP 400" alone was all there was to go on when
+     * the reason was a context overflow. */
+    if (!res.ok) {
+      const detail = typeof res.text === 'function' ? await res.text().catch(() => '') : '';
+      return { messages, calls, rounds: rounds - 1, failed: 'HTTP ' + res.status + (detail ? ': ' + errorText(detail) : '') };
+    }
 
     const json = await res.json().catch(() => null);
+    if (json) await onReply?.(json);
     const message = json?.choices?.[0]?.message;
     const wanted = message?.tool_calls || [];
     if (!wanted.length) return { messages, calls, rounds: rounds - 1 };

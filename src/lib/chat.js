@@ -237,7 +237,8 @@ export function fitToContext({ messages, modelMeta, requestedMax, toolHeavy = fa
 }
 
 export function isContextError(message) {
-  return /reduce the length|context length|too long|maximum context|context_length_exceeded|tokens? per request/i.test(
+  // "exceeds the available context size" / exceed_context_size_error is llama-server's.
+  return /reduce the length|context length|context size|exceed_context_size|too long|maximum context|context_length_exceeded|tokens? per request/i.test(
     String(message || '')
   );
 }

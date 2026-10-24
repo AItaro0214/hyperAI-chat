@@ -676,6 +676,14 @@ function recoverRow(msg) {
     try {
       const res = await api('/api/rooms/' + state.roomId + '/messages/' + msg.id + '/recover', { method: 'POST' });
       if (!res.ok) {
+        // A failed job's reason is now on the message itself; show it there.
+        if (res.message) {
+          const at = state.messages.findIndex((m) => m.id === msg.id);
+          if (at >= 0) state.messages[at] = res.message;
+          renderMessages();
+          toast(res.reason, 'err');
+          return;
+        }
         note.textContent = res.reason || '回収できませんでした';
         btn.disabled = false;
         return;
@@ -2172,7 +2180,13 @@ function modelCacheNote(bt) {
   if (!bt.modelReference) return '';
   const mc = bt.modelCache;
   if (mc?.ok) {
-    return '<p class="xs muted"><span class="ok">モデルのキャッシュを設定済み</span>: <code>' + esc(mc.value) + '</code></p>';
+    // RunPod pins ":main" to the commit it resolved to; that is what is cached.
+    const sha = /:([0-9a-f]{12,})$/i.exec(mc.resolved || '')?.[1];
+    return (
+      '<p class="xs muted"><span class="ok">モデルのキャッシュを設定済み</span>: <code>' + esc(mc.resolved || mc.value) + '</code>' +
+      (sha ? '<br>（main をコミット ' + esc(sha.slice(0, 12)) + ' に固定して保存しています）' : '') +
+      '</p>'
+    );
   }
   return (
     '<p class="xs"><span class="warn">モデルのキャッシュが' + (mc ? '設定できませんでした' : '未設定です') + '</span>' +

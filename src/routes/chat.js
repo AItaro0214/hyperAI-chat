@@ -14,7 +14,7 @@ import {
   ENGINE_STRENGTHS,
   CHOOSE,
 } from '../lib/search.js';
-import { resolveTools, thinkingFor, chatTools } from '../lib/chat-tools.js';
+import { resolveTools, thinkingFor, chatTools, promptBudgetFor, shrinkToolResults } from '../lib/chat-tools.js';
 import {
   buildMessages,
   buildRequest,
@@ -479,12 +479,22 @@ chat.post('/chat', async (c) => {
         const searchMode = settings.searchBackend || 'ollama';
         // Under CHOOSE the model is offered whichever of Brave and Exa have keys.
         const engines = searchMode === CHOOSE ? await availableEngines(c.env).catch(() => []) : [];
+        const promptBudget = promptBudgetFor(modelMeta.context);
         const phase = await resolveTools({
           url: req.url,
           headers: req.headers,
           body: req.body,
           tools: chatTools({ engines, strengths: ENGINE_STRENGTHS }),
           maxRounds: Number(settings.searchRounds) || 2,
+          promptBudget,
+          /* The decisions come back whole rather than streamed, and carry the
+           * worker's startup details too — and on a cold start the first of
+           * them is the request that woke it. */
+          onReply: async (json) => {
+            if (startup || !json?.hyperai_worker) return;
+            startup = describeStartup(json.hyperai_worker, startedAt);
+            if (startup) await emit('worker', startup);
+          },
           onPhase: (kind, detail) => {
             const text =
               kind === 'deciding'
@@ -536,14 +546,25 @@ chat.post('/chat', async (c) => {
           },
         });
         req.body.messages = phase.messages;
-        if (phase.calls.length) {
-          await emit('meta', { notices: ['ウェブを ' + phase.calls.length + ' 回調べました'] });
+        // The reply is sent with every result so far; it has to fit as well.
+        if (shrinkToolResults(req.body.messages, promptBudget)) {
+          req.notices.push('検索結果が長いため、一部を省略して回答します');
         }
-        if (phase.stoppedBecause) {
-          await emit('meta', { notices: ['検索を打ち切りました（' + phase.stoppedBecause + '）'] });
-        }
+        /* Kept in req.notices, which is saved with the reply — what happened
+         * during the search should still be readable after a reload, a
+         * failure most of all. */
+        const phaseNotes = [];
+        if (phase.calls.length) phaseNotes.push('ウェブを ' + phase.calls.length + ' 回調べました');
+        if (phase.stoppedBecause) phaseNotes.push('検索を打ち切りました（' + phase.stoppedBecause + '）');
         if (phase.failed) {
-          await emit('meta', { notices: ['ツール呼び出しに対応していないため、検索は行いませんでした'] });
+          phaseNotes.push(
+            (phase.calls.length ? '検索の途中で' : '検索するかの判断で') +
+              'モデルがエラーを返しました（' + phase.failed + '）。ここまでの情報で回答します'
+          );
+        }
+        if (phaseNotes.length) {
+          req.notices.push(...phaseNotes);
+          await emit('meta', { notices: req.notices });
         }
       }
 
@@ -584,7 +605,12 @@ chat.post('/chat', async (c) => {
           // Keep as much as possible: drop the older half rather than everything.
           const system = req.body.messages.filter((m) => m.role === 'system').slice(0, 1);
           const rest = req.body.messages.filter((m) => m.role !== 'system');
-          const kept = rest.length > 1 ? rest.slice(Math.ceil(rest.length / 2)) : rest;
+          let kept = rest.length > 1 ? rest.slice(Math.ceil(rest.length / 2)) : rest;
+          /* Start at a user turn. Cut anywhere else and a tool result can be
+           * left without the call it answers, which the chat template
+           * rejects — a second failure in place of the first. */
+          const firstUser = kept.findIndex((m) => m.role === 'user');
+          if (firstUser > 0) kept = kept.slice(firstUser);
           req.body.messages = [...system, ...(kept.length ? kept : rest.slice(-1))];
           req.notices.push('コンテキスト超過のため、古い ' + (rest.length - kept.length) + ' 件を除いて再実行しました');
           await emit('meta', {

@@ -31,6 +31,9 @@ check('  通常時は 131K なら削らない', plain.dropped === 0);
 
 check('コンテキスト超過エラーを判定', isContextError('Please reduce the length of the messages or completion.'));
 check('  他のエラーは誤判定しない', !isContextError('User not found.'));
+// Verbatim from a failed RunPod job: llama-server's wording.
+check('  llama-server の超過も判定', isContextError('request (34479 tokens) exceeds the available context size (32768 tokens), try increasing it'));
+check('  エラー種別だけでも判定', isContextError('{"type":"exceed_context_size_error"}'));
 
 check('compound は reasoning_effort 非対応', groqTakesReasoning('groq/compound') === false);
 check('  gpt-oss は対応', groqTakesReasoning('openai/gpt-oss-120b') === true);

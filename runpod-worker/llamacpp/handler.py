@@ -167,7 +167,8 @@ def start():
         pass
     print("[worker] " + " ".join(args), flush=True)
     started = time.time()
-    proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+    global PROC
+    proc = PROC = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
 
     def pump():
         for line in proc.stdout:
@@ -193,6 +194,28 @@ def start():
 
 
 STARTUP_ERROR = None
+PROC = None
+
+
+def failure(status=None, text="", exc=None):
+    """A failed job's output. RunPod keeps only the "error" string, and its
+    worker logs cannot be read from outside, so everything needed to explain
+    the failure goes into that string: llama-server's own message, whether it
+    is still running, and — when something went wrong in it rather than with
+    the request — the tail of its log."""
+    parts = []
+    if status is not None:
+        parts.append(f"llama-server {status}: {str(text)[:1500]}")
+    if exc is not None:
+        parts.append(f"{type(exc).__name__}: {str(exc)[:600]}")
+    dead = PROC is not None and PROC.poll() is not None
+    if dead:
+        parts.append(f"llama-server は終了しています（終了コード {PROC.returncode}）")
+    if exc is not None or dead or (status is not None and status >= 500):
+        tail = "\n".join(line[:300] for line in list(LOG)[-25:])
+        if tail:
+            parts.append("--- llama-server log（末尾） ---\n" + tail)
+    return {"error": "\n".join(parts)[:4000]}
 
 
 async def handler(job):
@@ -200,7 +223,17 @@ async def handler(job):
     if STARTUP_ERROR:
         yield {"error": "startup failed: " + STARTUP_ERROR, "worker": INFO}
         return
+    # Anything raised mid-request — llama-server dying under a stream, a reply
+    # that is not JSON — becomes a failure with its reason, not a bare one.
+    try:
+        async for item in serve(inp):
+            yield item
+    except Exception as e:  # noqa: BLE001
+        print("[worker] job failed: " + repr(e), flush=True)
+        yield failure(exc=e)
 
+
+async def serve(inp):
     async with httpx.AsyncClient(base_url=BASE, timeout=httpx.Timeout(None, connect=10)) as client:
         route = inp.get("openai_route")
         if route:
@@ -214,7 +247,7 @@ async def handler(job):
                 # which is where the app recovers lost replies from.
                 async with client.stream("POST", route, json=body) as res:
                     if res.status_code != 200:
-                        yield {"error": (await res.aread()).decode(errors="replace")[:2000], "status": res.status_code}
+                        yield failure(res.status_code, (await res.aread()).decode(errors="replace"))
                         return
                     # First, so the reader sees how the worker started as soon
                     # as the reply does.
@@ -225,7 +258,7 @@ async def handler(job):
                 return
             res = await client.post(route, json=body)
             if res.status_code != 200:
-                yield {"error": res.text[:2000], "status": res.status_code}
+                yield failure(res.status_code, res.text)
                 return
             yield {**res.json(), META_KEY: worker_meta()}
             return
@@ -237,7 +270,7 @@ async def handler(job):
             "/v1/completions",
             json={"prompt": inp.get("prompt") or "", "max_tokens": int(params.get("max_tokens", 16))},
         )
-        out = res.json() if res.status_code == 200 else {"error": res.text[:2000], "status": res.status_code}
+        out = res.json() if res.status_code == 200 else failure(res.status_code, res.text)
         if inp.get("worker_info"):
             out = {**out, "worker": INFO}
         yield out

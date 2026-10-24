@@ -27,7 +27,7 @@ export const VLLM_IMAGE = 'runpod/worker-v1-vllm:v2.27.1';
  * .github/workflows/llamacpp-worker.yml. The tag is the llama.cpp build it is
  * based on and the handler's WORKER_VERSION, pinned for the same reason as the
  * vLLM one; the workflow refuses to build if this does not match. */
-export const LLAMACPP_IMAGE = 'ghcr.io/aitaro0214/hyperai-llamacpp-worker:b11804-2';
+export const LLAMACPP_IMAGE = 'ghcr.io/aitaro0214/hyperai-llamacpp-worker:b11804-3';
 
 /* The previous model, on vLLM. Kept whole so going back is passing this as the
  * spec rather than reconstructing it from git. */
@@ -137,6 +137,27 @@ const QUANT_DISK_GB = { Q2_0: 67, IQ2_XS: 69, IQ3_XXS: 77, IQ3_S: 84 };
 
 /** The value RunPod's console takes in an endpoint's Model field. */
 export const modelReference = (spec = {}) => 'https://huggingface.co/' + resolveSpec(spec).model + ':main';
+
+/* "https://huggingface.co/<org>/<model>:<revision>" without the revision. */
+const refRepo = (ref) => String(ref || '').replace(/:[^:/]*$/, '').toLowerCase();
+
+/**
+ * Whether the references an endpoint reports include the one asked for.
+ *
+ * RunPod resolves a branch to the commit it points at, so ":main" comes back
+ * as ":<sha>". The repository is what has to match; the revision may be
+ * either. Returns the reference as RunPod holds it, or null.
+ */
+export function matchModelRef(refs, wanted) {
+  if (!Array.isArray(refs)) return null;
+  return refs.find((r) => refRepo(r) === refRepo(wanted)) || null;
+}
+
+/** A cache attempt's outcome, from the references RunPod reports back. */
+export function modelCacheResult(refs, value, extra = {}) {
+  const resolved = matchModelRef(refs, value);
+  return { ok: !!resolved, refs, value, resolved, ...extra };
+}
 
 export const DEFAULT_SPEC = LLAMACPP_SPEC;
 
@@ -381,7 +402,7 @@ export async function provision(apiKey, spec = {}) {
   if (s.engine === 'llamacpp' && s.cacheModel) {
     const ref = modelReference(s);
     modelCache = await attachModel(apiKey, endpointId, [ref])
-      .then((refs) => ({ ok: refs.includes(ref), refs, value: ref }))
+      .then((refs) => modelCacheResult(refs, ref))
       .catch((e) => ({ ok: false, error: e.message, value: ref }));
   }
   return { endpointId, templateId, base: openaiBase(endpointId), model: 'breakthrough', modelCache };
@@ -665,7 +686,7 @@ export async function diagnose(apiKey, endpointId) {
   if (DEFAULT_SPEC.engine === 'llamacpp' && DEFAULT_SPEC.cacheModel) {
     const value = modelReference(DEFAULT_SPEC);
     out.modelCache = await cachedModels(apiKey, endpointId)
-      .then((refs) => ({ attached: Array.isArray(refs) && refs.includes(value), refs, value }))
+      .then((refs) => ({ attached: !!matchModelRef(refs, value), resolved: matchModelRef(refs, value), refs, value }))
       .catch((e) => ({ attached: null, error: e.message, value }));
   }
 
@@ -806,6 +827,7 @@ export function extractCompletion(job) {
   let created = null;
   let chatId = null;
   let finishReason = null;
+  let toolCalls = false;
 
   for (const chunk of chunks) {
     if (chunk.usage) usage = chunk.usage;
@@ -821,6 +843,7 @@ export function extractCompletion(job) {
     // delta for a stream, message for a single completion; tokens is the
     // worker's own format.
     const part = choice.delta || choice.message || {};
+    if (Array.isArray(part.tool_calls) && part.tool_calls.length) toolCalls = true;
     if (typeof part.content === 'string') text += part.content;
     else if (Array.isArray(part.content)) {
       text += part.content.map((p) => (typeof p === 'string' ? p : p?.text || '')).join('');
@@ -831,7 +854,10 @@ export function extractCompletion(job) {
     if (Array.isArray(choice.tokens)) text += choice.tokens.join('');
   }
 
-  return { text, reasoning, usage, created, chatId, finishReason, status: job?.status || null };
+  /* A completion that asks for a tool is one of the search decisions, not a
+   * reply: its text is the preamble to a search ("もう少し調べます"). */
+  if (finishReason === 'tool_calls') toolCalls = true;
+  return { text, reasoning, usage, created, chatId, finishReason, toolCalls, status: job?.status || null };
 }
 
 /* How far from the message's own timestamp a job may sit and still be its
@@ -851,16 +877,30 @@ export async function recoverReply(apiKey, endpointId, { since = 0, limit = 8 } 
   const requests = await listRequests(apiKey, endpointId);
   const pending = requests.filter((r) => r.status === 'IN_QUEUE' || r.status === 'IN_PROGRESS');
   const done = requests.filter((r) => r.status === 'COMPLETED').slice(0, limit);
+  /* Failed jobs carry the reason — "request (34479 tokens) exceeds the
+   * available context size", say — which is often the whole answer to why a
+   * reply is missing. */
+  const failed = [];
+  for (const row of requests.filter((r) => r.status === 'FAILED').slice(0, 4)) {
+    const job = await fetchJob(apiKey, endpointId, row.id).catch(() => null);
+    failed.push({ jobId: row.id, error: failedReason(job) });
+  }
 
   const candidates = [];
+  let decisions = 0;
   for (const row of done) {
     const job = await fetchJob(apiKey, endpointId, row.id).catch(() => null);
     if (!job) continue;
     const reply = extractCompletion(job);
     if (!reply.text && !reply.reasoning) continue;
+    // A search decision is not the reply, however well its time matches.
+    if (reply.toolCalls) {
+      decisions++;
+      continue;
+    }
     candidates.push({ ...reply, jobId: row.id, executionTime: row.executionTime ?? null });
   }
-  if (!candidates.length) return { found: null, pending, checked: done.length };
+  if (!candidates.length) return { found: null, pending, failed, decisions, checked: done.length };
 
   /* Which job is this message's? The timestamps inside the chunks decide when
    * they are usable, and length breaks the tie when they are not — a job with
@@ -873,5 +913,23 @@ export async function recoverReply(apiKey, endpointId, { since = 0, limit = 8 } 
     ? pool.reduce((best, c) => (Math.abs(c.created - since) < Math.abs(best.created - since) ? c : best))
     : pool.reduce((best, c) => (c.text.length > best.text.length ? c : best));
 
-  return { found, pending, checked: done.length, matched: inWindow.length > 0 };
+  return { found, pending, failed, decisions, checked: done.length, matched: inWindow.length > 0 };
+}
+
+/** The reason a failed job gives, as plain text. */
+export function failedReason(job) {
+  let raw = job?.error ?? job?.output?.error ?? '';
+  if (typeof raw !== 'string') raw = JSON.stringify(raw);
+  // llama-server's error arrives as JSON inside the string.
+  for (let i = 0; i < 2; i++) {
+    try {
+      const parsed = JSON.parse(raw);
+      const inner = parsed?.error?.message ?? parsed?.error ?? parsed?.message;
+      if (inner === undefined || inner === null) break;
+      raw = typeof inner === 'string' ? inner : JSON.stringify(inner);
+    } catch {
+      break;
+    }
+  }
+  return String(raw || '理由が記録されていません').slice(0, 600);
 }

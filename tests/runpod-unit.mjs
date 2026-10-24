@@ -13,6 +13,10 @@ import {
   describeStartup,
   fmtDuration,
   extractCompletion,
+  matchModelRef,
+  modelCacheResult,
+  recoverReply,
+  failedReason,
   WORKER_META_KEY,
   DEFAULT_SPEC,
   VLLM_SPEC,
@@ -281,6 +285,51 @@ check('破棄はワーカーを 0 にしてから', calls[0] === 'PATCH /endpoin
 check('  エンドポイントを削除する', calls.includes('DELETE /endpoints/ep_9'));
 check('  テンプレートも削除する', calls.includes('DELETE /templates/tpl_9'));
 
+globalThis.fetch = realFetch;
+
+/* ---------------------- cache: RunPod pins ":main" to a SHA --------------- */
+// Verbatim from production: sent ":main", RunPod stored the commit.
+const SHA_REF = 'https://huggingface.co/SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF:eec4e10a2c29b440a2ae85591fa11569ce752963';
+check('キャッシュ: SHA に解決されていても成功', matchModelRef([SHA_REF], REF) === SHA_REF);
+check('  同じ値でも成功', matchModelRef([REF], REF) === REF);
+check('  別のリポジトリは失敗', matchModelRef(['https://huggingface.co/other/model:main'], REF) === null);
+check('  名前の一部だけ一致は失敗', matchModelRef([REF.replace('GGUF:main', 'GGUF-v2:main')], REF) === null);
+check('  一覧が無ければ失敗', matchModelRef(null, REF) === null && matchModelRef([], REF) === null);
+const stored = modelCacheResult([SHA_REF], REF);
+check('  解決後の値を残す（画面に出す）', stored.ok === true && stored.resolved === SHA_REF && stored.value === REF, JSON.stringify(stored));
+
+/* ------------------- recovery: decisions are not replies ------------------ */
+const decision = extractCompletion({
+  status: 'COMPLETED',
+  output: [{ choices: [{ finish_reason: 'tool_calls', message: { content: '法的な枠組みを確認しました。実務的な選択肢をもう少し調べます。', tool_calls: [{ id: 't' }] } }] }],
+});
+check('検索の判断（ツール呼び出し）と分かる', decision.toolCalls === true, JSON.stringify(decision).slice(0, 120));
+check('  普通の返答はそう扱わない', extractCompletion({ output: [{ choices: [{ finish_reason: 'stop', message: { content: '答え' } }] }] }).toolCalls === false);
+
+// Verbatim from the failed production job.
+const FAILED_JOB = {
+  status: 'FAILED',
+  error: '{"error":{"code":400,"message":"request (34479 tokens) exceeds the available context size (32768 tokens), try increasing it","type":"exceed_context_size_error","n_prompt_tokens":34479,"n_ctx":32768}}',
+};
+check('失敗の理由を読み出す', failedReason(FAILED_JOB).startsWith('request (34479 tokens) exceeds the available context size'), failedReason(FAILED_JOB));
+check('  理由が無ければそう言う', failedReason({ status: 'FAILED' }) === '理由が記録されていません');
+check('  ワーカーのログ付きの理由もそのまま', failedReason({ error: 'llama-server 500: boom\n--- llama-server log（末尾） ---\nCUDA error' }).includes('CUDA error'));
+
+const jobs = {
+  'job-decision': { status: 'COMPLETED', output: [{ created: 1000, choices: [{ finish_reason: 'tool_calls', message: { content: '調べます', tool_calls: [{}] } }] }] },
+  'job-failed': FAILED_JOB,
+};
+globalThis.fetch = async (url) => {
+  const u = String(url);
+  if (u.endsWith('/requests')) {
+    return { ok: true, status: 200, json: async () => ({ requests: [{ id: 'job-failed', status: 'FAILED' }, { id: 'job-decision', status: 'COMPLETED' }] }) };
+  }
+  const id = decodeURIComponent(u.split('/status/')[1] || '');
+  return { ok: true, status: 200, json: async () => jobs[id] };
+};
+const rec = await recoverReply('key', 'ep', { since: 1000 });
+check('回収: 判断のジョブを返答として取り込まない', rec.found === null && rec.decisions === 1, JSON.stringify(rec).slice(0, 200));
+check('  失敗したジョブの理由を返す', rec.failed.length === 1 && rec.failed[0].error.includes('34479'), JSON.stringify(rec.failed));
 globalThis.fetch = realFetch;
 
 const passed = results.filter(([ok]) => ok).length;

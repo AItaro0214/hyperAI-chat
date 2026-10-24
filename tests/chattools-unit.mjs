@@ -1,4 +1,15 @@
-import { CHAT_TOOLS, chatTools, thinkingFor, resolveTools, MAX_ROUNDS, ROUND_CEILING } from '../src/lib/chat-tools.js';
+import {
+  CHAT_TOOLS,
+  chatTools,
+  thinkingFor,
+  resolveTools,
+  approxTokens,
+  shrinkToolResults,
+  promptBudgetFor,
+  errorText,
+  MAX_ROUNDS,
+  ROUND_CEILING,
+} from '../src/lib/chat-tools.js';
 import { ENGINE_STRENGTHS } from '../src/lib/search.js';
 
 const results = [];
@@ -155,6 +166,66 @@ await resolveTools({
   execute: async (n, a) => { engineArgs.push(a.engine); return '結果'; },
 });
 check('  選んだ engine が実行に届く', engineArgs.join() === 'exa', engineArgs.join());
+globalThis.fetch = realFetch;
+
+/* ------------------------------ context budget ---------------------------- */
+// The production failure: ten searches' results, 34,479 tokens, 32K window.
+check('予算: 32K の窓で答えの分を残す', promptBudgetFor(32768) === 32768 - 8192 - 512, String(promptBudgetFor(32768)));
+check('  窓が不明なら 32K とみなす', promptBudgetFor(undefined) === promptBudgetFor(32768));
+check('見積もり: ツール呼び出しの引数も数える',
+  approxTokens([{ role: 'assistant', content: null, tool_calls: [{ function: { arguments: 'x'.repeat(1500) } }] }]) >= 1000);
+
+const bulky = () => [
+  { role: 'user', content: '質問' },
+  ...Array.from({ length: 10 }, (_, i) => [
+    { role: 'assistant', content: null, tool_calls: [{ id: 'c' + i, function: { name: 'web_search', arguments: '{}' } }] },
+    { role: 'tool', tool_call_id: 'c' + i, content: '結果'.repeat(4000) },
+  ]).flat(),
+];
+const big = bulky();
+const before = approxTokens(big);
+const cuts = shrinkToolResults(big, 20000);
+check('縮める: 予算に収める', approxTokens(big) <= 20000 && cuts > 0, before + ' → ' + approxTokens(big));
+check('  ツールの結果だけを縮める', big[0].content === '質問' && big.filter((m) => m.role === 'tool').length === 10);
+check('  省略したと書く', big.some((m) => m.role === 'tool' && m.content.includes('省略')));
+check('  呼び出しと結果の組は壊さない', big.filter((m) => m.tool_calls).length === 10);
+check('  収まっていれば何もしない', shrinkToolResults([{ role: 'user', content: 'x' }], 20000) === 0);
+
+// A model that keeps searching stops before the window, not at it.
+let sentTokens = [];
+turn = 0;
+globalThis.fetch = async (u, o) => {
+  sentTokens.push(approxTokens(JSON.parse(o.body).messages));
+  turn++;
+  return reply({ content: null, tool_calls: [{ id: 'k' + turn, function: { name: 'web_search', arguments: '{"query":"q' + turn + '"}' } }] });
+};
+out = await resolveTools({
+  url: 'u', headers: {}, body: { messages: [{ role: 'user', content: 'x' }] },
+  maxRounds: 10, promptBudget: promptBudgetFor(32768),
+  execute: async () => '結果'.repeat(4000), // ~8,000 chars, as ten long snippets come to
+});
+check('検索を続けても上限を超えて送らない', Math.max(...sentTokens) <= promptBudgetFor(32768) - 700, sentTokens.join(','));
+check('  上限で打ち切ったと言う', out.stoppedBecause === '会話の長さの上限', String(out.stoppedBecause));
+check('  打ち切った後も予算内', approxTokens(out.messages) <= promptBudgetFor(32768), String(approxTokens(out.messages)));
+
+// A refused decision says why.
+const runpodError = JSON.stringify({
+  error: JSON.stringify({ error: { code: 400, message: 'request (34479 tokens) exceeds the available context size (32768 tokens), try increasing it' } }),
+});
+check('エラー本文から理由を取り出す', errorText(runpodError).startsWith('request (34479 tokens) exceeds'), errorText(runpodError));
+check('  JSON でなければそのまま', errorText('plain failure') === 'plain failure');
+globalThis.fetch = async () => ({ ok: false, status: 400, async text() { return runpodError; }, async json() { return {}; } });
+out = await resolveTools({ url: 'u', headers: {}, body: { messages: [{ role: 'user', content: 'x' }] }, execute: async () => 'x' });
+check('判断の失敗は理由つきで返す', /^HTTP 400: request \(34479 tokens\)/.test(out.failed), out.failed);
+
+// Each decision's response reaches the caller (it carries the startup details).
+const seenReplies = [];
+globalThis.fetch = async () => ({ ok: true, status: 200, async json() { return { choices: [{ message: { content: 'ok' } }], hyperai_worker: { source: 'cache' } }; } });
+await resolveTools({
+  url: 'u', headers: {}, body: { messages: [{ role: 'user', content: 'x' }] }, execute: async () => 'x',
+  onReply: (j) => seenReplies.push(j.hyperai_worker?.source),
+});
+check('判断の応答を onReply に渡す', seenReplies.join() === 'cache', seenReplies.join());
 globalThis.fetch = realFetch;
 
 const passed = results.filter(([ok]) => ok).length;

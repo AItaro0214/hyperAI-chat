@@ -94,5 +94,30 @@ body = json.loads(frame[len("data: "):])
 check("  本文を持たない（choices が空）", body["choices"] == [] and body["object"] == "chat.completion.chunk")
 check("  アプリが読むキーに入れる", body[handler.META_KEY] == meta and handler.META_KEY == "hyperai_worker")
 
+# A failed job's reason: all RunPod keeps is the "error" string.
+handler.LOG.clear()
+handler.LOG.extend(["load_tensors: ok", "CUDA error: out of memory"])
+handler.PROC = None
+f = handler.failure(400, '{"error":{"message":"request (34479 tokens) exceeds the available context size"}}')
+check("失敗: llama-server の理由を残す", f["error"].startswith("llama-server 400:") and "34479" in f["error"], f)
+check("  要求の誤り（4xx）にはログを付けない", "log" not in f["error"], f)
+f = handler.failure(500, "internal")
+check("  5xx はログの末尾を付ける", "CUDA error: out of memory" in f["error"], f)
+
+
+class Dead:
+    returncode = -9
+
+    def poll(self):
+        return -9
+
+
+handler.PROC = Dead()
+f = handler.failure(exc=ConnectionError("refused"))
+check("  例外は種類と内容を残す", "ConnectionError: refused" in f["error"], f)
+check("  落ちていればそう言う", "終了コード -9" in f["error"] and "CUDA error" in f["error"], f)
+check("  長すぎない", len(handler.failure(500, "x" * 10000)["error"]) <= 4000)
+handler.PROC = None
+
 print(f"\n{sum(results)}/{len(results)} passed")
 sys.exit(0 if all(results) else 1)
