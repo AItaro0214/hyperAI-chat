@@ -1,4 +1,17 @@
-import { webSearch, webFetch, formatResults, stripHtml, BACKENDS, BACKEND_NOTES } from '../src/lib/search.js';
+import {
+  webSearch,
+  webFetch,
+  formatResults,
+  stripHtml,
+  availableEngines,
+  pickEngine,
+  searchRecord,
+  BACKENDS,
+  SEARCH_MODES,
+  BACKEND_NOTES,
+  MODE_LABELS,
+  CHOOSE,
+} from '../src/lib/search.js';
 
 const results = [];
 const check = (name, ok, extra = '') => {
@@ -202,6 +215,96 @@ msg = await errorOf(() => webFetch(exaEnv, { url: 'https://down.example', backen
 check('読めないページ: 200 の中のエラーを拾う', msg.includes('取得できませんでした') && msg.includes('CRAWL_NOT_FOUND') && msg.includes('404'), msg);
 
 globalThis.fetch = realFetch;
+
+/* ------------------------ the model chooses an engine --------------------- */
+check('「モデルに選ばせる」は設定の選択肢で、検索方式ではない', SEARCH_MODES.includes(CHOOSE) && !BACKENDS.includes(CHOOSE));
+check('  分かる名前と説明がある', MODE_LABELS[CHOOSE].includes('Brave') && MODE_LABELS[CHOOSE].includes('Exa') && !!BACKEND_NOTES[CHOOSE]);
+
+const keyed = (keys) => ({ ...env(), ...keys });
+check('候補: キーなし → なし', (await availableEngines(keyed({}))).length === 0);
+check('  Brave だけ', (await availableEngines(keyed({ BRAVE_API_KEY: 'b' }))).join() === 'brave');
+check('  Exa だけ', (await availableEngines(keyed({ EXA_API_KEY: 'e' }))).join() === 'exa');
+check('  両方', (await availableEngines(keyed({ BRAVE_API_KEY: 'b', EXA_API_KEY: 'e' }))).join() === 'brave,exa');
+
+check('指定なしは Brave', pickEngine(['brave', 'exa'], undefined).engine === 'brave');
+check('  Brave が無ければ Exa', pickEngine(['exa'], '').engine === 'exa');
+check('  指定どおり', pickEngine(['brave', 'exa'], 'exa').engine === 'exa' && pickEngine(['brave', 'exa'], 'exa').note === null);
+check('  大文字でも通す', pickEngine(['brave', 'exa'], ' EXA ').engine === 'exa');
+const bad = pickEngine(['brave', 'exa'], 'google');
+check('不正な値は既定に戻し、そう伝える', bad.engine === 'brave' && bad.note.includes('google') && bad.note.includes('brave'), bad.note);
+const missing = pickEngine(['brave'], 'exa');
+check('  キーの無い方式も既定に戻す', missing.engine === 'brave' && !!missing.note);
+check('候補が無ければ登録を促す', (await errorOf(async () => pickEngine([], 'exa'))).includes('BRAVE_API_KEY か EXA_API_KEY'));
+
+// Routing: each request goes to the engine chosen, never both.
+const both = keyed({ BRAVE_API_KEY: 'b', EXA_API_KEY: 'e' });
+const hits = [];
+globalThis.fetch = async (url, options = {}) => {
+  const u = String(url);
+  hits.push(u);
+  if (u.startsWith('https://api.exa.ai/search')) {
+    return { ok: true, status: 200, json: async () => ({ results: [{ title: 'X', url: 'https://x.example', text: 'exa' }] }) };
+  }
+  if (u.startsWith('https://api.exa.ai/contents')) {
+    return { ok: true, status: 200, json: async () => ({ results: [{ title: 'P', url: JSON.parse(options.body).urls[0], text: '本文' }], statuses: [] }) };
+  }
+  if (u.startsWith('https://api.search.brave.com')) {
+    return { ok: true, status: 200, json: async () => ({ web: { results: [{ title: 'B', url: 'https://b.example', description: 'brave' }] } }) };
+  }
+  return { ok: true, status: 200, text: async () => '<title>直</title><p>直接</p>' };
+};
+const route = async (engine, env2 = both) => {
+  hits.length = 0;
+  const found = await webSearch(env2, { query: 'q', backend: CHOOSE, engine });
+  return { found, hits: hits.slice() };
+};
+let r = await route('exa');
+check('振り分け: exa を選べば Exa だけ', r.found.backend === 'exa' && r.found.mode === CHOOSE && r.hits.length === 1 && r.hits[0].includes('exa.ai'), r.hits.join());
+r = await route('brave');
+check('  brave を選べば Brave だけ', r.found.backend === 'brave' && r.hits.length === 1 && r.hits[0].includes('brave.com'), r.hits.join());
+r = await route(undefined);
+check('  指定なしは Brave', r.found.backend === 'brave' && r.found.note === null);
+r = await route('bing');
+check('  不正な値は Brave で検索し、結果に断り書き', r.found.backend === 'brave' && formatResults(r.found).includes('"bing" は使えない'), formatResults(r.found).slice(0, 80));
+r = await route('exa', keyed({ BRAVE_API_KEY: 'b' }));
+check('  キーの無い Exa を指定 → Brave', r.found.backend === 'brave' && !r.hits.some((h) => h.includes('exa.ai')));
+hits.length = 0;
+const fixed = await webSearch(both, { query: 'q', backend: 'exa', engine: 'brave' });
+check('「選ばせる」以外では engine を無視（設定どおり）', fixed.backend === 'exa' && fixed.note === null && hits.length === 1);
+
+// A page is readable whichever engine found it: Exa's contents when there is
+// a key, the old way when not.
+hits.length = 0;
+let pg = await webFetch(both, { url: 'https://b.example', backend: CHOOSE });
+check('ページ: Exa があれば contents で読む', pg.via === 'exa' && hits.length === 1 && hits[0].includes('/contents'), hits.join());
+hits.length = 0;
+pg = await webFetch(keyed({ BRAVE_API_KEY: 'b' }), { url: 'https://b.example', backend: CHOOSE });
+check('  Exa が無ければ今までの方法', pg.via === 'direct' && !hits.some((h) => h.includes('exa.ai')) && pg.content.includes('直接'), hits.join());
+globalThis.fetch = realFetch;
+
+// What is kept with the reply, for the screen.
+const rec = searchRecord({ kind: 'search', found: { backend: 'exa', mode: CHOOSE, note: null, results: [1, 2, 3] }, args: { query: '論文', engine: 'exa' } });
+check('表示: 方式・検索語・件数', rec.engine === 'exa' && rec.query === '論文' && rec.count === 3, JSON.stringify(rec));
+check('  モデルが選んだと分かる', rec.chosen === true);
+const recDefault = searchRecord({ kind: 'search', found: { backend: 'brave', mode: CHOOSE, note: null, results: [] }, args: { query: 'x' } });
+check('  指定なしは「選択」と出さない', recDefault.engine === 'brave' && recDefault.chosen === false);
+const recBad = searchRecord({ kind: 'search', found: { backend: 'brave', mode: CHOOSE, note: '指定の engine "g" は…', results: [] }, args: { query: 'x', engine: 'g' } });
+check('  不正な指定は断り書きを残す', recBad.chosen === false && recBad.note.includes('"g"'));
+const recFixed = searchRecord({ kind: 'search', found: { backend: 'brave', mode: 'brave', note: null, results: [1] }, args: { query: 'x' } });
+check('  設定で固定のときは選択なし', recFixed.engine === 'brave' && recFixed.chosen === false);
+const recErr = searchRecord({ kind: 'search', args: { query: 'x' }, mode: CHOOSE, error: 'BRAVE_API_KEY か…' });
+check('  失敗も残す', recErr.error.includes('BRAVE') && recErr.count === 0 && recErr.engine === null);
+const recPage = searchRecord({ kind: 'fetch', page: { url: 'https://p.example', via: 'exa' }, args: { url: 'https://p.example' } });
+check('  ページは読んだ方法を残す', recPage.kind === 'fetch' && recPage.via === 'exa' && recPage.url === 'https://p.example');
+check('  長い検索語は切る', searchRecord({ kind: 'search', args: { query: 'あ'.repeat(500) } }).query.length === 120);
+
+// ...and reaches the saved reply and the screen.
+const { readFileSync } = await import('node:fs');
+const routeSrc = readFileSync(new URL('../src/routes/chat.js', import.meta.url), 'utf8');
+const appSrc = readFileSync(new URL('../public/app.js', import.meta.url), 'utf8');
+check('  チャットの経路が engine を渡す', /engine: args\.engine/.test(routeSrc) && /backend: searchMode/.test(routeSrc));
+check('  返答の meta に保存する', /base\.searches = searches/.test(routeSrc) && /searches\.push\(searchRecord\(/.test(routeSrc));
+check('  画面に出す', /msg\.meta\?\.searches\?\.length/.test(appSrc) && /function searchLog/.test(appSrc));
 
 void realGet;
 const passed = results.filter(([ok]) => ok).length;

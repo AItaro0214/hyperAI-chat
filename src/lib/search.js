@@ -21,7 +21,25 @@ import { getApiKey, getJsonSetting } from './store.js';
 
 export const BACKENDS = ['ollama', 'searxng', 'brave', 'exa', 'xai'];
 
+/* Not a backend but a setting: the model picks Brave or Exa on each search,
+ * from those whose key is registered. */
+export const CHOOSE = 'choose';
+export const SEARCH_MODES = [...BACKENDS, CHOOSE];
+
+/* What each choosable engine is good at, written for the model: this is what
+ * it decides by. */
+export const ENGINE_KEYS = { brave: 'BRAVE_API_KEY', exa: 'EXA_API_KEY' };
+export const ENGINE_STRENGTHS = {
+  brave: 'ニュース・最新の出来事・固有名詞やキーワードでの普通の検索に強い。独立したインデックス',
+  exa: '意味で探す検索。言い換えや説明文での検索、論文・技術記事・企業・似たページを探すのに強い',
+};
+
+export const MODE_LABELS = { [CHOOSE]: 'モデルに選ばせる（Brave と Exa）' };
+
 export const BACKEND_NOTES = {
+  [CHOOSE]:
+    '検索のたびにモデルが Brave と Exa から選ぶ。キーが登録されている方式だけが候補になる。' +
+    'モデルが指定しなければ Brave（無ければ Exa）',
   ollama: '生の検索結果（無料枠あり・OLLAMA_API_KEY が必要）',
   searxng: '自前の SearXNG。第三者が経路にいない',
   brave: '独立インデックス（BRAVE_API_KEY が必要）',
@@ -173,27 +191,59 @@ const IMPLS = { ollama: viaOllama, searxng: viaSearxng, brave: viaBrave, exa: vi
 
 /* -------------------------------- the API ------------------------------- */
 
-/**
- * @returns {Promise<{backend: string, results: {title,url,snippet}[]}>}
- */
-export async function webSearch(env, { query, maxResults = 5, backend = 'ollama' } = {}) {
-  const q = String(query || '').trim();
-  if (!q) throw new Error('検索語が空です');
-  const impl = IMPLS[backend];
-  if (!impl) throw new Error('backend は ' + BACKENDS.join(' / ') + ' のいずれかです');
-  const limit = Math.max(1, Math.min(Number(maxResults) || 5, MAX_RESULTS));
-  return { backend, results: await impl(env, q, limit) };
+/** The choosable engines whose key is registered, in a fixed order. */
+export async function availableEngines(env) {
+  const out = [];
+  for (const [engine, key] of Object.entries(ENGINE_KEYS)) {
+    if (await getApiKey(env, key)) out.push(engine);
+  }
+  return out;
 }
 
 /**
- * Reads one page. With exa as the search backend, through Exa's /contents;
- * otherwise Ollama's web_fetch when there is a key, and a plain fetch after.
+ * Which engine a search under CHOOSE runs on.
+ *
+ * Brave is the default when the model names none, being the plain web
+ * search. A name it was not offered falls back to that default rather than
+ * failing the search, and says so in `note`, which reaches the model.
+ */
+export function pickEngine(available, requested) {
+  if (!available.length) throw new Error('BRAVE_API_KEY か EXA_API_KEY を登録してください（モデルに選ばせる設定です）');
+  const fallback = available.includes('brave') ? 'brave' : available[0];
+  const want = String(requested ?? '').trim().toLowerCase();
+  if (!want) return { engine: fallback, note: null };
+  if (available.includes(want)) return { engine: want, note: null };
+  return { engine: fallback, note: '指定の engine "' + String(requested).slice(0, 30) + '" は使えないため ' + fallback + ' で検索しました' };
+}
+
+/**
+ * @param {string} [engine] the model's choice, read only when backend is CHOOSE
+ * @returns {Promise<{backend: string, mode: string, note: string|null, results: {title,url,snippet}[]}>}
+ */
+export async function webSearch(env, { query, maxResults = 5, backend = 'ollama', engine } = {}) {
+  const q = String(query || '').trim();
+  if (!q) throw new Error('検索語が空です');
+  let chosen = backend;
+  let note = null;
+  if (backend === CHOOSE) ({ engine: chosen, note } = pickEngine(await availableEngines(env), engine));
+  const impl = IMPLS[chosen];
+  if (!impl) throw new Error('backend は ' + SEARCH_MODES.join(' / ') + ' のいずれかです');
+  const limit = Math.max(1, Math.min(Number(maxResults) || 5, MAX_RESULTS));
+  return { backend: chosen, mode: backend, note, results: await impl(env, q, limit) };
+}
+
+/**
+ * Reads one page. Under exa or CHOOSE, through Exa's /contents when its key is
+ * there, whichever engine found the page; otherwise Ollama's web_fetch when
+ * there is a key, and a plain fetch after. `via` says which it was.
  */
 export async function webFetch(env, { url, backend } = {}) {
   const target = String(url || '').trim();
   if (!/^https?:\/\//i.test(target)) throw new Error('http(s) の URL を指定してください');
 
-  if (backend === 'exa') return exaPage(env, target);
+  if ((backend === 'exa' || backend === CHOOSE) && (await getApiKey(env, 'EXA_API_KEY'))) {
+    return { ...(await exaPage(env, target)), via: 'exa' };
+  }
 
   const key = await getApiKey(env, 'OLLAMA_API_KEY');
   if (key) {
@@ -205,7 +255,7 @@ export async function webFetch(env, { url, backend } = {}) {
     });
     if (res.ok) {
       const json = await res.json();
-      return { title: json.title || target, content: clip(json.content, 40000), url: target };
+      return { title: json.title || target, content: clip(json.content, 40000), url: target, via: 'ollama' };
     }
   }
 
@@ -216,7 +266,12 @@ export async function webFetch(env, { url, backend } = {}) {
   });
   if (!res.ok) throw new Error('取得できませんでした: HTTP ' + res.status);
   const html = await res.text();
-  return { title: (/<title[^>]*>([\s\S]*?)<\/title>/i.exec(html)?.[1] || target).trim(), content: stripHtml(html), url: target };
+  return {
+    title: (/<title[^>]*>([\s\S]*?)<\/title>/i.exec(html)?.[1] || target).trim(),
+    content: stripHtml(html),
+    url: target,
+    via: 'direct',
+  };
 }
 
 export function stripHtml(html) {
@@ -237,10 +292,32 @@ export function stripHtml(html) {
     .slice(0, 40000);
 }
 
+/**
+ * One search or page read, as kept with the reply so the reader can see
+ * afterwards which engine ran: `engine` is what searched, `chosen` whether the
+ * model picked it (and got it), `via` how a page was read.
+ */
+export function searchRecord({ kind, found, page, args = {}, mode, error }) {
+  const cut = (s, n) => String(s ?? '').slice(0, n);
+  if (kind === 'fetch') {
+    return { kind, url: cut(page?.url || args.url, 300), via: page?.via || null, ...(error ? { error: cut(error, 160) } : {}) };
+  }
+  return {
+    kind: 'search',
+    engine: found?.backend || (mode && mode !== CHOOSE ? mode : null),
+    chosen: !!found && found.mode === CHOOSE && !!args.engine && !found.note,
+    query: cut(args.query, 120),
+    count: found ? found.results.length : 0,
+    ...(found?.note ? { note: cut(found.note, 120) } : {}),
+    ...(error ? { error: cut(error, 160) } : {}),
+  };
+}
+
 /** Results as a block the model can read, with the links kept intact. */
-export function formatResults({ backend, results }) {
-  if (!results?.length) return '（検索結果がありませんでした）';
+export function formatResults({ backend, results, note }) {
+  if (!results?.length) return '（検索結果がありませんでした）' + (note ? '\n' + note : '');
   const lines = ['検索結果（' + backend + '・' + results.length + '件）', ''];
+  if (note) lines.splice(1, 0, note);
   for (const [i, r] of results.entries()) {
     lines.push(i + 1 + '. ' + (r.title || '(無題)'));
     if (r.url) lines.push('   ' + r.url);

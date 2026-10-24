@@ -360,6 +360,14 @@ input:focus, select:focus, textarea:focus {
 .think summary { cursor: pointer; list-style: none; font-size: 12px; margin-bottom: 5px; }
 .think summary::-webkit-details-marker { display: none; }
 
+/* Breakthrough: which engine each search ran on. Folded like the reasoning. */
+.search-log { margin: 0 0 13px; border-left: 2px solid var(--line); padding: 2px 0 2px 13px; color: var(--muted); font-size: 12.5px; }
+.search-log summary { cursor: pointer; list-style: none; font-size: 12px; }
+.search-log summary::-webkit-details-marker { display: none; }
+.search-log ul { list-style: none; margin: 6px 0 2px; padding: 0; display: flex; flex-direction: column; gap: 5px; }
+.search-log li { display: flex; flex-wrap: wrap; gap: 6px; align-items: baseline; }
+.search-log .url { font-family: var(--mono); font-size: 11.5px; overflow-wrap: anywhere; }
+
 .notice { font-size: 12.5px; color: var(--warn); margin-bottom: 11px; display: flex; gap: 7px; align-items: flex-start; }
 .notice i { margin-top: 3px; }
 .cites { margin-top: 13px; display: flex; flex-direction: column; gap: 4px; font-size: 12.5px; }

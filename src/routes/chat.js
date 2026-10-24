@@ -5,8 +5,16 @@ import { requireAuth } from '../lib/guard.js';
 import { getSettings, logUsage } from '../lib/store.js';
 import { getCatalog, findModel, estimateChatCost } from '../lib/models.js';
 import { openaiBase as runpodBase, describeStartup, DEFAULT_SPEC as RUNPOD_SPEC } from '../lib/runpod.js';
-import { webSearch as webSearch2, webFetch as webFetch2, formatResults } from '../lib/search.js';
-import { resolveTools, thinkingFor } from '../lib/chat-tools.js';
+import {
+  webSearch as webSearch2,
+  webFetch as webFetch2,
+  formatResults,
+  availableEngines,
+  searchRecord,
+  ENGINE_STRENGTHS,
+  CHOOSE,
+} from '../lib/search.js';
+import { resolveTools, thinkingFor, chatTools } from '../lib/chat-tools.js';
 import {
   buildMessages,
   buildRequest,
@@ -358,6 +366,8 @@ chat.post('/chat', async (c) => {
     let savedText = '';
     // Breakthrough only: how the worker that answered had started.
     let startup = null;
+    // Breakthrough only: each search and page read, and what it ran on.
+    const searches = [];
 
     // Once the browser goes away, keep draining the provider so the answer is
     // still saved to the room instead of being lost mid-flight.
@@ -414,6 +424,7 @@ chat.post('/chat', async (c) => {
         elapsed: now() - startedAt,
       };
       if (startup) base.startup = startup;
+      if (searches.length) base.searches = searches.slice(0, MAX_TOOL_RECORDS * 2);
       let json = JSON.stringify({ ...base, tools });
       if (json.length > MAX_META_BYTES) {
         json = JSON.stringify({ ...base, tools: tools.slice(0, 4), toolsTruncated: tools.length });
@@ -465,10 +476,14 @@ chat.post('/chat', async (c) => {
        * none, nothing is spent and the reply streams as usual. */
       if (breakthroughOn && webSearch) {
         await setPhase('searching');
+        const searchMode = settings.searchBackend || 'ollama';
+        // Under CHOOSE the model is offered whichever of Brave and Exa have keys.
+        const engines = searchMode === CHOOSE ? await availableEngines(c.env).catch(() => []) : [];
         const phase = await resolveTools({
           url: req.url,
           headers: req.headers,
           body: req.body,
+          tools: chatTools({ engines, strengths: ENGINE_STRENGTHS }),
           maxRounds: Number(settings.searchRounds) || 2,
           onPhase: (kind, detail) => {
             const text =
@@ -487,26 +502,31 @@ chat.post('/chat', async (c) => {
                 const found = await webSearch2(c.env, {
                   query: args.query,
                   maxResults: args.max_results || Number(settings.webSearchMaxResults) || 5,
-                  backend: settings.searchBackend || 'ollama',
+                  backend: searchMode,
+                  engine: args.engine,
                 });
+                searches.push(searchRecord({ kind: 'search', found, args }));
                 await emit('meta', {
                   notices: [
-                    '検索（' + found.backend + '）: ' + found.results.length + '件 — ' + String(args.query).slice(0, 60),
+                    '検索（' + found.backend + (found.mode === CHOOSE ? '・モデルが選択' : '') + '）: ' +
+                      found.results.length + '件 — ' + String(args.query).slice(0, 60),
                   ],
                 });
                 return formatResults(found);
               } catch (err) {
-                const why =
-                  '検索に失敗しました（' + (settings.searchBackend || 'ollama') + '）: ' + String(err.message).slice(0, 200);
+                searches.push(searchRecord({ kind: 'search', args, mode: searchMode, error: err.message }));
+                const why = '検索に失敗しました（' + searchMode + '）: ' + String(err.message).slice(0, 200);
                 await emit('meta', { notices: [why] });
                 return why + ' 検索結果は得られませんでした。分かる範囲で答えるか、分からないと伝えてください。';
               }
             }
             if (name === 'web_fetch') {
               try {
-                const page = await webFetch2(c.env, { url: args.url, backend: settings.searchBackend || 'ollama' });
+                const page = await webFetch2(c.env, { url: args.url, backend: searchMode });
+                searches.push(searchRecord({ kind: 'fetch', page, args }));
                 return [page.title, page.url, '', page.content].join('\n');
               } catch (err) {
+                searches.push(searchRecord({ kind: 'fetch', args, error: err.message }));
                 const why = 'ページを取得できませんでした: ' + String(err.message).slice(0, 200);
                 await emit('meta', { notices: [why] });
                 return why;

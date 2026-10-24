@@ -694,6 +694,43 @@ function recoverRow(msg) {
   return row;
 }
 
+/* Breakthrough: each search and page read the reply drew on, and which engine
+ * ran it — so whether the model is choosing well can be checked afterwards. */
+const READ_VIA = { exa: 'Exa', ollama: 'Ollama', direct: '直接' };
+function searchLog(entries) {
+  const searches = entries.filter((e) => e.kind === 'search');
+  const reads = entries.filter((e) => e.kind === 'fetch');
+  const byEngine = {};
+  for (const s of searches) byEngine[s.engine || '?'] = (byEngine[s.engine || '?'] || 0) + 1;
+  const det = el('details', 'search-log');
+  det.appendChild(
+    el(
+      'summary',
+      null,
+      '検索 ' + searches.length + ' 回' +
+        (searches.length ? '（' + Object.entries(byEngine).map(([k, n]) => k + ' ' + n).join('・') + '）' : '') +
+        (reads.length ? ' · ページ ' + reads.length + ' 件' : '')
+    )
+  );
+  const list = el('ul');
+  for (const e of entries) {
+    const li = el('li');
+    if (e.kind === 'search') {
+      li.appendChild(el('span', 'tag', e.engine || '?'));
+      if (e.chosen) li.appendChild(el('span', 'xs muted', 'モデルが選択'));
+      li.appendChild(el('span', null, '「' + e.query + '」' + (e.error ? '' : ' ' + e.count + '件')));
+    } else {
+      li.appendChild(el('span', 'tag', 'ページ' + (e.via ? '・' + (READ_VIA[e.via] || e.via) : '')));
+      li.appendChild(el('span', 'url', e.url));
+    }
+    if (e.note) li.appendChild(el('span', 'xs warn', e.note));
+    if (e.error) li.appendChild(el('span', 'xs error', e.error));
+    list.appendChild(li);
+  }
+  det.appendChild(list);
+  return det;
+}
+
 function messageNode(msg) {
   const wrap = el('div', 'msg ' + msg.role);
   wrap.dataset.id = msg.id;
@@ -736,6 +773,8 @@ function messageNode(msg) {
     n.appendChild(el('span', null, notice));
     wrap.appendChild(n);
   }
+
+  if (msg.meta?.searches?.length) wrap.appendChild(searchLog(msg.meta.searches));
 
   if (msg.reasoning) {
     const det = el('details', 'think');
@@ -2144,6 +2183,15 @@ function modelCacheNote(bt) {
   );
 }
 
+/* Under "let the model choose": which engines it will actually be offered. */
+function chooseNote(engines) {
+  if (engines.length > 1) return '<br><span class="xs ok">選べる方式: ' + esc(engines.join(' / ')) + '</span>';
+  if (engines.length === 1) {
+    return '<br><span class="xs warn">キーがあるのは ' + esc(engines[0]) + ' だけなので、選ばずに ' + esc(engines[0]) + ' で検索します</span>';
+  }
+  return '<br><span class="xs warn">BRAVE_API_KEY と EXA_API_KEY が未登録です（「API キー」タブで登録）</span>';
+}
+
 /* Breakthrough mode: a self-hosted model on a rented GPU, plus the search it
  * needs. Provisioning takes minutes, so this polls rather than blocks. */
 async function renderBreakthroughTab(body) {
@@ -2153,7 +2201,9 @@ async function renderBreakthroughTab(body) {
       (b) =>
         '<label class="row" style="gap:8px;align-items:flex-start;margin-bottom:8px">' +
         '<input type="radio" name="sb" value="' + b + '"' + (bt.search.backend === b ? ' checked' : '') + '>' +
-        '<span><b>' + b + '</b><br><span class="xs muted">' + esc(bt.search.notes[b] || '') + '</span></span></label>'
+        '<span><b>' + esc(bt.search.labels?.[b] || b) + '</b><br><span class="xs muted">' + esc(bt.search.notes[b] || '') + '</span>' +
+        (b === 'choose' ? chooseNote(bt.search.engines || []) : '') +
+        '</span></label>'
     )
     .join('');
 

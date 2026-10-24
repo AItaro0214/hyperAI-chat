@@ -54,7 +54,7 @@ import {
   modelReference,
   DEFAULT_SPEC,
 } from '../lib/runpod.js';
-import { BACKENDS, BACKEND_NOTES } from '../lib/search.js';
+import { SEARCH_MODES, BACKEND_NOTES, MODE_LABELS, availableEngines } from '../lib/search.js';
 import { keyUsage, accountCredits, utcWindows } from '../lib/generation.js';
 
 const admin = new Hono();
@@ -319,8 +319,11 @@ admin.get('/breakthrough', async (c) => {
       backend: settings.searchBackend || 'ollama',
       rounds: Number(settings.searchRounds) || 2,
       searxngUrl: settings.searxngUrl || '',
-      backends: BACKENDS,
+      backends: SEARCH_MODES,
       notes: BACKEND_NOTES,
+      labels: MODE_LABELS,
+      // Which of Brave and Exa "let the model choose" can actually offer.
+      engines: await availableEngines(c.env).catch(() => []),
     },
     spec: DEFAULT_SPEC,
     image: imageFor(DEFAULT_SPEC),

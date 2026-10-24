@@ -28,38 +28,61 @@ export const ROUND_CEILING = 10;
  * someone watching a spinner. */
 const DEFAULT_BUDGET_MS = 240000;
 
-export const CHAT_TOOLS = [
-  {
-    type: 'function',
-    function: {
-      name: 'web_search',
-      description:
-        '必要なときだけウェブを検索する。返るのは検索エンジンの生の結果（タイトル・URL・抜粋）で、要約ではない。' +
-        '最新の出来事、変わりやすい事実、固有名詞の確認などに使う。' +
-        '一般的な知識や、雑談、コードの書き方のような自分で答えられることには使わないこと。',
-      parameters: {
-        type: 'object',
-        properties: {
-          query: { type: 'string', description: '検索語' },
-          max_results: { type: 'integer', description: '最大件数。既定 5、上限 10' },
+const SEARCH_DESCRIPTION =
+  '必要なときだけウェブを検索する。返るのは検索エンジンの生の結果（タイトル・URL・抜粋）で、要約ではない。' +
+  '最新の出来事、変わりやすい事実、固有名詞の確認などに使う。' +
+  '一般的な知識や、雑談、コードの書き方のような自分で答えられることには使わないこと。';
+
+/**
+ * The tools offered to a self-hosted model.
+ *
+ * With two or more engines to choose from, web_search takes an `engine`, and
+ * what each is good at goes into the description — that is all the model has
+ * to choose by. With one or none there is no choice to offer, so the argument
+ * is left out rather than shown with a single value.
+ *
+ * @param {{engines?: string[], strengths?: Record<string,string>}} [options]
+ */
+export function chatTools({ engines = [], strengths = {} } = {}) {
+  const properties = {
+    query: { type: 'string', description: '検索語' },
+    max_results: { type: 'integer', description: '最大件数。既定 5、上限 10' },
+  };
+  let description = SEARCH_DESCRIPTION;
+  if (engines.length > 1) {
+    const guide = engines.map((e) => e + ': ' + (strengths[e] || '')).join(' / ');
+    properties.engine = {
+      type: 'string',
+      enum: engines,
+      description: '使う検索エンジン。内容に合う方を選ぶ。' + guide,
+    };
+    description += ' 検索エンジンは engine で選べる（' + guide + '）。';
+  }
+  return [
+    {
+      type: 'function',
+      function: {
+        name: 'web_search',
+        description,
+        parameters: { type: 'object', properties, required: ['query'] },
+      },
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'web_fetch',
+        description: '検索結果の中身を確かめる必要があるときだけ、そのページ本文を取得する。どの検索エンジンで見つけたページでも読める。',
+        parameters: {
+          type: 'object',
+          properties: { url: { type: 'string', description: 'http(s) の URL' } },
+          required: ['url'],
         },
-        required: ['query'],
       },
     },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'web_fetch',
-      description: '検索結果の中身を確かめる必要があるときだけ、そのページ本文を取得する。',
-      parameters: {
-        type: 'object',
-        properties: { url: { type: 'string', description: 'http(s) の URL' } },
-        required: ['url'],
-      },
-    },
-  },
-];
+  ];
+}
+
+export const CHAT_TOOLS = chatTools();
 
 /** Reasoning depth, as the one control a self-hosted Qwen actually has. */
 export function thinkingFor(effort) {
@@ -83,6 +106,7 @@ export async function resolveTools({
   body,
   execute,
   onPhase,
+  tools = CHAT_TOOLS,
   maxRounds = MAX_ROUNDS,
   timeoutMs = 900000,
   budgetMs = DEFAULT_BUDGET_MS,
@@ -104,7 +128,7 @@ export async function resolveTools({
     const probe = {
       ...body,
       messages,
-      tools: CHAT_TOOLS,
+      tools,
       tool_choice: 'auto',
       stream: false,
       /* "Do I need to search?" is a routing decision, not a reasoning task.

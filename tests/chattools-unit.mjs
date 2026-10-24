@@ -1,4 +1,5 @@
-import { CHAT_TOOLS, thinkingFor, resolveTools, MAX_ROUNDS, ROUND_CEILING } from '../src/lib/chat-tools.js';
+import { CHAT_TOOLS, chatTools, thinkingFor, resolveTools, MAX_ROUNDS, ROUND_CEILING } from '../src/lib/chat-tools.js';
+import { ENGINE_STRENGTHS } from '../src/lib/search.js';
 
 const results = [];
 const check = (name, ok, extra = '') => {
@@ -117,6 +118,43 @@ out = await resolveTools({
 });
 check('時間予算で打ち切る', out.stoppedBecause === '時間切れ' || out.rounds < 10, 'rounds=' + out.rounds + ' / ' + out.stoppedBecause);
 
+globalThis.fetch = realFetch;
+
+/* ------------------------ engine choice in the schema --------------------- */
+const searchTool = (tools) => tools.find((t) => t.function.name === 'web_search').function;
+check('既定（選択なし）は engine を出さない', !('engine' in searchTool(CHAT_TOOLS).parameters.properties));
+check('  候補 1 つでも出さない', !('engine' in searchTool(chatTools({ engines: ['exa'], strengths: ENGINE_STRENGTHS })).parameters.properties));
+const two = searchTool(chatTools({ engines: ['brave', 'exa'], strengths: ENGINE_STRENGTHS }));
+const engineProp = two.parameters.properties.engine;
+check('候補 2 つで enum を出す', JSON.stringify(engineProp?.enum) === '["brave","exa"]', JSON.stringify(engineProp?.enum));
+check('  必須にはしない（既定がある）', JSON.stringify(two.parameters.required) === '["query"]');
+check('  得意分野を説明に書く', engineProp.description.includes('ニュース') && engineProp.description.includes('論文') && two.description.includes('engine'));
+check('  ページを読むのは方式を問わない', chatTools({ engines: ['brave', 'exa'] })[1].function.description.includes('どの検索エンジン'));
+check('  呼ぶたびに作り直す（共有物を書き換えない）', !('engine' in searchTool(CHAT_TOOLS).parameters.properties));
+
+// The tools passed in are the ones the model is offered.
+let offered = null;
+globalThis.fetch = async (u, o) => { offered = JSON.parse(o.body).tools; return reply({ content: 'ok' }); };
+await resolveTools({
+  url: 'u', headers: {}, body: { messages: [{ role: 'user', content: 'x' }] },
+  tools: chatTools({ engines: ['brave', 'exa'], strengths: ENGINE_STRENGTHS }), execute: async () => 'x',
+});
+check('渡したツールをモデルに見せる', !!searchTool(offered).parameters.properties.engine);
+
+// The model's choice reaches execute() as an argument.
+turn = 0;
+const engineArgs = [];
+globalThis.fetch = async () => {
+  turn++;
+  return turn === 1
+    ? reply({ content: null, tool_calls: [{ id: 'c1', function: { name: 'web_search', arguments: '{"query":"論文","engine":"exa"}' } }] })
+    : reply({ content: '答え' });
+};
+await resolveTools({
+  url: 'u', headers: {}, body: { messages: [{ role: 'user', content: 'x' }] },
+  execute: async (n, a) => { engineArgs.push(a.engine); return '結果'; },
+});
+check('  選んだ engine が実行に届く', engineArgs.join() === 'exa', engineArgs.join());
 globalThis.fetch = realFetch;
 
 const passed = results.filter(([ok]) => ok).length;
