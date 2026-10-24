@@ -2197,6 +2197,22 @@ function modelCacheNote(bt) {
   );
 }
 
+/* The endpoint's workers, said in terms of what they cost. Only "running"
+ * bills (it includes the idle timeout after a reply); a worker that has
+ * scaled down but is kept on the host for a fast restart is "待機" and free,
+ * even though RunPod's health counts it as ready. */
+function workerStates(live) {
+  const parts = [];
+  if (live.running) parts.push('<span class="ok">稼働中 ' + live.running + '台（課金中）</span>');
+  if (live.standby) parts.push('待機 ' + live.standby + '台（停止中・課金なし。次のリクエストですぐ起動）');
+  if (live.initializing) parts.push('<span class="warn">準備中 ' + live.initializing + '台（イメージやモデルを用意中・課金なし）</span>');
+  if (live.throttled) parts.push('<span class="warn">GPU の空き待ち ' + live.throttled + '台（課金なし）</span>');
+  if (live.unhealthy) parts.push('<span class="error">異常 ' + live.unhealthy + '台（課金なし。「診断」で理由を確認）</span>');
+  if (!parts.length) parts.push('停止中（次のリクエストで起動）');
+  const jobs = (live.inQueue ? '待ち ' + live.inQueue + '件' : '') + (live.inProgress ? (live.inQueue ? '・' : '') + '処理中 ' + live.inProgress + '件' : '');
+  return parts.join(' / ') + (jobs ? ' / ' + jobs : '');
+}
+
 /* Under "let the model choose": which engines it will actually be offered. */
 function chooseNote(engines) {
   if (engines.length > 1) return '<br><span class="xs ok">選べる方式: ' + esc(engines.join(' / ')) + '</span>';
@@ -2234,16 +2250,14 @@ async function renderBreakthroughTab(body) {
         (bt.live?.error
           ? '<span class="warn">確認できません: ' + esc(bt.live.error) + '</span>'
           : bt.live
-            ? (bt.live.ready ? '<span class="ok">応答可能 ' + bt.live.ready + '台</span>' : '') +
-              (bt.live.starting ? ' <span class="warn">起動中 ' + bt.live.starting + '台</span>' : '') +
-              (bt.live.running ? ' 実行中 ' + bt.live.running + '台' : '') +
-              (bt.live.inQueue ? ' / 待ち ' + bt.live.inQueue + '件' : '') +
-              (!bt.live.ready && !bt.live.starting && !bt.live.running ? '停止中（次のリクエストで起動）' : '')
+            ? workerStates(bt.live)
             : '—') +
         '</dd>' +
         '<dt>起動処理</dt><dd id="bt-state">' +
         (bt.warming?.ready
-          ? '<span class="ok">完了</span>'
+          ? '<span class="ok">完了</span>' + (bt.warming.stopped ? '（その後、待機に戻りました）' : '')
+          : bt.warming?.standby
+            ? '待機中（すぐ起動できる・課金なし）'
           : bt.warming?.starting
             ? '起動中（' + bt.warming.since + '秒前に開始' + (bt.warming.queued ? ' / 待ち ' + bt.warming.queued + '件' : '') + '）'
             : bt.warming?.error
@@ -2259,7 +2273,8 @@ async function renderBreakthroughTab(body) {
         '<span class="sm">チャット・エージェントでこのモデルを使う</span></label>' +
         (bt.active
           ? '<button class="btn danger" id="bt-off">' +
-            (bt.live?.ready || bt.live?.running || bt.live?.starting ? '停止（課金を止める）' : '無効化（起動しないようにする）') +
+            // Only a running worker bills; anything else is merely kept from starting.
+            (bt.live?.running ? '停止（課金を止める）' : '無効化（起動しないようにする）') +
             '</button><button class="btn" id="bt-warm">いま起動する</button>'
           : '<button class="btn primary" id="bt-activate">有効化する</button>') +
         '<button class="btn" id="bt-reset">キューを空にする</button>' +

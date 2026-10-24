@@ -524,6 +524,38 @@ export async function health(apiKey, endpointId) {
 }
 
 /**
+ * RunPod's /health worker counts, sorted by what they cost.
+ *
+ * "ready" is not "running". Per RunPod's docs only Running is billed — the
+ * cold start, the jobs and the idle timeout. A worker that has scaled down
+ * but is kept on the host for a fast restart (FlashBoot) is "idle", and
+ * /health counts it as "ready" too (runpodctl's source notes endpoints with
+ * running 0 reporting ready 1–5). So "応答可能" on ready read as "a GPU is up
+ * and billing" when it was a stopped worker costing nothing. Initializing
+ * (pulling the image or the cached model), throttled and unhealthy workers
+ * are unbilled as well.
+ */
+export function describeWorkers(health) {
+  const w = health?.workers || {};
+  const j = health?.jobs || {};
+  const n = (v) => Number(v) || 0;
+  const running = n(w.running);
+  // The same stopped worker can appear as both idle and ready.
+  const standby = Math.max(0, Math.max(n(w.idle), n(w.ready)) - running);
+  return {
+    running,
+    standby,
+    initializing: n(w.initializing),
+    throttled: n(w.throttled),
+    unhealthy: n(w.unhealthy),
+    inQueue: n(j.inQueue),
+    inProgress: n(j.inProgress),
+    completed: n(j.completed),
+    billed: running > 0,
+  };
+}
+
+/**
  * Brings a worker up, once.
  *
  * The obvious loop — send a request, give up, send another — piles jobs onto
@@ -534,9 +566,11 @@ export async function health(apiKey, endpointId) {
  *
  * So exactly one request is sent and left to finish, and progress is reported
  * from RunPod's health in parallel. Whichever settles first decides: the reply
- * arriving means it is warm, and a worker reaching ready means the same.
+ * arriving means it is warm, and so does health counting one more completed
+ * job. "ready" does not: it also counts a stopped FlashBoot worker, which
+ * appears before the request has even started (see describeWorkers).
  */
-export async function warm(apiKey, endpointId, { onProgress, timeoutMs = DEFAULT_SPEC.executionTimeoutMs } = {}) {
+export async function warm(apiKey, endpointId, { onProgress, timeoutMs = DEFAULT_SPEC.executionTimeoutMs, pollMs = 10000 } = {}) {
   const started = Date.now();
   const base = openaiBase(endpointId);
   let done = false;
@@ -558,12 +592,17 @@ export async function warm(apiKey, endpointId, { onProgress, timeoutMs = DEFAULT
   });
 
   const watch = (async () => {
+    let baseline = null;
     while (!done && Date.now() - started < timeoutMs) {
       const elapsed = Math.round((Date.now() - started) / 1000);
       const h = await health(apiKey, endpointId).catch(() => null);
       onProgress?.({ elapsed, workers: h?.workers || null, jobs: h?.jobs || null });
-      if (Number(h?.workers?.ready) > 0) return { ok: true };
-      await new Promise((r) => setTimeout(r, 10000));
+      if (h) {
+        const { completed } = describeWorkers(h);
+        if (baseline === null) baseline = completed;
+        else if (completed > baseline) return { ok: true };
+      }
+      await new Promise((r) => setTimeout(r, pollMs));
     }
     return { ok: false, timedOut: true };
   })();

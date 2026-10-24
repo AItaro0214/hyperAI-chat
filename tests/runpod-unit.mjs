@@ -17,6 +17,8 @@ import {
   modelCacheResult,
   QWEN38_MEMORY,
   vramEstimate,
+  describeWorkers,
+  warm as warmUp,
   recoverReply,
   failedReason,
   WORKER_META_KEY,
@@ -342,6 +344,38 @@ globalThis.fetch = async (url) => {
 const rec = await recoverReply('key', 'ep', { since: 1000 });
 check('回収: 判断のジョブを返答として取り込まない', rec.found === null && rec.decisions === 1, JSON.stringify(rec).slice(0, 200));
 check('  失敗したジョブの理由を返す', rec.failed.length === 1 && rec.failed[0].error.includes('34479'), JSON.stringify(rec.failed));
+globalThis.fetch = realFetch;
+
+/* --------------------- workers: only "running" bills ---------------------- */
+// Seen in production ~90 s after the last job, idleTimeout 15: a stopped
+// FlashBoot worker, counted as both idle and ready.
+const after = describeWorkers({ workers: { idle: 1, ready: 1, running: 0, initializing: 0 }, jobs: { completed: 7, failed: 2 } });
+check('ready だけのワーカーは待機（課金なし）', after.billed === false && after.running === 0 && after.standby === 1, JSON.stringify(after));
+check('  idle と ready の二重計上をしない', after.standby === 1);
+const busy = describeWorkers({ workers: { idle: 0, ready: 1, running: 1 }, jobs: { inProgress: 1 } });
+check('running があれば課金中', busy.billed === true && busy.running === 1 && busy.standby === 0, JSON.stringify(busy));
+const prep = describeWorkers({ workers: { initializing: 1 }, jobs: { inQueue: 1 } });
+check('準備中は課金なし', prep.billed === false && prep.initializing === 1 && prep.inQueue === 1);
+check('health が無くても壊れない', describeWorkers(null).billed === false && describeWorkers(undefined).standby === 0);
+
+// A warm-up is done when its job is, not when a stopped worker shows as ready.
+const seq = [
+  { workers: { idle: 1, ready: 1 }, jobs: { completed: 3, inQueue: 1 } },
+  { workers: { idle: 1, ready: 1 }, jobs: { completed: 3, inQueue: 1 } },
+  { workers: { running: 1, ready: 1 }, jobs: { completed: 3, inProgress: 1 } },
+  { workers: { running: 1, ready: 1 }, jobs: { completed: 4 } },
+];
+let healthCalls = 0;
+globalThis.fetch = async (url) => {
+  if (String(url).endsWith('/health')) {
+    const body = seq[Math.min(healthCalls++, seq.length - 1)];
+    return { ok: true, status: 200, json: async () => body };
+  }
+  return new Promise(() => {}); // the probe: still waiting on the cold start
+};
+const warmed = await warmUp('key', 'ep', { timeoutMs: 5000, pollMs: 5 });
+check('ウォームアップ: ready では完了にしない', healthCalls === 4, 'health calls ' + healthCalls);
+check('  ジョブの完了で完了にする', warmed.ready === true);
 globalThis.fetch = realFetch;
 
 const passed = results.filter(([ok]) => ok).length;

@@ -46,6 +46,7 @@ import {
   updateEndpoint,
   setActive,
   getEndpoint,
+  describeWorkers,
   diagnose,
   validateSpec,
   resolveSpec,
@@ -258,13 +259,18 @@ async function describeWarming(env, live) {
 
   const since = Math.round((Date.now() - record.started) / 1000);
   if (live?.error) return { since, unknown: true, error: live.error };
-  if (Number(live?.ready) > 0) return { since, ready: true };
 
-  const busy = (Number(live?.starting) || 0) + (Number(live?.running) || 0);
-  if (busy) return { since, starting: true, queued: Number(live?.inQueue) || 0 };
+  // Still on its way: queued, preparing, or up and working through the probe.
+  const pending = (live?.inQueue || 0) + (live?.inProgress || 0);
+  if (pending || live?.initializing || live?.throttled) return { since, starting: true, queued: live?.inQueue || 0 };
+  if (live?.running) return { since, ready: true };
 
-  // Nothing running and nothing queued: whatever was started is not.
+  /* Done and since stopped: with a short idle timeout the worker scales down
+   * seconds after the warm-up answers. It is kept for a fast restart and
+   * costs nothing, which is the expected end state, not a failure. */
+  if (record.ready) return { since, ready: true, stopped: true };
   if (record.error) return { since, error: record.error };
+  if (live?.standby) return { since, standby: true };
   return { since, stalled: true };
 }
 
@@ -294,17 +300,11 @@ admin.get('/breakthrough', async (c) => {
     if (key) {
       const ep = await getEndpoint(key, settings.runpodEndpointId).catch(() => null);
       out_workersMax = ep?.workersMax ?? null;
+      /* Sorted by what bills: only "running" does. "ready" also counts a
+       * stopped worker kept for a fast restart, so it is not shown as one
+       * that is up (see describeWorkers). */
       live = await health(key, settings.runpodEndpointId)
-        .then((h) => ({
-          workers: h.workers || null,
-          jobs: h.jobs || null,
-          // "ready" is a worker that can answer now; "initializing" is one
-          // still pulling the image or loading weights.
-          ready: Number(h.workers?.ready) || 0,
-          starting: (Number(h.workers?.initializing) || 0) + (Number(h.workers?.throttled) || 0),
-          running: Number(h.workers?.running) || 0,
-          inQueue: Number(h.jobs?.inQueue) || 0,
-        }))
+        .then((h) => ({ workers: h.workers || null, jobs: h.jobs || null, ...describeWorkers(h) }))
         .catch((e) => ({ error: String(e.message).slice(0, 200) }));
     }
   }
