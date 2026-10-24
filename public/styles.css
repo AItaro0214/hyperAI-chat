@@ -16,6 +16,8 @@
   --ok: #12855c;
   --warn: #a06a10;
   --err: #d02a40;
+  /* The select arrow, drawn in --ink-2, for where the native one is replaced. */
+  --chevron: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1.5l5 5 5-5' fill='none' stroke='%234a5060' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
 
   /* glass */
   --glass: rgba(255, 255, 255, .55);
@@ -568,6 +570,40 @@ table.data td.num { text-align: right; font-family: var(--mono); font-size: 12.5
   .grid2 { grid-template-columns: 1fr; }
   .kv { grid-template-columns: 1fr; gap: 2px 0; }
   .kv dt { margin-top: 8px; }
+
+  /* Admin console. Seven tabs do not fit a phone, and scrolled sideways the
+   * active one ends up off screen; wrapped, every tab is in view. */
+  #admin-tabs { flex-wrap: wrap; overflow-x: visible; gap: 4px; padding: 8px 10px; }
+  #admin-tabs .tab { padding: 7px 12px; }
+
+  /* The native select indents its text past the inputs beside it and, on iOS,
+   * ignores their height. Drawn like the inputs instead, with its own arrow.
+   * The arrow is set again on focus: the focus rule's `background` shorthand
+   * would otherwise clear it. */
+  select {
+    -webkit-appearance: none; appearance: none;
+    padding-right: 38px;
+    background-image: var(--chevron); background-repeat: no-repeat;
+    background-position: right 14px center; background-size: 12px 8px;
+  }
+  select:focus { background-image: var(--chevron); background-repeat: no-repeat; background-position: right 14px center; background-size: 12px 8px; }
+  select.sm, select.sm:focus { padding-right: 34px; background-position: right 12px center; }
+
+  /* A short input beside a button: the button would break its label in two
+   * rather than move, so both take a line of their own as needed. */
+  /* div only: label.row holds a radio or checkbox and its text, which should
+   * stay side by side. */
+  .card div.row { flex-wrap: wrap; }
+  .card div.row > .input { flex: 1 1 180px; max-width: none !important; }
+  .card div.row > .btn { white-space: nowrap; }
+
+  /* Squeezed to the screen, headers broke a character at a time ("回/数")
+   * and the free-text columns (UA, detail) shrank to one letter. Those
+   * columns keep a width instead, and .scroll-x scrolls the rest into view. */
+  table.data th { white-space: nowrap; }
+  table.data td.xs { min-width: 14em; }
+  table.data .tag { white-space: nowrap; }
+  a.btn { text-decoration: none; }
   .empty { margin: 8vh auto; }
   .toast { top: calc(env(safe-area-inset-top) + 70px); bottom: auto; }
   @keyframes toast-in { from { transform: translate(-50%, -14px) scale(.94); opacity: 0; } }
