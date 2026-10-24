@@ -4,7 +4,8 @@ import { now } from '../lib/auth.js';
 import { requireAuth } from '../lib/guard.js';
 import { getSettings, logUsage } from '../lib/store.js';
 import { getCatalog, findModel, estimateChatCost } from '../lib/models.js';
-import { openaiBase as runpodBase, describeStartup, DEFAULT_SPEC as RUNPOD_SPEC } from '../lib/runpod.js';
+import { openaiBase as runpodBase, describeStartup } from '../lib/runpod.js';
+import { runpodChatFetch, webhookUrl, queueNotice } from '../lib/runpod-jobs.js';
 import {
   webSearch as webSearch2,
   webFetch as webFetch2,
@@ -368,6 +369,12 @@ chat.post('/chat', async (c) => {
     let startup = null;
     // Breakthrough only: each search and page read, and what it ran on.
     const searches = [];
+    /* Breakthrough only: the RunPod job the reply is being written by. Saved
+     * the moment it exists, so the reply can be collected without this Worker
+     * (see runpod-jobs.js); `detached` means this Worker stopped following it
+     * and the reply is still to come. */
+    let runpodJob = null;
+    let detached = false;
 
     // Once the browser goes away, keep draining the provider so the answer is
     // still saved to the room instead of being lost mid-flight.
@@ -385,8 +392,8 @@ chat.post('/chat', async (c) => {
       await emit('status', { phase });
     };
 
-    const savePartial = async (final) => {
-      if (!final && (text === savedText || Date.now() - lastSaved < 8000)) return;
+    const savePartial = async (final, { force = false } = {}) => {
+      if (!final && !force && (text === savedText || Date.now() - lastSaved < 8000)) return;
       lastSaved = Date.now();
       savedText = text;
       try {
@@ -420,10 +427,17 @@ chat.post('/chat', async (c) => {
         reasoningEffort,
         notices: noticesOut(final),
         imageOutput,
-        partial: !final,
+        // A reply this Worker stopped following is not finished, whatever it says.
+        partial: !final || detached,
         elapsed: now() - startedAt,
       };
       if (startup) base.startup = startup;
+      if (runpodJob) {
+        base.runpodJob = {
+          ...runpodJob,
+          status: final && !detached ? (failed ? 'FAILED' : 'COMPLETED') : runpodJob.status,
+        };
+      }
       if (searches.length) base.searches = searches.slice(0, MAX_TOOL_RECORDS * 2);
       let json = JSON.stringify({ ...base, tools });
       if (json.length > MAX_META_BYTES) {
@@ -471,6 +485,37 @@ chat.post('/chat', async (c) => {
         reasoningEffort,
         title: roomTitle,
       });
+      /* Breakthrough requests run as RunPod jobs rather than sync requests,
+       * so a long queue or a slow startup — up to two hours in all — does not
+       * drop them. The wait is shown as it goes, every ten seconds at most. */
+      let lastWaitNote = 0;
+      const onWaitStatus = (s) => {
+        if (s.output || Date.now() - lastWaitNote < 10000) return;
+        lastWaitNote = Date.now();
+        emit('meta', { notices: [queueNotice(s)] }).catch(() => {});
+      };
+      const decisionFetch = breakthroughOn
+        ? runpodChatFetch(apiKey, settings.runpodEndpointId, { onStatus: onWaitStatus })
+        : undefined;
+      const replyFetch = breakthroughOn
+        ? runpodChatFetch(apiKey, settings.runpodEndpointId, {
+            webhook: await webhookUrl(c.env, assistantId),
+            onJob: async (jobId) => {
+              runpodJob = { id: jobId, endpointId: settings.runpodEndpointId, submittedAt: Date.now(), status: 'IN_QUEUE' };
+              await savePartial(false, { force: true });
+            },
+            onStatus: (s) => {
+              if (runpodJob && s.status) runpodJob.status = s.status;
+              onWaitStatus(s);
+            },
+            onDetach: () => {
+              detached = true;
+            },
+          })
+        : null;
+      const sendReply = () =>
+        replyFetch ? replyFetch(req.url, { body: JSON.stringify(req.body) }) : postJson(req.url, req.headers, req.body);
+
       /* The model decides whether to search, rather than searching always.
        * One non-streaming round trip with the tools offered; if it asks for
        * none, nothing is spent and the reply streams as usual. */
@@ -487,6 +532,7 @@ chat.post('/chat', async (c) => {
           tools: chatTools({ engines, strengths: ENGINE_STRENGTHS }),
           maxRounds: Number(settings.searchRounds) || 2,
           promptBudget,
+          fetchImpl: decisionFetch,
           /* The decisions come back whole rather than streamed, and carry the
            * worker's startup details too — and on a cold start the first of
            * them is the request that woke it. */
@@ -570,33 +616,15 @@ chat.post('/chat', async (c) => {
 
       await setPhase(webSearch ? 'searching' : 'connecting');
 
-      /* A cold GPU takes minutes to answer the first request. The stream is
-       * kept alive with phase updates so the browser does not give up and the
-       * user can see that something is still happening. */
-      let keepalive = null;
-      if (breakthroughOn) {
-        const started = Date.now();
-        keepalive = setInterval(() => {
-          const secs = Math.round((Date.now() - started) / 1000);
-          /* The wait is for generation as much as for startup, and the reply
-           * is not streamed — so without this the screen shows nothing at all
-           * for however long the model takes, which is indistinguishable from
-           * a hang. */
-          const what =
-            secs < 60
-              ? 'GPU の応答を待っています… ' + secs + '秒'
-              : '起動中… ' + Math.floor(secs / 60) + '分' + (secs % 60) + '秒（重みの読み込みに数分かかります）';
-          emit('meta', { notices: [what] }).catch(() => {});
-        }, 10000);
-      }
-
-      // Matches the endpoint's own executionTimeoutMs; anything shorter gives
-      // up on a cold start that the endpoint was still allowed to finish.
-      const upstreamTimeout = breakthroughOn ? RUNPOD_SPEC.executionTimeoutMs : undefined;
-      let upstream = await postJson(req.url, req.headers, req.body, upstreamTimeout).finally(() =>
-        clearInterval(keepalive)
-      );
-      if (!upstream.ok) {
+      /* A cold GPU, or a queue behind one, can keep the reply waiting for a
+       * long time; the job's status is shown as it changes (onWaitStatus), so
+       * the screen never sits silent long enough to look hung. */
+      let upstream = await sendReply();
+      if (!upstream.ok && detached) {
+        // Not a failure: the job carries on, and the reply arrives without us.
+        req.notices.push('応答の追跡を打ち切りました。RunPod で処理が続いており、終わると自動で入ります（開き直すと表示されます）');
+        await emit('meta', { notices: req.notices });
+      } else if (!upstream.ok) {
         const detail = await readProviderError(upstream);
         // Fetched web pages can blow past the window; one retry with just the
         // latest turns usually succeeds instead of failing outright.
@@ -621,9 +649,11 @@ chat.post('/chat', async (c) => {
             notices: req.notices,
             title: roomTitle,
           });
-          upstream = await postJson(req.url, req.headers, req.body, upstreamTimeout);
+          upstream = await sendReply();
         }
-        if (!upstream.ok) {
+        if (!upstream.ok && detached) {
+          req.notices.push('応答の追跡を打ち切りました。RunPod で処理が続いており、終わると自動で入ります');
+        } else if (!upstream.ok) {
           const body = isContextError(detail) ? await readProviderError(upstream) : detail;
           if (upstream.status === 429) {
             failed = 'レート制限 (429): ' + body + rateLimitHint(provider, req.effectiveModel);
@@ -633,11 +663,11 @@ chat.post('/chat', async (c) => {
           await emit('error', { message: failed });
         }
       }
-      if (!failed && !upstream.body) {
+      if (!failed && !detached && !upstream.body) {
         failed = 'プロバイダから応答本文が返りませんでした';
         await emit('error', { message: failed });
       }
-      if (!failed) {
+      if (!failed && upstream.ok) {
         await consumeChatStream(upstream, {
           onText: async (t) => {
             text += t;

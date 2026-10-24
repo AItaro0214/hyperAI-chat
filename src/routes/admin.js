@@ -409,8 +409,13 @@ admin.post('/breakthrough/reset', async (c) => {
     done.purgeError = e.message;
   }
   try {
-    await updateEndpoint(key, settings.runpodEndpointId, { idleTimeout: DEFAULT_SPEC.idleTimeout });
+    // The endpoint's own defaults; replies set their execution limit per job.
+    await updateEndpoint(key, settings.runpodEndpointId, {
+      idleTimeout: DEFAULT_SPEC.idleTimeout,
+      executionTimeoutMs: DEFAULT_SPEC.executionTimeoutMs,
+    });
     done.idleTimeout = DEFAULT_SPEC.idleTimeout;
+    done.executionTimeoutMs = DEFAULT_SPEC.executionTimeoutMs;
   } catch (e) {
     done.patchError = e.message;
   }

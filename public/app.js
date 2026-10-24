@@ -782,6 +782,16 @@ function messageNode(msg) {
     wrap.appendChild(n);
   }
 
+  // Still being written on RunPod; it fills in when the job ends.
+  const job = msg.meta?.runpodJob;
+  if (msg.meta?.partial && job?.id && !['COMPLETED', 'FAILED', 'CANCELLED', 'TIMED_OUT', 'LOST'].includes(job.status)) {
+    const n = el('div', 'notice');
+    n.innerHTML = '<i>' + icon('warning', 15) + '</i>';
+    const label = job.status === 'IN_QUEUE' ? '待ち行列で待機中' : job.status === 'IN_PROGRESS' ? '処理中' : '確認中';
+    n.appendChild(el('span', null, 'RunPod で' + label + 'です。終わると自動でここに入ります（最大2時間）。'));
+    wrap.appendChild(n);
+  }
+
   if (msg.meta?.searches?.length) wrap.appendChild(searchLog(msg.meta.searches));
 
   if (msg.reasoning) {
@@ -1196,6 +1206,10 @@ function createStreamView(model) {
   });
 }
 
+/* How long a breakthrough job can still produce a reply: the server's two
+ * hours (JOB_WAIT_MS in runpod.js) from submission, plus a little. */
+const jobDeadline = (job) => Number(job.submittedAt) + 2 * 3600 * 1000 + 5 * 60 * 1000;
+
 /**
  * Waits for a reply the connection dropped in the middle of.
  *
@@ -1204,10 +1218,14 @@ function createStreamView(model) {
  * watching. This watches: it polls the row until it stops being marked
  * partial, then lets the caller re-render.
  */
-async function followUnfinished(roomId, messageId, { tries = 120, everyMs = 3000 } = {}) {
-  toast('接続が切れましたが、応答は続いています。取得しています…');
-  for (let i = 0; i < tries; i++) {
-    await new Promise((r) => setTimeout(r, everyMs));
+async function followUnfinished(roomId, messageId, { tries = 120, everyMs = 3000, quiet = false, until = 0 } = {}) {
+  if (!quiet) toast('接続が切れましたが、応答は続いています。取得しています…');
+  /* A breakthrough reply has a RunPod job behind it that may run for up to
+   * two hours; the server settles it whenever the room is read, so reading
+   * the room now and then is all following it takes. */
+  let deadline = until;
+  for (let i = 0; i < tries || Date.now() < deadline; i++) {
+    await new Promise((r) => setTimeout(r, deadline ? 15000 : everyMs));
     let res;
     try {
       res = await api('/api/rooms/' + roomId);
@@ -1217,12 +1235,17 @@ async function followUnfinished(roomId, messageId, { tries = 120, everyMs = 3000
     const row = (res.messages || []).find((m) => m.id === messageId);
     if (!row) continue;
 
-    // Render what has arrived so far, so a long reply is visible while it lands.
-    state.room = res.room;
-    state.messages = res.messages;
-    renderMessages();
+    // Render what has arrived so far, so a long reply is visible while it
+    // lands — unless another room has been opened in the meantime.
+    if (state.roomId === roomId && !state.streaming) {
+      state.room = res.room;
+      state.messages = res.messages;
+      renderMessages();
+    }
 
     const partial = row.meta?.partial === true;
+    const job = row.meta?.runpodJob;
+    if (partial && job?.submittedAt && !deadline) deadline = jobDeadline(job);
     if (!partial) {
       if (row.meta?.abandoned && !row.content) {
         toast('応答は完了しませんでした（生成が長すぎて記録が途切れました）。もう一度お試しください。', 'err');
@@ -1386,6 +1409,12 @@ async function send({ content = '', attachments = [], regenerate = false }) {
         state.messages = res.messages;
         $('#room-title').value = res.room.title;
         renderMessages();
+        /* The stream ended but the reply did not: a RunPod job still running
+         * after this Worker stopped following it. Keep checking, quietly. */
+        const row = res.messages.find((m) => m.id === pendingMessageId);
+        if (sawDone && row?.meta?.partial && row.meta.runpodJob?.submittedAt) {
+          followUnfinished(state.roomId, pendingMessageId, { quiet: true, tries: 0, until: jobDeadline(row.meta.runpodJob) });
+        }
       } catch {
         /* keep what is on screen */
       }

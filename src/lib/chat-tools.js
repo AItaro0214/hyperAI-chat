@@ -194,12 +194,17 @@ export async function resolveTools({
   timeoutMs = 900000,
   budgetMs = DEFAULT_BUDGET_MS,
   promptBudget = 0,
+  // A self-hosted model's decisions go through RunPod jobs (runpodChatFetch).
+  fetchImpl = fetch,
 }) {
   const messages = body.messages.slice();
   const calls = [];
   const asked = new Set();
   const limit = Math.max(1, Math.min(Number(maxRounds) || MAX_ROUNDS, ROUND_CEILING));
-  const started = Date.now();
+  /* The clock starts when the model first answers. The first decision is
+   * usually what wakes a cold worker, and the queue and the startup before
+   * it — minutes, sometimes tens of them — are not searching. */
+  let started = null;
   let rounds = 0;
   let stoppedBecause = null;
 
@@ -207,7 +212,7 @@ export async function resolveTools({
   const roundBudget = promptBudget > 0 ? Math.max(1000, promptBudget - 700) : 0;
 
   for (rounds = 1; rounds <= limit; rounds++) {
-    if (Date.now() - started > budgetMs) {
+    if (started !== null && Date.now() - started > budgetMs) {
       stoppedBecause = '時間切れ';
       break;
     }
@@ -239,7 +244,7 @@ export async function resolveTools({
       max_tokens: 700,
     };
 
-    const res = await fetch(url, {
+    const res = await fetchImpl(url, {
       method: 'POST',
       headers,
       body: JSON.stringify(probe),
@@ -255,6 +260,7 @@ export async function resolveTools({
     }
 
     const json = await res.json().catch(() => null);
+    if (started === null) started = Date.now();
     if (json) await onReply?.(json);
     const message = json?.choices?.[0]?.message;
     const wanted = message?.tool_calls || [];

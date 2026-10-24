@@ -16,6 +16,21 @@
 
 const REST = 'https://rest.runpod.io/v1';
 const RUN = 'https://api.runpod.ai/v2';
+export const RUN_BASE = RUN;
+
+/* How long a breakthrough reply may take, all told (see runpod-jobs.js).
+ *
+ * The wait is queue + startup + generation, and the first can be most of it:
+ * a fresh endpoint spends twenty minutes having RunPod cache the model before
+ * a worker can start at all. So the two hours is the app's total wait; the
+ * job's own executionTimeout (counted from pickup) is the same, so it never
+ * cuts what the total still allows; and its lifespan (ttl, from submission,
+ * after which RunPod deletes it in any state) has an hour more, for the
+ * result to be collected. */
+const HOUR_MS = 3600 * 1000;
+export const JOB_WAIT_MS = 2 * HOUR_MS;
+export const JOB_EXECUTION_MS = 2 * HOUR_MS;
+export const JOB_TTL_MS = 3 * HOUR_MS;
 const GRAPHQL = 'https://api.runpod.io/graphql';
 
 /* The maintained vLLM worker. Pinned rather than :latest so a breaking change
@@ -129,9 +144,9 @@ export const LLAMACPP_SPEC = {
    * Not the 1-second minimum: an agent turn pauses between rounds while it
    * searches, and dropping the worker inside one turn would reload it twice. */
   idleTimeout: 15,
-  /* Generous: with the cache missing, the first request waits on a 78 GiB
-   * download as well as on loading. */
-  executionTimeoutMs: 1800000,
+  /* The endpoint's default, for jobs that do not set their own: the replies
+   * do (JOB_EXECUTION_MS), and this matches it. */
+  executionTimeoutMs: 7200000,
   // Only used by the fallback download: 78 GiB of shards, plus headroom.
   containerDiskInGb: 100,
 };
@@ -564,61 +579,51 @@ export function describeWorkers(health) {
  * spending GPU time on nothing. Loading 16GB takes minutes, which is longer
  * than any sensible client timeout, so a retry is always the wrong move here.
  *
- * So exactly one request is sent and left to finish, and progress is reported
- * from RunPod's health in parallel. Whichever settles first decides: the reply
- * arriving means it is warm, and so does health counting one more completed
- * job. "ready" does not: it also counts a stopped FlashBoot worker, which
- * appears before the request has even started (see describeWorkers).
+ * So exactly one job is sent and followed by its id. It goes in through /run,
+ * not the OpenAI route: a sync request is dropped long before a fresh
+ * endpoint's twenty minutes of model caching is over, and its job with it.
+ * The job ending is the answer — "ready" is not, since it also counts a
+ * stopped FlashBoot worker, which appears before the job has even started
+ * (see describeWorkers).
  */
-export async function warm(apiKey, endpointId, { onProgress, timeoutMs = DEFAULT_SPEC.executionTimeoutMs, pollMs = 10000 } = {}) {
+export async function warm(apiKey, endpointId, { onProgress, timeoutMs = JOB_WAIT_MS, pollMs = 10000 } = {}) {
   const started = Date.now();
-  const base = openaiBase(endpointId);
-  let done = false;
-
-  const probe = fetch(base + '/chat/completions', {
+  const headers = { authorization: 'Bearer ' + apiKey, 'content-type': 'application/json' };
+  const submit = await fetch(RUN + '/' + endpointId + '/run', {
     method: 'POST',
-    headers: { authorization: 'Bearer ' + apiKey, 'content-type': 'application/json' },
-    body: JSON.stringify({ model: 'breakthrough', messages: [{ role: 'user', content: 'hi' }], max_tokens: 1 }),
-    signal: AbortSignal.timeout(timeoutMs),
-  }).then(async (res) => {
-    if (res.ok) return { ok: true };
-    const detail = await res.text().catch(() => '');
-    // A 4xx that is not a queue problem is a configuration error; waiting
-    // cannot fix it, so it is raised rather than retried.
-    if (res.status >= 400 && res.status < 500 && res.status !== 429) {
-      throw new Error('エンドポイントが ' + res.status + ' を返しました。設定を確認してください: ' + detail.slice(0, 300));
-    }
-    return { ok: false, status: res.status, detail };
+    headers,
+    body: JSON.stringify({
+      input: {
+        openai_route: '/v1/chat/completions',
+        openai_input: { model: 'breakthrough', messages: [{ role: 'user', content: 'hi' }], max_tokens: 1 },
+      },
+      policy: { executionTimeout: JOB_EXECUTION_MS, ttl: JOB_TTL_MS },
+    }),
+    signal: AbortSignal.timeout(60000),
   });
-
-  const watch = (async () => {
-    let baseline = null;
-    while (!done && Date.now() - started < timeoutMs) {
-      const elapsed = Math.round((Date.now() - started) / 1000);
-      const h = await health(apiKey, endpointId).catch(() => null);
-      onProgress?.({ elapsed, workers: h?.workers || null, jobs: h?.jobs || null });
-      if (h) {
-        const { completed } = describeWorkers(h);
-        if (baseline === null) baseline = completed;
-        else if (completed > baseline) return { ok: true };
-      }
-      await new Promise((r) => setTimeout(r, pollMs));
-    }
-    return { ok: false, timedOut: true };
-  })();
-
-  try {
-    const result = await Promise.race([probe, watch]);
-    if (result.ok) return { ready: true, seconds: Math.round((Date.now() - started) / 1000) };
-    if (result.timedOut) {
-      throw new Error(
-        '起動が ' + Math.round(timeoutMs / 60000) + ' 分以内に完了しませんでした。GPU の在庫切れか、モデルが大きすぎる可能性があります。'
-      );
-    }
-    throw new Error('エンドポイントが ' + result.status + ' を返しました: ' + String(result.detail).slice(0, 300));
-  } finally {
-    done = true;
+  const queued = await submit.json().catch(() => null);
+  if (!queued?.id) {
+    throw new Error('起動用のジョブを送れませんでした（' + submit.status + '）: ' + JSON.stringify(queued || {}).slice(0, 300));
   }
+
+  while (Date.now() - started < timeoutMs) {
+    const elapsed = Math.round((Date.now() - started) / 1000);
+    const [job, h] = await Promise.all([
+      fetch(RUN + '/' + endpointId + '/status/' + encodeURIComponent(queued.id), { headers, signal: AbortSignal.timeout(30000) })
+        .then((r) => r.json())
+        .catch(() => null),
+      health(apiKey, endpointId).catch(() => null),
+    ]);
+    onProgress?.({ elapsed, workers: h?.workers || null, jobs: h?.jobs || null, jobId: queued.id, jobStatus: job?.status || null });
+    if (job?.status === 'COMPLETED') return { ready: true, seconds: elapsed, jobId: queued.id };
+    if (['FAILED', 'CANCELLED', 'TIMED_OUT'].includes(job?.status)) {
+      throw new Error('起動用のジョブが ' + job.status + ' で終わりました: ' + failedReason(job));
+    }
+    await new Promise((r) => setTimeout(r, pollMs));
+  }
+  throw new Error(
+    '起動が ' + Math.round(timeoutMs / 60000) + ' 分以内に完了しませんでした（待ち行列・準備・読み込みの合計）。GPU の在庫切れか、モデルの準備に時間がかかっています。'
+  );
 }
 
 /**

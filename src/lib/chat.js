@@ -272,6 +272,8 @@ export function clampEffort(provider, modelId, effort) {
   return { effort, notice: null };
 }
 
+export const BREAKTHROUGH_MAX_TOKENS = 32768;
+
 /* The three depths the self-hosted template knows, from the app's wider set. */
 function templateEffort(effort) {
   const e = String(effort || '').toLowerCase();
@@ -313,7 +315,10 @@ export function buildRequest({ provider, model, messages, options = {}, apiKey, 
      * watchable and can be stopped, so the cap only has to prevent the runaway
      * case. */
     if (stream) btBody.stream_options = { include_usage: true };
-    btBody.max_tokens = Number(options.maxTokens) > 0 ? Number(options.maxTokens) : 16384;
+    /* And a ceiling on what a setting can ask for: a job may now run for two
+     * hours, and the length of the reply is what keeps that from being two
+     * hours of an 80GB GPU generating. 32K is minutes, not hours. */
+    btBody.max_tokens = Math.min(Number(options.maxTokens) > 0 ? Number(options.maxTokens) : 16384, BREAKTHROUGH_MAX_TOKENS);
     /* The one reasoning control a self-hosted Qwen has: thinking on or off,
      * passed through the chat template rather than as a top-level field. */
     /* Off unless asked for. Qwen thinks by default, and on one rented GPU

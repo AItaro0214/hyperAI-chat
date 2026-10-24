@@ -4,6 +4,7 @@ import { now } from '../lib/auth.js';
 import { requireAuth } from '../lib/guard.js';
 import { getSettings, getApiKey } from '../lib/store.js';
 import { recoverReply } from '../lib/runpod.js';
+import { pendingReplies, settleMessage } from '../lib/runpod-jobs.js';
 
 const rooms = new Hono();
 rooms.use('*', requireAuth);
@@ -128,6 +129,15 @@ rooms.post('/', async (c) => {
 rooms.get('/:id', async (c) => {
   const room = await ownedRoom(c, c.req.param('id'));
   if (!room) return c.json({ error: 'not found' }, 404);
+  /* A breakthrough reply still waiting on its RunPod job is looked up once
+   * more before the room is shown, so a tab that was closed comes back to a
+   * finished answer. At most every 20 seconds per reply. */
+  const waiting = await pendingReplies(c.env, { roomId: room.id, limit: 3 }).catch(() => []);
+  for (const row of waiting) {
+    const checkedAt = parseJson(row.meta, {})?.runpodJob?.checkedAt || 0;
+    if (Date.now() - checkedAt < 20000) continue;
+    await settleMessage(c.env, row).catch(() => {});
+  }
   const { results } = await c.env.DB.prepare('SELECT * FROM messages WHERE room_id = ? ORDER BY created_at ASC, rowid ASC')
     .bind(room.id)
     .all();
@@ -295,6 +305,19 @@ rooms.post('/:id/messages/:mid/recover', async (c) => {
     .bind(c.req.param('mid'), room.id)
     .first();
   if (!msg) return c.json({ error: 'message not found' }, 404);
+
+  /* A reply that knows its job is read by id — exact, where the search below
+   * can only guess by time. */
+  if (parseJson(msg.meta, {})?.runpodJob?.id) {
+    const out = await settleMessage(c.env, msg).catch((e) => ({ state: 'error', error: e.message }));
+    const updated = await c.env.DB.prepare('SELECT * FROM messages WHERE id = ?').bind(msg.id).first();
+    if (out.state === 'settled' || out.state === 'lost') {
+      return c.json({ ok: !updated.error, message: shapeMessage(updated), reason: updated.error || undefined, matched: true });
+    }
+    if (out.state === 'pending') {
+      return c.json({ ok: false, pending: 1, reason: 'RunPod で処理中です（' + out.status + '）。終わると自動で入ります。' });
+    }
+  }
 
   const settings = await getSettings(c.env);
   const endpointId = settings.runpodEndpointId;

@@ -359,23 +359,41 @@ check('準備中は課金なし', prep.billed === false && prep.initializing ===
 check('health が無くても壊れない', describeWorkers(null).billed === false && describeWorkers(undefined).standby === 0);
 
 // A warm-up is done when its job is, not when a stopped worker shows as ready.
-const seq = [
-  { workers: { idle: 1, ready: 1 }, jobs: { completed: 3, inQueue: 1 } },
-  { workers: { idle: 1, ready: 1 }, jobs: { completed: 3, inQueue: 1 } },
-  { workers: { running: 1, ready: 1 }, jobs: { completed: 3, inProgress: 1 } },
-  { workers: { running: 1, ready: 1 }, jobs: { completed: 4 } },
-];
-let healthCalls = 0;
-globalThis.fetch = async (url) => {
-  if (String(url).endsWith('/health')) {
-    const body = seq[Math.min(healthCalls++, seq.length - 1)];
-    return { ok: true, status: 200, json: async () => body };
+// It goes in through /run, so a long queue does not drop it.
+const jobSeq = ['IN_QUEUE', 'IN_QUEUE', 'IN_PROGRESS', 'COMPLETED'];
+let statusCalls = 0;
+let warmSubmit = null;
+globalThis.fetch = async (url, options = {}) => {
+  const u = String(url);
+  if (u.endsWith('/run')) {
+    warmSubmit = JSON.parse(options.body);
+    return { ok: true, status: 200, json: async () => ({ id: 'warm-1', status: 'IN_QUEUE' }) };
   }
-  return new Promise(() => {}); // the probe: still waiting on the cold start
+  if (u.includes('/status/')) {
+    const status = jobSeq[Math.min(statusCalls++, jobSeq.length - 1)];
+    return { ok: true, status: 200, json: async () => ({ id: 'warm-1', status }) };
+  }
+  // health: a stopped FlashBoot worker counted as ready from the start
+  return { ok: true, status: 200, json: async () => ({ workers: { idle: 1, ready: 1 }, jobs: { inQueue: 1 } }) };
 };
 const warmed = await warmUp('key', 'ep', { timeoutMs: 5000, pollMs: 5 });
-check('ウォームアップ: ready では完了にしない', healthCalls === 4, 'health calls ' + healthCalls);
-check('  ジョブの完了で完了にする', warmed.ready === true);
+check('ウォームアップ: /run のジョブで起こす', warmSubmit?.input?.openai_route === '/v1/chat/completions' && warmSubmit.input.openai_input.max_tokens === 1);
+check('  ジョブに 2 時間の実行上限と寿命を付ける', warmSubmit.policy.executionTimeout === 7200000 && warmSubmit.policy.ttl === 10800000, JSON.stringify(warmSubmit.policy));
+check('  ready では完了にしない', statusCalls === 4, 'status calls ' + statusCalls);
+check('  ジョブの完了で完了にする', warmed.ready === true && warmed.jobId === 'warm-1');
+globalThis.fetch = async (url) =>
+  String(url).endsWith('/run')
+    ? { ok: true, status: 200, json: async () => ({ id: 'warm-2' }) }
+    : String(url).includes('/status/')
+      ? { ok: true, status: 200, json: async () => ({ status: 'FAILED', error: 'llama-server 500: boom' }) }
+      : { ok: true, status: 200, json: async () => ({}) };
+let warmErr = '';
+try {
+  await warmUp('key', 'ep', { timeoutMs: 5000, pollMs: 5 });
+} catch (e) {
+  warmErr = e.message;
+}
+check('  失敗したら理由を言う', warmErr.includes('FAILED') && warmErr.includes('boom'), warmErr);
 globalThis.fetch = realFetch;
 
 const passed = results.filter(([ok]) => ok).length;

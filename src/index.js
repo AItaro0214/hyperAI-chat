@@ -12,6 +12,7 @@ import exportRoutes from './routes/export.js';
 import imageRoutes from './routes/images.js';
 import agentRoutes from './routes/agent.js';
 import artifactRoutes from './routes/artifacts.js';
+import runpodHookRoutes from './routes/runpod-hook.js';
 
 // The Durable Object class the container binding runs against.
 export { Sandbox } from '@cloudflare/sandbox';
@@ -87,6 +88,8 @@ app.route('/api', exportRoutes);
 app.route('/api', imageRoutes);
 app.route('/api', agentRoutes);
 app.route('/api/artifacts', artifactRoutes);
+// Called by RunPod, not the browser: signed per message instead of a session.
+app.route('/api/runpod', runpodHookRoutes);
 
 app.get('/api/health', (c) => c.json({ ok: true, time: new Date().toISOString() }));
 
@@ -135,6 +138,16 @@ export default {
           if (count) console.log('reaped orphan blobs', count);
         })
         .catch((e) => console.error('media reap failed', e))
+    );
+    /* Breakthrough replies still waiting on a RunPod job — the backstop for
+     * when neither the Worker that sent it nor the webhook brought it in. */
+    const { sweepPendingJobs } = await import('./lib/runpod-jobs.js');
+    ctx.waitUntil(
+      sweepPendingJobs(env)
+        .then(({ checked, settled }) => {
+          if (checked) console.log('runpod sweep', checked, 'checked,', settled, 'settled');
+        })
+        .catch((e) => console.error('runpod sweep failed', e))
     );
   },
 };

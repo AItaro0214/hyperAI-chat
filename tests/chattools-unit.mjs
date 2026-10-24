@@ -230,6 +230,32 @@ await resolveTools({
   onReply: (j) => seenReplies.push(j.hyperai_worker?.source),
 });
 check('判断の応答を onReply に渡す', seenReplies.join() === 'cache', seenReplies.join());
+
+// Breakthrough decisions go through the fetch given (RunPod jobs), not fetch.
+let globalCalls = 0;
+globalThis.fetch = async () => { globalCalls++; return reply({ content: 'x' }); };
+let viaJobs = 0;
+await resolveTools({
+  url: 'u', headers: {}, body: { messages: [{ role: 'user', content: 'x' }] }, execute: async () => 'x',
+  fetchImpl: async () => { viaJobs++; return reply({ content: 'ok' }); },
+});
+check('判断は渡された fetch で送る', viaJobs === 1 && globalCalls === 0);
+
+// A long queue before the first answer is not search time.
+let slowTurn = 0;
+out = await resolveTools({
+  url: 'u', headers: {}, body: { messages: [{ role: 'user', content: 'x' }] }, budgetMs: 40, maxRounds: 3,
+  execute: async () => '結果',
+  fetchImpl: async () => {
+    slowTurn++;
+    if (slowTurn === 1) {
+      await new Promise((r) => setTimeout(r, 120)); // the cold start, three budgets long
+      return reply({ content: null, tool_calls: [{ id: 's1', function: { name: 'web_search', arguments: '{"query":"a"}' } }] });
+    }
+    return reply({ content: '答え' });
+  },
+});
+check('  待ち行列の時間は検索の持ち時間に数えない', out.stoppedBecause !== '時間切れ' && slowTurn === 2 && out.calls.length === 1, String(out.stoppedBecause) + ' / turns ' + slowTurn);
 globalThis.fetch = realFetch;
 
 const passed = results.filter(([ok]) => ok).length;
