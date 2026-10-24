@@ -266,8 +266,9 @@ export async function runTool(env, roomId, name, args, state, onOutput, options 
       }
     }
     case 'web_fetch': {
+      const settings = await getSettings(env).catch(() => ({}));
       try {
-        const page = await webFetch(env, { url: args.url });
+        const page = await webFetch(env, { url: args.url, backend: settings.searchBackend || 'ollama' });
         const head = [page.title, page.url, ''].join('\n');
         return { text: head + '\n' + page.content, meta: { url: page.url } };
       } catch (e) {

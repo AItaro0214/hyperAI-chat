@@ -12,16 +12,22 @@
  * is left to the model that was asked.
  *
  * searxng is the only one with no third party in the path at all: it is the
- * user's own instance querying public engines. */
+ * user's own instance querying public engines.
+ *
+ * exa is used the same way, with its model-driven parts left off: no
+ * highlights (an LLM picks those), no summary, no answer or deep search. */
 
 import { getApiKey, getJsonSetting } from './store.js';
 
-export const BACKENDS = ['ollama', 'searxng', 'brave', 'xai'];
+export const BACKENDS = ['ollama', 'searxng', 'brave', 'exa', 'xai'];
 
 export const BACKEND_NOTES = {
   ollama: '生の検索結果（無料枠あり・OLLAMA_API_KEY が必要）',
   searxng: '自前の SearXNG。第三者が経路にいない',
   brave: '独立インデックス（BRAVE_API_KEY が必要）',
+  exa:
+    '独立インデックス。抜粋はページ本文の先頭で、要約は入らない（EXA_API_KEY が必要）。' +
+    '検索 1 回 $0.007、ページを読むと 1 ページ $0.001（毎月 $10 の無料枠あり）',
   xai: 'Grok が検索して要約を返す。仲介モデルの判断が入る',
 };
 
@@ -88,6 +94,71 @@ async function viaBrave(env, query, limit) {
   }));
 }
 
+/* Exa (https://exa.ai/docs/reference/search, /get-contents).
+ *
+ * Priced to keep cheap. A search is $7 per 1k and covers text for its first
+ * ten results, so the snippet — the start of each page's own text, cut short
+ * — costs nothing more; a result past ten would, and MAX_RESULTS stops there.
+ * Whole pages come from /contents at $1 per 1k pages, and only for the pages
+ * the model chooses to read. */
+const EXA = 'https://api.exa.ai';
+const EXA_SNIPPET_CHARS = 1200;
+const EXA_PAGE_CHARS = 40000;
+
+const EXA_STATUS_HINTS = {
+  401: '（EXA_API_KEY が無効です）',
+  402: '（Exa のクレジットが尽きたか、利用上限に達しました）',
+  429: '（Exa のレート制限です。少し待ってください）',
+};
+
+async function exaPost(env, path, body, timeoutMs) {
+  const key = await getApiKey(env, 'EXA_API_KEY');
+  if (!key) throw new Error('EXA_API_KEY が未設定です');
+  const res = await fetch(EXA + path, {
+    method: 'POST',
+    headers: { 'x-api-key': key, 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  if (!res.ok) {
+    throw new Error('Exa ' + path + ' ' + res.status + (EXA_STATUS_HINTS[res.status] || '') + ': ' + (await res.text()).slice(0, 200));
+  }
+  return res.json();
+}
+
+async function viaExa(env, query, limit) {
+  const json = await exaPost(
+    env,
+    '/search',
+    {
+      query,
+      // Not deep / deep-lite: those research and synthesise.
+      type: 'auto',
+      numResults: limit,
+      contents: {
+        // Page text, cut short, as the snippet. Section filtering is
+        // best-effort; it keeps menus from being most of a short excerpt.
+        text: { maxCharacters: EXA_SNIPPET_CHARS, excludeSections: ['navigation', 'header', 'banner', 'sidebar', 'footer'] },
+      },
+    },
+    45000
+  );
+  return (json.results || []).slice(0, limit).map((r) => ({ title: r.title, url: r.url, snippet: clip(r.text, EXA_SNIPPET_CHARS) }));
+}
+
+/** One page's text through Exa's /contents. */
+async function exaPage(env, url) {
+  const json = await exaPost(env, '/contents', { urls: [url], text: { maxCharacters: EXA_PAGE_CHARS } }, 60000);
+  // A page Exa could not reach is reported per URL, inside a 200.
+  const status = (json.statuses || []).find((s) => s.id === url) || json.statuses?.[0];
+  if (status?.status === 'error') {
+    throw new Error('Exa がページを取得できませんでした（' + (status.error?.tag || 'error') + (status.error?.httpStatusCode ? ' ' + status.error.httpStatusCode : '') + '）');
+  }
+  const page = json.results?.[0];
+  if (!page?.text) throw new Error('Exa から本文が返りませんでした');
+  return { title: page.title || url, content: clip(page.text, EXA_PAGE_CHARS), url: page.url || url };
+}
+
 /* Kept as an option, but it answers rather than searches: the sources come
  * back attached to Grok's summary, not as a result list. */
 async function viaXai(env, query) {
@@ -98,7 +169,7 @@ async function viaXai(env, query) {
   );
 }
 
-const IMPLS = { ollama: viaOllama, searxng: viaSearxng, brave: viaBrave, xai: viaXai };
+const IMPLS = { ollama: viaOllama, searxng: viaSearxng, brave: viaBrave, exa: viaExa, xai: viaXai };
 
 /* -------------------------------- the API ------------------------------- */
 
@@ -114,10 +185,15 @@ export async function webSearch(env, { query, maxResults = 5, backend = 'ollama'
   return { backend, results: await impl(env, q, limit) };
 }
 
-/** Reads one page. Only Ollama offers this; the rest need a plain fetch. */
-export async function webFetch(env, { url } = {}) {
+/**
+ * Reads one page. With exa as the search backend, through Exa's /contents;
+ * otherwise Ollama's web_fetch when there is a key, and a plain fetch after.
+ */
+export async function webFetch(env, { url, backend } = {}) {
   const target = String(url || '').trim();
   if (!/^https?:\/\//i.test(target)) throw new Error('http(s) の URL を指定してください');
+
+  if (backend === 'exa') return exaPage(env, target);
 
   const key = await getApiKey(env, 'OLLAMA_API_KEY');
   if (key) {

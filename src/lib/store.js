@@ -9,6 +9,7 @@ export const SECRET_KEYS = [
   // Raw web search, for the self-hosted model that has none of its own.
   'OLLAMA_API_KEY',
   'BRAVE_API_KEY',
+  'EXA_API_KEY',
 ];
 
 /* ---------------------------- sealed API keys ---------------------------

@@ -504,7 +504,7 @@ chat.post('/chat', async (c) => {
             }
             if (name === 'web_fetch') {
               try {
-                const page = await webFetch2(c.env, { url: args.url });
+                const page = await webFetch2(c.env, { url: args.url, backend: settings.searchBackend || 'ollama' });
                 return [page.title, page.url, '', page.content].join('\n');
               } catch (err) {
                 const why = 'ページを取得できませんでした: ' + String(err.message).slice(0, 200);

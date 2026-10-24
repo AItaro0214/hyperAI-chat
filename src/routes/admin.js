@@ -183,6 +183,25 @@ const KEY_TESTS = {
     if (!res.ok) return { ok: false, error: 'HTTP ' + res.status + ' ' + text.slice(0, 200) };
     return { ok: true, detail: { ok: true } };
   },
+
+  // One page through /contents, $0.001 — a search would be $0.007.
+  async EXA_API_KEY(value) {
+    const res = await fetch('https://api.exa.ai/contents', {
+      method: 'POST',
+      headers: { 'x-api-key': value, 'content-type': 'application/json' },
+      body: JSON.stringify({ urls: ['https://exa.ai'], text: { maxCharacters: 100 } }),
+      signal: AbortSignal.timeout(30000),
+    });
+    const text = await res.text();
+    if (!res.ok) return { ok: false, error: 'HTTP ' + res.status + ' ' + text.slice(0, 200) };
+    let cost = null;
+    try {
+      cost = JSON.parse(text).costDollars?.total ?? null;
+    } catch {
+      cost = null;
+    }
+    return { ok: true, detail: { cost } };
+  },
 };
 
 admin.post('/secrets/test', async (c) => {
