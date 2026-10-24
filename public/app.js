@@ -135,10 +135,16 @@ async function deriveClientHash(password, salt, iterations) {
 
 /* ================================ LOGIN ================================= */
 function showLoginStep(step) {
-  for (const id of ['login-form', 'mfa-form', 'recovery-form', 'enroll-form', 'recovery-codes-box']) {
+  for (const id of ['login-form', 'mfa-form', 'recovery-form', 'enroll-form', 'recovery-codes-box', 'forgot-form', 'reset-form']) {
     $('#' + id).hidden = id !== step;
   }
   $('#login-error').hidden = true;
+  $('#login-info').hidden = true;
+}
+function loginInfo(message) {
+  const node = $('#login-info');
+  node.textContent = message;
+  node.hidden = false;
 }
 function loginError(message) {
   const node = $('#login-error');
@@ -240,6 +246,78 @@ $('#recovery-form').addEventListener('submit', async (e) => {
   }
 });
 
+/* ---------------------------- password reset ---------------------------- */
+$('#forgot-password').addEventListener('click', () => {
+  $('#forgot-email').value = $('#login-email').value.trim();
+  showLoginStep('forgot-form');
+  $('#forgot-email').focus();
+});
+$('#forgot-back').addEventListener('click', () => showLoginStep('login-form'));
+
+$('#forgot-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  busy(e.target, true, '送信中…');
+  try {
+    const res = await api('/api/auth/forgot', { method: 'POST', body: JSON.stringify({ email: $('#forgot-email').value.trim() }) });
+    showLoginStep('login-form');
+    loginInfo(res.message);
+  } catch (err) {
+    loginError(err.message);
+  } finally {
+    busy(e.target, false);
+  }
+});
+
+/** Opens the reset form when the page was reached from the link in the mail. */
+async function openResetFromLink() {
+  const m = location.hash.match(/^#reset=([\w-]+)$/);
+  if (!m) return false;
+  // Keep the token out of the address bar and the history.
+  history.replaceState(null, '', location.pathname + location.search);
+  state.reset = { token: m[1] };
+  $('#app-view').hidden = true;
+  $('#login-view').hidden = false;
+  try {
+    const info = await api('/api/auth/reset/check', { method: 'POST', body: JSON.stringify({ token: state.reset.token }) });
+    Object.assign(state.reset, info);
+    showLoginStep('reset-form');
+    $('#reset-email').textContent = '（' + info.email + '）';
+    $('#reset-password').focus();
+  } catch (err) {
+    state.reset = null;
+    showLoginStep('forgot-form');
+    loginError(err.message);
+  }
+  return true;
+}
+// The link can also land in a tab that already has the app open, where only
+// the fragment changes and nothing reloads.
+window.addEventListener('hashchange', () => {
+  if (location.hash.startsWith('#reset=')) openResetFromLink();
+});
+
+$('#reset-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const next = $('#reset-password').value;
+  if (next.length < 10) return loginError('パスワードは 10 文字以上にしてください');
+  if (next !== $('#reset-password2').value) return loginError('2 回の入力が一致しません');
+  busy(e.target, true, '変更中…');
+  try {
+    const clientHash = await deriveClientHash(next, state.reset.salt, state.reset.iterations);
+    await api('/api/auth/reset', { method: 'POST', body: JSON.stringify({ token: state.reset.token, clientHash }) });
+    state.reset = null;
+    $('#reset-password').value = '';
+    $('#reset-password2').value = '';
+    showLoginStep('login-form');
+    loginInfo('パスワードを変更しました。新しいパスワードでログインしてください。');
+    $('#login-email').focus();
+  } catch (err) {
+    loginError(err.message);
+  } finally {
+    busy(e.target, false);
+  }
+});
+
 $('#use-recovery').addEventListener('click', () => showLoginStep('recovery-form'));
 $('#back-to-mfa').addEventListener('click', () => showLoginStep('mfa-form'));
 $('#copy-recovery').addEventListener('click', () =>
@@ -253,6 +331,7 @@ $('#logout').addEventListener('click', async () => {
 
 /* ================================= BOOT ================================= */
 async function boot() {
+  if (await openResetFromLink()) return;
   try {
     state.me = await api('/api/auth/me');
   } catch {

@@ -36,7 +36,32 @@
             <input id="login-password" type="password" autocomplete="current-password" required />
           </label>
           <button class="btn primary lg block" type="submit">ログイン</button>
+          <button class="btn quiet block" type="button" id="forgot-password">パスワードを忘れた</button>
           <p class="muted xs">パスワードは端末側で PBKDF2 60万回のハッシュ化を行ってから送信されます。</p>
+        </form>
+
+        <form id="forgot-form" class="stack" hidden>
+          <p class="sm">登録したメールアドレスに、パスワードを再設定するリンクを送ります。リンクは 15 分間、1 回だけ使えます。</p>
+          <label class="field">
+            <span>メールアドレス</span>
+            <input id="forgot-email" type="email" autocomplete="username" inputmode="email" required />
+          </label>
+          <button class="btn primary lg block" type="submit">再設定のメールを送る</button>
+          <button class="btn quiet block" type="button" id="forgot-back">ログインに戻る</button>
+        </form>
+
+        <form id="reset-form" class="stack" hidden>
+          <p class="sm">新しいパスワードを決めてください（10 文字以上）。<span id="reset-email" class="muted"></span></p>
+          <label class="field">
+            <span>新しいパスワード</span>
+            <input id="reset-password" type="password" autocomplete="new-password" minlength="10" required />
+          </label>
+          <label class="field">
+            <span>もう一度</span>
+            <input id="reset-password2" type="password" autocomplete="new-password" minlength="10" required />
+          </label>
+          <button class="btn primary lg block" type="submit">パスワードを変更</button>
+          <p class="muted xs">変更した後も、ログインには認証アプリの 6 桁コードが必要です。</p>
         </form>
 
         <form id="mfa-form" class="stack" hidden>
@@ -74,6 +99,7 @@
           </div>
         </div>
 
+        <p id="login-info" class="sm" hidden></p>
         <p id="login-error" class="error" hidden></p>
       </div>
     </div>

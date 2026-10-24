@@ -57,6 +57,9 @@ Cloudflare Containers 上のサンドボックスで、コードを書いて動�
   DB が漏れても、pepper（Worker シークレット）なしには総当たりできません
 - **二要素認証**: TOTP（RFC 6238）必須。リカバリコードは HMAC ハッシュで保存、1 回限り
 - **ロックアウト**: 10 回失敗でアカウントロック
+- **パスワードの再設定**: ログイン画面の「パスワードを忘れた」から、登録アドレスにリンクを送ります。
+  リンクは 15 分・1 回限りで、1 日 3 通まで。DB にはトークンの SHA-256 だけを残します。
+  再設定するとロックも解除されますが、次のログインでも TOTP は必要です
 - **API キー**: AES-256-GCM で封緘して D1 に保存。平文は返しません
 - **アーティファクト**: `allow-same-origin` なしの iframe で実行するため、
   中身が何を読み込んでもアプリの Cookie やストレージには触れません
@@ -104,6 +107,9 @@ cp wrangler.example.jsonc wrangler.jsonc
 - `r2_buckets[].bucket_name` — R2（省略可）
 - `routes[].pattern` と `vars.APP_NAME` — 独自ドメイン
 - `vars.ALLOWED_EMAIL` — ログインを許可する唯一のメールアドレス
+- `send_email[].allowed_destination_addresses` — 再設定メールの送り先（ALLOWED_EMAIL と同じ）
+- `vars.APP_ORIGIN` — 再設定メールに書くリンクの URL（例: `https://chat.example.com`）
+- `vars.MAIL_FROM` — 再設定メールの送信元。Email Sending を有効にしたドメインのアドレス
 
 ### 2. リソースの作成
 
@@ -114,6 +120,13 @@ npx wrangler r2 bucket create <your-r2-bucket>   # 任意
 for f in ./migrations/*.sql; do
   npx wrangler d1 execute <your-d1-database-name> --remote --file="$f"
 done
+```
+
+Email Sending（Workers Paid が必要。月 3,000 通まで無料）を送信元のドメインで有効にします。
+これを省くと「パスワードを忘れた」は使えません（送信の失敗が login_events に残ります）。
+
+```bash
+npx wrangler email sending enable notify.example.com
 ```
 
 ### 3. シークレット

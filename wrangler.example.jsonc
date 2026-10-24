@@ -44,7 +44,7 @@
   "containers": [
     {
       "class_name": "Sandbox",
-      "image": "docker.io/cloudflare/sandbox:0.12.9",
+      "image": "docker.io/cloudflare/sandbox:0.12.13",
       "instance_type": "standard-1",
       "max_instances": 8
     }
@@ -79,8 +79,17 @@
   "browser": {
     "binding": "BROWSER"
   },
+  // Password reset mail. Only the owner's own address can be sent to.
+  "send_email": [
+    {
+      "name": "EMAIL",
+      "allowed_destination_addresses": ["owner@example.com"]
+    }
+  ],
   "vars": {
     "APP_NAME": "chat.example.com",
-    "ALLOWED_EMAIL": "owner@example.com"
+    "ALLOWED_EMAIL": "owner@example.com",
+    "APP_ORIGIN": "https://chat.example.com",
+    "MAIL_FROM": "noreply@notify.example.com"
   }
 }

@@ -21,6 +21,7 @@ import {
   clearFailures,
   clientMeta,
   createSession,
+  destroyAllSessions,
   destroySession,
   getUserByEmail,
   getUserById,
@@ -32,6 +33,8 @@ import {
   verifyTicket,
 } from '../lib/auth.js';
 import { requireAuth, throttle } from '../lib/guard.js';
+import { APP_NAME } from '../lib/branding.js';
+import { consumeResetToken, createResetToken, maskEmail, peekResetToken, resetMail } from '../lib/password-reset.js';
 
 const auth = new Hono();
 
@@ -191,6 +194,76 @@ auth.post('/recovery', async (c) => {
   await logEvent(c.env, { email: user.email, kind: 'recovery', ok: 1, detail: 'remaining=' + stored.length, ...meta });
   await finishLogin(c, user);
   return c.json({ status: 'ok', remainingRecoveryCodes: stored.length });
+});
+
+/* ---------------------------- password reset ---------------------------- */
+// The answer is the same whether or not the address is registered, so this
+// cannot be used to find out which addresses have an account.
+const FORGOT_REPLY = '登録済みのアドレスであれば、再設定用のリンクを送りました。メールを確認してください。';
+
+auth.post('/forgot', async (c) => {
+  if (!(await throttle(c, 'forgot', 5, 3600))) return c.json({ error: 'リクエストが多すぎます。しばらくしてからお試しください。' }, 429);
+  const meta = clientMeta(c);
+  const { email } = await c.req.json().catch(() => ({}));
+  if (!email) return c.json({ error: 'メールアドレスを入力してください' }, 400);
+
+  const user = await getUserByEmail(c.env, email);
+  if (!user) {
+    await logEvent(c.env, { email, kind: 'pw_reset', ok: 0, detail: 'unknown user', ...meta });
+    return c.json({ ok: true, message: FORGOT_REPLY });
+  }
+  if (!c.env.EMAIL || !c.env.MAIL_FROM) {
+    await logEvent(c.env, { email: user.email, kind: 'pw_reset', ok: 0, detail: 'mail not configured', ...meta });
+    return c.json({ ok: true, message: FORGOT_REPLY });
+  }
+  const token = await createResetToken(c.env, user, meta);
+  if (!token) {
+    await logEvent(c.env, { email: user.email, kind: 'pw_reset', ok: 0, detail: 'daily limit', ...meta });
+    return c.json({ ok: true, message: FORGOT_REPLY });
+  }
+
+  // The token rides in the fragment, which browsers never send to a server
+  // or put in a Referer header.
+  const origin = c.env.APP_ORIGIN || new URL(c.req.url).origin;
+  try {
+    await c.env.EMAIL.send(resetMail({ to: user.email, from: c.env.MAIL_FROM, link: origin + '/#reset=' + token, appName: APP_NAME }));
+    await logEvent(c.env, { email: user.email, kind: 'pw_reset', ok: 1, detail: 'mail sent', ...meta });
+  } catch (e) {
+    console.error('reset mail failed', e?.code, e?.message);
+    await logEvent(c.env, { email: user.email, kind: 'pw_reset', ok: 0, detail: 'mail failed: ' + (e?.code || e?.message || e), ...meta });
+  }
+  return c.json({ ok: true, message: FORGOT_REPLY });
+});
+
+// Lets the page check the link and fetch the KDF parameters before asking for
+// a new password. Does not use the token up.
+auth.post('/reset/check', async (c) => {
+  if (!(await throttle(c, 'reset', 30, 600))) return c.json({ error: 'リクエストが多すぎます' }, 429);
+  const { token } = await c.req.json().catch(() => ({}));
+  const user = await peekResetToken(c.env, token);
+  if (!user) return c.json({ error: 'このリンクは無効か、有効期限が切れています。もう一度メールを送ってください。' }, 400);
+  return c.json({ ok: true, email: maskEmail(user.email), salt: user.pw_salt, iterations: user.pw_iter || PW_ITER });
+});
+
+auth.post('/reset', async (c) => {
+  if (!(await throttle(c, 'reset', 30, 600))) return c.json({ error: 'リクエストが多すぎます' }, 429);
+  const meta = clientMeta(c);
+  const { token, clientHash } = await c.req.json().catch(() => ({}));
+  if (!token || !clientHash) return c.json({ error: 'パラメータが不足しています' }, 400);
+  const user = await consumeResetToken(c.env, token);
+  if (!user) return c.json({ error: 'このリンクは無効か、有効期限が切れています。もう一度メールを送ってください。' }, 400);
+
+  // Proving the mailbox is also how a locked account gets back in, the same
+  // as `npm run unlock`. TOTP is still asked for at the next login.
+  const hash = await wrapClientHash(c.env.PW_PEPPER, user.pw_salt, String(clientHash));
+  await c.env.DB.prepare(
+    'UPDATE users SET pw_hash = ?, pw_changed_at = ?, failed_attempts = 0, locked_at = NULL, updated_at = ? WHERE id = ?'
+  )
+    .bind(hash, now(), now(), user.id)
+    .run();
+  await destroyAllSessions(c.env, user.id);
+  await logEvent(c.env, { email: user.email, kind: 'pw_reset', ok: 1, detail: 'password replaced', ...meta });
+  return c.json({ ok: true });
 });
 
 /* --------------------------------- misc --------------------------------- */

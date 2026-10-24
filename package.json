@@ -45,11 +45,12 @@
     "test:recover": "node tests/recover-unit.mjs",
     "test:ttslive": "node tests/tts-live.mjs",
     "test:params": "node tests/params-unit.mjs",
-    "test:spend": "node tests/spend-unit.mjs"
+    "test:spend": "node tests/spend-unit.mjs",
+    "test:reset": "node tests/reset-unit.mjs"
   },
   "dependencies": {
     "@cloudflare/puppeteer": "^1.4.0",
-    "@cloudflare/sandbox": "^0.12.9",
+    "@cloudflare/sandbox": "^0.12.13",
     "hono": "^4.6.0"
   },
   "devDependencies": {
