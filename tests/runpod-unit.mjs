@@ -19,6 +19,8 @@ import {
   vramEstimate,
   describeWorkers,
   warm as warmUp,
+  isAppJob,
+  rememberOwnJob,
   recoverReply,
   failedReason,
   WORKER_META_KEY,
@@ -406,6 +408,62 @@ try {
   warmErr = e.message;
 }
 check('  失敗したら理由を言う', warmErr.includes('FAILED') && warmErr.includes('boom'), warmErr);
+globalThis.fetch = realFetch;
+
+/* ------------- recovery: the app's own jobs are never a reply ------------- */
+// Production, 2026-10-24: "RunPod から回収" took the diagnosis probe's eight
+// tokens of "ping" for a reply. Its output, as the worker returns it:
+const PROBE_OUT = {
+  status: 'COMPLETED',
+  output: [{
+    id: 'cmpl-1', object: 'text_completion', created: 1792821600,
+    choices: [{ index: 0, text: '") > 0\n\n\ndef test_d', finish_reason: 'length' }],
+    usage: { prompt_tokens: 2, completion_tokens: 8 },
+    worker: { source: 'cache', version: '5' },
+  }],
+};
+const WARM_OUT = {
+  status: 'COMPLETED',
+  output: [{ id: 'chatcmpl-w', object: 'chat.completion', created: 1792821590, choices: [{ message: { content: 'H' }, finish_reason: 'length' }], usage: { completion_tokens: 1 } }],
+};
+const SHORT_REPLY = {
+  status: 'COMPLETED',
+  output: ['data: ' + JSON.stringify({ id: 'chatcmpl-r', created: 1792821620, choices: [{ delta: { content: 'はい。' }, finish_reason: 'stop' }] }) + '\n\n',
+    'data: ' + JSON.stringify({ choices: [], usage: { completion_tokens: 3 } }) + '\n\n'],
+};
+check('診断の probe は答えではない', isAppJob(extractCompletion(PROBE_OUT)) === true, JSON.stringify(extractCompletion(PROBE_OUT)).slice(0, 100));
+check('  起動の warm（1 トークンで打ち切り）も答えではない', isAppJob(extractCompletion(WARM_OUT)) === true);
+check('  短くても普通に終わった返答は答え', isAppJob(extractCompletion(SHORT_REPLY)) === false);
+check('  記録した ID は形に関係なく除く', isAppJob(extractCompletion(SHORT_REPLY), 'j1', new Set(['j1'])) === true);
+check('ID の記録: 新しい順に 40 件まで、重複なし',
+  rememberOwnJob(['a', 'b'], 'b').join() === 'b,a' && rememberOwnJob(Array.from({ length: 50 }, (_, i) => 'x' + i), 'n').length === 40);
+
+const jobBoard = (jobs) => {
+  globalThis.fetch = async (url) => {
+    const u = String(url);
+    if (u.endsWith('/requests')) {
+      return { ok: true, status: 200, json: async () => ({ requests: Object.keys(jobs).map((id) => ({ id, status: 'COMPLETED' })) }) };
+    }
+    return { ok: true, status: 200, json: async () => jobs[decodeURIComponent(u.split('/status/')[1])] };
+  };
+};
+const SINCE = 1792821587; // the message's created_at
+jobBoard({ probe: PROBE_OUT, warm: WARM_OUT, reply: { ...SHORT_REPLY } });
+let rr = await recoverReply('k', 'ep', { since: SINCE });
+check('回収: 時刻が近い probe・warm より、返答を選ぶ', rr.found?.jobId === 'reply' && rr.appJobs === 2, JSON.stringify({ found: rr.found?.jobId, appJobs: rr.appJobs }));
+
+jobBoard({ probe: PROBE_OUT, warm: WARM_OUT });
+rr = await recoverReply('k', 'ep', { since: SINCE });
+check('  返答が消えていて probe だけなら、何も取り込まない（今回の事故）', rr.found === null && rr.appJobs === 2);
+
+const OTHER_TURN = { status: 'COMPLETED', output: ['data: ' + JSON.stringify({ created: SINCE + 7200, choices: [{ delta: { content: '別の発言への長い返答' } }] }) + '\n\n'] };
+jobBoard({ other: OTHER_TURN });
+rr = await recoverReply('k', 'ep', { since: SINCE });
+check('  時刻の合わない返答は、長くても取り込まない', rr.found === null && rr.outOfWindow === 1, JSON.stringify(rr).slice(0, 120));
+
+jobBoard({ ownlooking: { ...SHORT_REPLY } });
+rr = await recoverReply('k', 'ep', { since: SINCE, ownJobs: new Set(['ownlooking']) });
+check('  記録したアプリのジョブは除く', rr.found === null && rr.appJobs === 1);
 globalThis.fetch = realFetch;
 
 const passed = results.filter(([ok]) => ok).length;

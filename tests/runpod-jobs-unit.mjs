@@ -221,6 +221,18 @@ db = fakeDb();
 out = await settleMessage(env(db), { id: 'm', meta: JSON.stringify({ partial: false }) });
 check('  ジョブの無い返答には触らない', out.state === 'skipped' && db.updates.length === 0);
 
+// The job-id path reads the message's own job and nothing else: no job list,
+// so a diagnosis probe or another turn's reply can never be picked up.
+const seenUrls = [];
+globalThis.fetch = async (u) => {
+  seenUrls.push(String(u));
+  return json({ id: 'job-9', status: 'COMPLETED', output: [frame({ choices: [{ delta: { content: '答え' } }] })] });
+};
+db = fakeDb();
+await settleMessage(env(db), waitingRow());
+check('ID で追う経路は自分のジョブしか読まない',
+  seenUrls.length === 1 && seenUrls[0] === 'https://api.runpod.ai/v2/ep/status/job-9' && !seenUrls.some((x) => x.includes('/requests')), seenUrls.join(' '));
+
 db = fakeDb();
 await pendingReplies(env(db), { roomId: 'r1', limit: 3 });
 

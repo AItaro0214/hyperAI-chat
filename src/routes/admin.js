@@ -56,6 +56,8 @@ import {
   modelCacheResult,
   r2Prefix,
   R2_SECRETS,
+  OWN_JOBS_KEY,
+  rememberOwnJob,
   DEFAULT_SPEC,
 } from '../lib/runpod.js';
 import { SEARCH_MODES, BACKEND_NOTES, MODE_LABELS, availableEngines } from '../lib/search.js';
@@ -276,12 +278,27 @@ async function describeWarming(env, live) {
   return { since, stalled: true };
 }
 
+/* Jobs the app sends for itself are written down, so "RunPod から回収"
+ * never takes one of them for a reply (recoverReply's ownJobs). */
+async function noteOwnJob(env, jobId) {
+  if (!jobId) return;
+  const list = await getJsonSetting(env, OWN_JOBS_KEY, []);
+  await setJsonSetting(env, OWN_JOBS_KEY, rememberOwnJob(list, jobId));
+}
+
 /** Drives the warm-up, recording progress where any instance can read it. */
 async function runWarm(env, key, endpointId) {
   const base = await readWarming(env);
+  let noted = false;
   try {
     const out = await warm(key, endpointId, {
-      onProgress: (p) => writeWarming(env, { ...base, ...p }).catch(() => {}),
+      onProgress: (p) => {
+        if (p.jobId && !noted) {
+          noted = true;
+          noteOwnJob(env, p.jobId).catch(() => {});
+        }
+        return writeWarming(env, { ...base, ...p }).catch(() => {});
+      },
     });
     await writeWarming(env, { ...base, ready: true, seconds: out.seconds });
   } catch (e) {
@@ -452,7 +469,9 @@ admin.post('/breakthrough/diagnose', async (c) => {
   if (!key) return c.json({ error: 'RUNPOD_API_KEY が未登録です' }, 400);
   if (!settings.runpodEndpointId) return c.json({ error: 'エンドポイントがありません' }, 400);
   try {
-    return c.json(await diagnose(key, settings.runpodEndpointId));
+    const out = await diagnose(key, settings.runpodEndpointId);
+    await noteOwnJob(c.env, out.probe?.jobId).catch(() => {});
+    return c.json(out);
   } catch (e) {
     return c.json({ error: e.message }, 502);
   }

@@ -952,9 +952,16 @@ export function extractCompletion(job) {
   let chatId = null;
   let finishReason = null;
   let toolCalls = false;
+  let textCompletion = false;
+  let workerInfo = false;
 
   for (const chunk of chunks) {
     if (chunk.usage) usage = chunk.usage;
+    /* The diagnosis probe: a plain /v1/completions call ("ping") whose output
+     * the worker tags with `worker`. A chat reply is neither — its worker
+     * details travel as hyperai_worker. */
+    if (chunk.object === 'text_completion') textCompletion = true;
+    if (chunk.worker && typeof chunk.worker === 'object') workerInfo = true;
     if (!created && Number(chunk.created)) created = Number(chunk.created);
     if (!chatId && typeof chunk.id === 'string') chatId = chunk.id;
 
@@ -981,7 +988,36 @@ export function extractCompletion(job) {
   /* A completion that asks for a tool is one of the search decisions, not a
    * reply: its text is the preamble to a search ("もう少し調べます"). */
   if (finishReason === 'tool_calls') toolCalls = true;
-  return { text, reasoning, usage, created, chatId, finishReason, toolCalls, status: job?.status || null };
+  /* Cut off after a handful of tokens: the warm-up asks for 1 and the probe
+   * for 8, where a reply is allowed 16,384. */
+  const capped = finishReason === 'length' && Number(usage?.completion_tokens ?? Infinity) <= APP_JOB_MAX_TOKENS;
+  return {
+    text,
+    reasoning,
+    usage,
+    created,
+    chatId,
+    finishReason,
+    toolCalls,
+    textCompletion,
+    workerInfo,
+    capped,
+    status: job?.status || null,
+  };
+}
+
+/* The most tokens a job of the app's own (warm-up, diagnosis) asks for. */
+const APP_JOB_MAX_TOKENS = 16;
+
+/**
+ * Whether a finished job is one the app sent for itself — the diagnosis
+ * probe or the warm-up — rather than a reply to anyone. Their output can sit
+ * closer in time to a message than its real reply does, and was once taken
+ * for it ('") > 0\n\n\ndef test_d', eight tokens of a "ping").
+ */
+export function isAppJob(reply, jobId, ownJobs) {
+  if (jobId && ownJobs?.has?.(jobId)) return true;
+  return !!(reply.textCompletion || reply.workerInfo || reply.capped);
 }
 
 /* How far from the message's own timestamp a job may sit and still be its
@@ -994,10 +1030,16 @@ const MATCH_AFTER_SEC = 3600;
 /**
  * Finds the finished job that belongs to a message and returns its reply.
  *
+ * Only replies are candidates: search decisions and the app's own jobs are
+ * set aside (isAppJob), and so is any job outside the message's time window —
+ * a reply from another turn is not this one's, and taking the longest job
+ * on the endpoint, as this once did, could hand a message someone else's.
+ *
  * @param {number} since  the message row's created_at, in epoch seconds
+ * @param {Set<string>} [ownJobs]  ids of jobs the app sent for itself
  * @returns {Promise<{found: object|null, pending: object[], checked: number}>}
  */
-export async function recoverReply(apiKey, endpointId, { since = 0, limit = 8 } = {}) {
+export async function recoverReply(apiKey, endpointId, { since = 0, limit = 8, ownJobs = new Set() } = {}) {
   const requests = await listRequests(apiKey, endpointId);
   const pending = requests.filter((r) => r.status === 'IN_QUEUE' || r.status === 'IN_PROGRESS');
   const done = requests.filter((r) => r.status === 'COMPLETED').slice(0, limit);
@@ -1012,32 +1054,50 @@ export async function recoverReply(apiKey, endpointId, { since = 0, limit = 8 } 
 
   const candidates = [];
   let decisions = 0;
+  let appJobs = 0;
   for (const row of done) {
+    if (ownJobs.has(row.id)) {
+      appJobs++;
+      continue;
+    }
     const job = await fetchJob(apiKey, endpointId, row.id).catch(() => null);
     if (!job) continue;
     const reply = extractCompletion(job);
-    if (!reply.text && !reply.reasoning) continue;
+    if (!reply.text.trim() && !reply.reasoning) continue;
     // A search decision is not the reply, however well its time matches.
     if (reply.toolCalls) {
       decisions++;
       continue;
     }
+    // Nor is the diagnosis probe or the warm-up.
+    if (isAppJob(reply, row.id, ownJobs)) {
+      appJobs++;
+      continue;
+    }
     candidates.push({ ...reply, jobId: row.id, executionTime: row.executionTime ?? null });
   }
-  if (!candidates.length) return { found: null, pending, failed, decisions, checked: done.length };
+  const none = { found: null, pending, failed, decisions, appJobs, checked: done.length };
+  if (!candidates.length) return none;
 
-  /* Which job is this message's? The timestamps inside the chunks decide when
-   * they are usable, and length breaks the tie when they are not — a job with
-   * no `created` at all is better than telling someone their reply is gone. */
-  const inWindow = since
-    ? candidates.filter((c) => c.created && c.created >= since - MATCH_BEFORE_SEC && c.created <= since + MATCH_AFTER_SEC)
-    : [];
-  const pool = inWindow.length ? inWindow : candidates;
-  const found = since && inWindow.length
-    ? pool.reduce((best, c) => (Math.abs(c.created - since) < Math.abs(best.created - since) ? c : best))
-    : pool.reduce((best, c) => (c.text.length > best.text.length ? c : best));
+  /* Which job is this message's? The one closest in time, among those that
+   * fall in the message's window. With no time to go by (since = 0) the
+   * longest is the best guess; with a time and nothing near it, there is no
+   * reply here for this message, and saying so beats importing another's. */
+  if (!since) return { ...none, found: candidates.reduce((best, c) => (c.text.length > best.text.length ? c : best)), matched: false };
+  const inWindow = candidates.filter((c) => c.created && c.created >= since - MATCH_BEFORE_SEC && c.created <= since + MATCH_AFTER_SEC);
+  if (!inWindow.length) return { ...none, outOfWindow: candidates.length };
+  const found = inWindow.reduce((best, c) => (Math.abs(c.created - since) < Math.abs(best.created - since) ? c : best));
+  return { ...none, found, matched: true };
+}
 
-  return { found, pending, failed, decisions, checked: done.length, matched: inWindow.length > 0 };
+/* The ids of jobs the app sends for itself (diagnosis, warm-up), kept so the
+ * recovery above can tell them from replies by id as well as by shape. */
+export const OWN_JOBS_KEY = 'runpodOwnJobs';
+const OWN_JOBS_KEEP = 40;
+
+export function rememberOwnJob(list, jobId) {
+  const ids = Array.isArray(list) ? list.filter((x) => x !== jobId) : [];
+  return [jobId, ...ids].slice(0, OWN_JOBS_KEEP);
 }
 
 /** The reason a failed job gives, as plain text. */

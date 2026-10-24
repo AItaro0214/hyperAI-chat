@@ -2,8 +2,8 @@ import { Hono } from 'hono';
 import { newId } from '../lib/crypto.js';
 import { now } from '../lib/auth.js';
 import { requireAuth } from '../lib/guard.js';
-import { getSettings, getApiKey } from '../lib/store.js';
-import { recoverReply } from '../lib/runpod.js';
+import { getSettings, getApiKey, getJsonSetting } from '../lib/store.js';
+import { recoverReply, OWN_JOBS_KEY } from '../lib/runpod.js';
 import { pendingReplies, settleMessage } from '../lib/runpod-jobs.js';
 
 const rooms = new Hono();
@@ -317,6 +317,14 @@ rooms.post('/:id/messages/:mid/recover', async (c) => {
     if (out.state === 'pending') {
       return c.json({ ok: false, pending: 1, reason: 'RunPod で処理中です（' + out.status + '）。終わると自動で入ります。' });
     }
+    /* Its own job is the only one that can be its reply. Already settled, or
+     * unreadable just now — either way, guessing by time from the other jobs
+     * on the endpoint can only find someone else's. */
+    return c.json({
+      ok: false,
+      message: shapeMessage(updated),
+      reason: out.state === 'skipped' ? 'この返答のジョブは既に回収済みです。' : 'RunPod に問い合わせできませんでした: ' + (out.error || out.state),
+    });
   }
 
   const settings = await getSettings(c.env);
@@ -327,7 +335,9 @@ rooms.post('/:id/messages/:mid/recover', async (c) => {
 
   let result;
   try {
-    result = await recoverReply(apiKey, endpointId, { since: Number(msg.created_at) || 0 });
+    // The app's own jobs (diagnosis, warm-up), set aside by id.
+    const ownJobs = new Set(await getJsonSetting(c.env, OWN_JOBS_KEY, []).catch(() => []));
+    result = await recoverReply(apiKey, endpointId, { since: Number(msg.created_at) || 0, ownJobs });
   } catch (e) {
     return c.json({ error: 'RunPod に問い合わせできませんでした: ' + String(e?.message || e).slice(0, 300) }, 502);
   }
@@ -339,7 +349,8 @@ rooms.post('/:id/messages/:mid/recover', async (c) => {
      * reason is written to the message, so it is still there after RunPod
      * forgets the job. */
     if (!waiting && failedJobs.length) {
-      const why = 'RunPod のジョブが失敗していました: ' + failedJobs[0].error;
+      // Recent failures on the endpoint, not necessarily this message's.
+      const why = '該当する答えは見つかりませんでした。このエンドポイントで最近失敗したジョブ: ' + failedJobs[0].error;
       const meta = { ...(parseJson(msg.meta, {}) || {}), partial: false, runpodFailures: failedJobs };
       await c.env.DB.prepare('UPDATE messages SET error = ?, meta = ? WHERE id = ?')
         .bind(msg.error || why, JSON.stringify(meta), msg.id)
@@ -353,7 +364,11 @@ rooms.post('/:id/messages/:mid/recover', async (c) => {
       checked: result.checked,
       reason: waiting
         ? '同じエンドポイントでまだ実行中のジョブが ' + waiting + ' 件あります。完了後にもう一度お試しください。'
-        : result.decisions
+        : result.outOfWindow
+          ? '該当する答えは見つかりませんでした（残っている返答はどれもこの発言と時刻が合わず、別の発言のものなので取り込みません）。'
+          : result.appJobs
+            ? '該当する答えは見つかりませんでした（残っていたのは診断・起動用のジョブ ' + result.appJobs + ' 件だけでした）。'
+            : result.decisions
           ? '残っているのは検索の判断のジョブだけで、返答のジョブは見つかりませんでした。'
           : result.checked
             ? '完了済みジョブは ' + result.checked + ' 件見つかりましたが、本文が取り出せませんでした。'

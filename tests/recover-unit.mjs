@@ -105,10 +105,14 @@ stub([{ id: 'q', status: 'IN_QUEUE' }], {});
 const pending = await recoverReply('key', 'ep', { since: 1990 });
 check('実行中のジョブを伝える', pending.found === null && pending.pending.length === 1);
 
-// 時刻が合うものがなければ、いちばん長い完了ジョブで妥協する。
+// 時刻が合うものがなければ取り込まない。別の発言の返答を入れてしまうより、
+// 見つからないと言う方がよい（以前は最長のジョブで妥協していた）。
 stub([{ id: 'a', status: 'COMPLETED' }], { a: at(10, 'ずっと前の長い返事') });
 const fallback = await recoverReply('key', 'ep', { since: 99999 });
-check('時刻が合わなければ最長を候補にする', fallback.found?.text === 'ずっと前の長い返事' && fallback.matched === false);
+check('時刻が合わなければ取り込まない', fallback.found === null && fallback.outOfWindow === 1);
+// 時刻の手がかりが無いときだけ、最長を候補にする。
+const noTime = await recoverReply('key', 'ep', { since: 0 });
+check('  時刻が分からないときだけ最長を候補にする', noTime.found?.text === 'ずっと前の長い返事' && noTime.matched === false);
 
 globalThis.fetch = realFetch;
 check('一覧と取得の関数がある', typeof listRequests === 'function' && typeof fetchJob === 'function');
