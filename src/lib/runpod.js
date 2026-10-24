@@ -27,7 +27,7 @@ export const VLLM_IMAGE = 'runpod/worker-v1-vllm:v2.27.1';
  * .github/workflows/llamacpp-worker.yml. The tag is the llama.cpp build it is
  * based on and the handler's WORKER_VERSION, pinned for the same reason as the
  * vLLM one; the workflow refuses to build if this does not match. */
-export const LLAMACPP_IMAGE = 'ghcr.io/aitaro0214/hyperai-llamacpp-worker:b11804-3';
+export const LLAMACPP_IMAGE = 'ghcr.io/aitaro0214/hyperai-llamacpp-worker:b11804-4';
 
 /* The previous model, on vLLM. Kept whole so going back is passing this as the
  * spec rather than reconstructing it from git. */
@@ -111,8 +111,12 @@ export const LLAMACPP_SPEC = {
    * RunPod cannot yet select files; the worker falls back to fetching only
    * this quant itself when the cache is not there. */
   cacheModel: true,
-  // QSA and DeltaNet layers keep the KV cache small; 32K is what the app trims to.
-  maxModelLen: 32768,
+  /* The model's own trained length, 262,144 — memory is not what limits it.
+   * See QWEN38_MEMORY: at this length the KV cache is 7.5 GiB in f16, and an
+   * 80GB card still has some 15 GiB to spare, so the cache stays f16 (q8_0
+   * would save 3.5 GiB that is not needed, at a small cost in accuracy).
+   * Beyond 262K would need RoPE scaling the model was not trained for. */
+  maxModelLen: 262144,
   // Slots sharing that one pool (--kv-unified): an agent's side calls can
   // overlap a reply without either losing context.
   maxNumSeqs: 2,
@@ -131,6 +135,47 @@ export const LLAMACPP_SPEC = {
   // Only used by the fallback download: 78 GiB of shards, plus headroom.
   containerDiskInGb: 100,
 };
+
+/* -------------------------------------------------------------------------
+ * How much of an 80GB card Qwen3.8-Flash-Next takes, and why the context can
+ * be the model's full 262K.
+ *
+ * From the IQ3_S GGUF's own metadata (qwen4exp.*): 48 blocks, of which only
+ * every fourth (full_attention_interval = 4: blocks 3, 7, …, 47) is attention
+ * and keeps a KV cache; the other 36 are Gated DeltaNet, whose state is a
+ * fixed size per sequence however long it runs. The attention layers have
+ * head_count_kv = 2 and key_length = value_length = 256.
+ *
+ * llama.cpp's qwen4exp graph (src/models/qwen4exp.cpp) caches, per token and
+ * per attention layer: K (2 × 256), V (2 × 256), and one indexer row for the
+ * sparse attention (raw key + pooled key, 2 × 128). compress_ratio = 4 picks
+ * which blocks are attended; it does not shrink what is stored.
+ *
+ *   f16: (512 + 512 + 256) × 2 bytes × 12 layers = 30,720 bytes per token
+ *
+ * The DeltaNet state is 128² × 48 heads in f32 per layer — 3 MiB × 36 layers,
+ * about 110 MiB a sequence. Compute buffers are an estimate: sparse attention
+ * reads at most 2,048 cells per query, so the large one is the indexer's
+ * scores over ctx/4 pooled keys (0.5 GiB at 262K); 4 GiB covers that and the
+ * MoE matmuls with room over.
+ * ---------------------------------------------------------------------- */
+export const QWEN38_MEMORY = {
+  // The smaller of the two cards: H100 80GB HBM3 reports 81,559 MiB.
+  cardGiB: 81559 / 1024,
+  weightsGiB: 55063448064 / 2 ** 30, // the IQ3_S first shard, all of it resident
+  kvBytesPerToken: { f16: 30720, q8_0: 16320 },
+  recurrentGiBPerSeq: 0.11,
+  computeGiB: 4,
+  cudaGiB: 1,
+};
+
+/** Estimated VRAM, in GiB, for a context and KV type. */
+export function vramEstimate({ ctx, seqs = 2, kv = 'f16' } = {}) {
+  const m = QWEN38_MEMORY;
+  const kvGiB = (ctx * m.kvBytesPerToken[kv]) / 2 ** 30;
+  const total = m.weightsGiB + kvGiB + m.recurrentGiBPerSeq * seqs + m.computeGiB + m.cudaGiB;
+  return { kvGiB, total, spare: m.cardGiB - total };
+}
 
 /* What each quant's two shards add up to, in GB as RunPod sizes disks. */
 const QUANT_DISK_GB = { Q2_0: 67, IQ2_XS: 69, IQ3_XXS: 77, IQ3_S: 84 };

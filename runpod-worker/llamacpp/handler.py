@@ -138,7 +138,8 @@ def command(model_path):
         "--host", "127.0.0.1",
         "--port", str(PORT),
         "--alias", env("SERVED_MODEL_NAME", "breakthrough"),
-        "-c", env("CTX_SIZE", "32768"),
+        # The model's trained length; the template sets it (LLAMACPP_SPEC.maxModelLen).
+        "-c", env("CTX_SIZE", "262144"),
         "-np", str(PARALLEL),
         "-ngl", "999",
         # The model's own chat template: thinking, tools and images all live in it.
@@ -175,11 +176,15 @@ def start():
             LOG.append(line.rstrip())
             print(line, end="", flush=True)
 
-    threading.Thread(target=pump, daemon=True).start()
+    reader = threading.Thread(target=pump, daemon=True)
+    reader.start()
 
     # /health is 503 while the weights load and 200 once a slot can answer.
     while True:
         if proc.poll() is not None:
+            # Its last lines — "cudaMalloc failed: out of memory", typically —
+            # may still be in the pipe; read them before saying why it stopped.
+            reader.join(timeout=5)
             raise RuntimeError(f"llama-server exited ({proc.returncode}):\n" + "\n".join(LOG))
         try:
             if httpx.get(BASE + "/health", timeout=5).status_code == 200:

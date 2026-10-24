@@ -15,6 +15,8 @@ import {
   extractCompletion,
   matchModelRef,
   modelCacheResult,
+  QWEN38_MEMORY,
+  vramEstimate,
   recoverReply,
   failedReason,
   WORKER_META_KEY,
@@ -66,7 +68,17 @@ check('  キャッシュを先に探させる', l.env.MODEL_CACHE === 'on');
 check('  キャッシュ不使用も指定できる', templateBody({ cacheModel: false }).env.MODEL_CACHE === 'off');
 check('  代替では選んだ量子化のフォルダだけ取得', l.env.MODEL_INCLUDE === 'IQ3_S/*', l.env.MODEL_INCLUDE);
 check('  読み込むファイル', l.env.MODEL_FILE === DEFAULT_SPEC.modelFile);
-check('  文脈長を渡す', l.env.CTX_SIZE === '32768');
+check('  文脈長はモデル本来の 262K', l.env.CTX_SIZE === '262144', l.env.CTX_SIZE);
+
+/* ---------------------------- memory: 262K fits --------------------------- */
+// From the GGUF: 12 attention layers × (K 2×256 + V 2×256 + indexer 2×128), f16.
+check('KV: 1 トークン 30,720 バイト（f16）', QWEN38_MEMORY.kvBytesPerToken.f16 === 12 * (2 * 256 + 2 * 256 + 2 * 128) * 2);
+check('  q8_0 は 34/32 バイト/値', QWEN38_MEMORY.kvBytesPerToken.q8_0 === (12 * (2 * 256 + 2 * 256 + 2 * 128) * 34) / 32);
+const at262 = vramEstimate({ ctx: 262144 });
+check('262K の KV は 7.5 GiB', Math.abs(at262.kvGiB - 7.5) < 0.01, at262.kvGiB.toFixed(2));
+check('  80GB に 10 GiB 以上の余裕を残して載る', at262.spare >= 10, 'spare ' + at262.spare.toFixed(1) + ' GiB / total ' + at262.total.toFixed(1));
+check('  既定の文脈長がそれ', DEFAULT_SPEC.maxModelLen === 262144 && vramEstimate({ ctx: DEFAULT_SPEC.maxModelLen, seqs: DEFAULT_SPEC.maxNumSeqs }).spare >= 10);
+check('  q8_0 にしなくてよい（f16 で足りる）', vramEstimate({ ctx: 262144, kv: 'q8_0' }).kvGiB < at262.kvGiB && at262.spare > 0);
 check('  モデル名を短縮名に固定', l.env.SERVED_MODEL_NAME === 'breakthrough');
 check('  vLLM の変数を混ぜない', !('MODEL_NAME' in l.env) && !('QUANTIZATION' in l.env));
 

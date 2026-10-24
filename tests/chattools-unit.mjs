@@ -172,6 +172,7 @@ globalThis.fetch = realFetch;
 // The production failure: ten searches' results, 34,479 tokens, 32K window.
 check('予算: 32K の窓で答えの分を残す', promptBudgetFor(32768) === 32768 - 8192 - 512, String(promptBudgetFor(32768)));
 check('  窓が不明なら 32K とみなす', promptBudgetFor(undefined) === promptBudgetFor(32768));
+check('  262K では答え 16K を残してほぼ全部使う', promptBudgetFor(262144) === 262144 - 16384 - 512, String(promptBudgetFor(262144)));
 check('見積もり: ツール呼び出しの引数も数える',
   approxTokens([{ role: 'assistant', content: null, tool_calls: [{ function: { arguments: 'x'.repeat(1500) } }] }]) >= 1000);
 
@@ -190,6 +191,9 @@ check('  ツールの結果だけを縮める', big[0].content === '質問' && b
 check('  省略したと書く', big.some((m) => m.role === 'tool' && m.content.includes('省略')));
 check('  呼び出しと結果の組は壊さない', big.filter((m) => m.tool_calls).length === 10);
 check('  収まっていれば何もしない', shrinkToolResults([{ role: 'user', content: 'x' }], 20000) === 0);
+// With the full window, the ten long searches that broke 32K fit whole.
+const roomy = bulky();
+check('262K なら 10 回分の検索結果を縮めずに収まる', shrinkToolResults(roomy, promptBudgetFor(262144)) === 0, String(approxTokens(roomy)));
 
 // A model that keeps searching stops before the window, not at it.
 let sentTokens = [];

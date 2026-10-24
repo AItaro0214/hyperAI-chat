@@ -119,5 +119,56 @@ check("  落ちていればそう言う", "終了コード -9" in f["error"] and
 check("  長すぎない", len(handler.failure(500, "x" * 10000)["error"]) <= 4000)
 handler.PROC = None
 
+# Out of memory at startup: llama-server prints why and exits. The reason has
+# to reach the job's error, since RunPod's own logs cannot be read from outside.
+import asyncio  # noqa: E402
+
+
+class HTTPError(Exception):
+    pass
+
+
+def refused(*_a, **_k):
+    raise HTTPError("connection refused")
+
+
+handler.httpx.HTTPError = HTTPError
+handler.httpx.get = refused
+
+with tempfile.TemporaryDirectory() as root:
+    fake = os.path.join(root, "fake_server.py")
+    with open(fake, "w", encoding="utf-8") as f:
+        f.write(
+            "import sys\n"
+            "print('load_tensors: offloading 48 repeating layers to GPU')\n"
+            "print('ggml_backend_cuda_buffer_type_alloc_buffer: allocating 7680.00 MiB on device 0: "
+            "cudaMalloc failed: out of memory')\n"
+            "print('llama_init_from_model: failed to initialize the context')\n"
+            "sys.exit(1)\n"
+        )
+    saved = (handler.locate, handler.command, handler.LLAMA_SERVER)
+    handler.locate = lambda: "/models/x-00001-of-00002.gguf"
+    handler.command = lambda path: [sys.executable, fake]
+    handler.LLAMA_SERVER = sys.executable  # for --version only
+    handler.LOG.clear()
+    err = None
+    try:
+        handler.start()
+    except RuntimeError as e:
+        err = str(e)
+    check("起動時のメモリ不足: 理由を最後の行まで上げる", bool(err) and "exited (1)" in err and "out of memory" in err and "failed to initialize" in err, err)
+
+    handler.STARTUP_ERROR = (err or "")[-4000:]
+
+    async def collect():
+        job = {"input": {"openai_route": "/v1/chat/completions", "openai_input": {"stream": True}}}
+        return [item async for item in handler.handler(job)]
+
+    out = asyncio.run(collect())
+    check("  以後のジョブはその理由で失敗する", len(out) == 1 and out[0]["error"].startswith("startup failed:") and "out of memory" in out[0]["error"], out)
+    handler.STARTUP_ERROR = None
+    handler.locate, handler.command, handler.LLAMA_SERVER = saved
+    handler.PROC = None
+
 print(f"\n{sum(results)}/{len(results)} passed")
 sys.exit(0 if all(results) else 1)

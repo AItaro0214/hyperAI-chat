@@ -107,14 +107,23 @@ export function approxTokens(messages) {
   return Math.ceil(chars / CHARS_PER_TOKEN);
 }
 
+/* The reply's own cap (buildRequest's default max_tokens for breakthrough). */
+const REPLY_TOKENS = 16384;
+
 /**
  * The prompt a self-hosted model can take while still leaving the reply room
- * to be written: its window less a quarter (at most 8K) for the answer.
+ * to be written: its window less the reply's cap, or a quarter of a small
+ * window. An unknown window is taken to be the old 32K, the cautious guess.
  */
 export function promptBudgetFor(context) {
   const ctx = Number(context) || 32768;
-  return ctx - Math.min(8192, Math.floor(ctx / 4)) - 512;
+  return ctx - Math.min(REPLY_TOKENS, Math.floor(ctx / 4)) - 512;
 }
+
+/* One tool result, at most: a page read is up to 40,000 characters, and with
+ * a 262K window there is room for it whole. The budget above still applies
+ * across all of them. */
+const TOOL_RESULT_CHARS = 40000;
 
 /**
  * Cuts tool results down until the conversation fits `budget` tokens: the
@@ -291,7 +300,7 @@ export async function resolveTools({
       messages.push({
         role: 'tool',
         tool_call_id: call.id,
-        content: String(text ?? '').slice(0, 20000),
+        content: String(text ?? '').slice(0, TOOL_RESULT_CHARS),
       });
     }
 
