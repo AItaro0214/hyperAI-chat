@@ -132,9 +132,35 @@ export const LLAMACPP_SPEC = {
    * which goes on the endpoint with the cache (cacheEnv). Empty: the
    * original only. */
   ownRepo: '',
-  /* A100 first, H100 when no A100 is free; 48GB cards cannot hold IQ3_S. The
-   * H100 NVL (94GB) is left out to keep the choice to the two 80GB parts. */
-  gpu: ['NVIDIA A100 80GB PCIe', 'NVIDIA A100-SXM4-80GB', 'NVIDIA H100 80GB HBM3', 'NVIDIA H100 PCIe'],
+  /* Cheapest first, in RunPod's Serverless price tiers (Flex, per hour, Oct
+   * 2026): A100 80GB $2.72, RTX PRO 6000 96GB $3.49, H100 80GB $4.79,
+   * H200 141GB $5.93. RunPod takes them in this order, so a stock-out falls
+   * through to the next instead of leaving a request queued — which is what
+   * happened with A100 and H100 alone ("No workers available" for half an
+   * hour while RTX PRO 6000 Server had High stock). Every one holds IQ3_S at
+   * 262K with 15 GiB or more to spare (GPU_MEMORY_GIB, vramEstimate).
+   *
+   * The H100 NVL (94GB) was left out only to keep to the 80GB parts; it fits
+   * and is back. B200 ($8.64) is not here: not worth it for this model. 48GB
+   * cards cannot hold IQ3_S. Blackwell runs the image's own sm_120 kernels
+   * (llama.cpp's CUDA 12.8 build includes 120a-real). */
+  gpu: [
+    'NVIDIA A100 80GB PCIe',
+    'NVIDIA A100-SXM4-80GB',
+    'NVIDIA RTX PRO 6000 Blackwell Server Edition',
+    'NVIDIA RTX PRO 6000 Blackwell Workstation Edition',
+    'NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition',
+    'NVIDIA H100 80GB HBM3',
+    'NVIDIA H100 PCIe',
+    'NVIDIA H100 NVL',
+    'NVIDIA H200',
+    'NVIDIA H200 NVL',
+  ],
+  /* The image is built with CUDA 12.8. A100 and H100 get no native kernels
+   * from it, only PTX compiled at load, and that needs a driver that knows
+   * CUDA 12.8 (570+): an older host would fail to load. RunPod schedules only
+   * on hosts that meet this. */
+  minCudaVersion: '12.8',
   /* RunPod's cached models: the host keeps the repository, so a cold start
    * loads from local disk instead of downloading 78 GiB. The download is not
    * billed. It is the whole repository — 281 GiB, every quant — because
@@ -189,8 +215,23 @@ export const LLAMACPP_SPEC = {
  * scores over ctx/4 pooled keys (0.5 GiB at 262K); 4 GiB covers that and the
  * MoE matmuls with room over.
  * ---------------------------------------------------------------------- */
+/* Usable memory of each candidate card, in GiB, from what the cards report
+ * (nvidia-smi MiB / 1024). */
+export const GPU_MEMORY_GIB = {
+  'NVIDIA A100 80GB PCIe': 81920 / 1024,
+  'NVIDIA A100-SXM4-80GB': 81920 / 1024,
+  'NVIDIA RTX PRO 6000 Blackwell Server Edition': 97887 / 1024,
+  'NVIDIA RTX PRO 6000 Blackwell Workstation Edition': 97887 / 1024,
+  'NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition': 97887 / 1024,
+  'NVIDIA H100 80GB HBM3': 81559 / 1024,
+  'NVIDIA H100 PCIe': 81559 / 1024,
+  'NVIDIA H100 NVL': 95830 / 1024,
+  'NVIDIA H200': 143771 / 1024,
+  'NVIDIA H200 NVL': 143771 / 1024,
+};
+
 export const QWEN38_MEMORY = {
-  // The smaller of the two cards: H100 80GB HBM3 reports 81,559 MiB.
+  // The smallest of the candidates: H100 80GB reports 81,559 MiB.
   cardGiB: 81559 / 1024,
   weightsGiB: 55063448064 / 2 ** 30, // the IQ3_S first shard, all of it resident
   kvBytesPerToken: { f16: 30720, q8_0: 16320 },
@@ -200,11 +241,12 @@ export const QWEN38_MEMORY = {
 };
 
 /** Estimated VRAM, in GiB, for a context and KV type. */
-export function vramEstimate({ ctx, seqs = 2, kv = 'f16' } = {}) {
+export function vramEstimate({ ctx, seqs = 2, kv = 'f16', gpu = null } = {}) {
   const m = QWEN38_MEMORY;
+  const card = gpu ? GPU_MEMORY_GIB[gpu] : m.cardGiB;
   const kvGiB = (ctx * m.kvBytesPerToken[kv]) / 2 ** 30;
   const total = m.weightsGiB + kvGiB + m.recurrentGiBPerSeq * seqs + m.computeGiB + m.cudaGiB;
-  return { kvGiB, total, spare: m.cardGiB - total };
+  return { kvGiB, total, spare: (card ?? 0) - total };
 }
 
 /* What each quant's two shards add up to, in GB as RunPod sizes disks. */
@@ -542,7 +584,42 @@ export function endpointBody(templateId, spec = {}) {
     flashboot: true,
     scalerType: 'QUEUE_DELAY',
     scalerValue: 4,
+    ...(s.minCudaVersion ? { minCudaVersion: s.minCudaVersion } : {}),
   };
+}
+
+/**
+ * Puts a spec's GPU choice on an endpoint that already exists, without
+ * recreating it (which would mean waiting for the model cache again).
+ *
+ * REST's PATCH takes gpuTypeIds and minCudaVersion, in order of preference.
+ * Whether it leaves the cached model and the endpoint's own env (the console's
+ * MODEL_NAME, the HF_TOKEN a private copy needs) alone is not documented, so
+ * both are read before and checked after, and put back through attachModel
+ * (which keeps whatever env is there and adds what is missing) if either was
+ * dropped. Returns what happened, never any value from the env.
+ */
+export async function applyGpuChoice(apiKey, endpointId, spec = {}) {
+  const s = resolveSpec(spec);
+  const before = { refs: await cachedModels(apiKey, endpointId).catch(() => null), env: await endpointEnv(apiKey, endpointId) };
+  if (before.refs === null || before.env === null) {
+    throw new Error('今の事前保存の設定と環境変数が読めないため、変更しません（消えたときに戻せないため）');
+  }
+  await call(apiKey, '/endpoints/' + endpointId, {
+    method: 'PATCH',
+    body: { gpuTypeIds: s.gpu, ...(s.minCudaVersion ? { minCudaVersion: s.minCudaVersion } : {}) },
+  });
+
+  const after = { refs: await cachedModels(apiKey, endpointId).catch(() => null), env: await endpointEnv(apiKey, endpointId) };
+  const lostRefs = before.refs.length > 0 && !(after.refs || []).length;
+  const lostEnv = Object.keys(before.env).filter((k) => after.env === null || !(k in after.env));
+  let restored = false;
+  if (lostRefs || lostEnv.length) {
+    const missing = Object.fromEntries(lostEnv.map((k) => [k, before.env[k]]));
+    await attachModel(apiKey, endpointId, lostRefs ? before.refs : after.refs, { env: missing });
+    restored = true;
+  }
+  return { gpuTypeIds: s.gpu, minCudaVersion: s.minCudaVersion || null, restored, lostEnvKeys: lostEnv, lostRefs };
 }
 
 /* ------------------------------ lifecycle ------------------------------- */

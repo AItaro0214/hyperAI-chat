@@ -26,6 +26,8 @@ import {
   redact,
   maskEnv,
   describeModelCache,
+  GPU_MEMORY_GIB,
+  applyGpuChoice,
   recoverReply,
   failedReason,
   WORKER_META_KEY,
@@ -53,7 +55,16 @@ check('  配布元推奨の IQ3_S', DEFAULT_SPEC.quantization === 'IQ3_S', DEFAU
 check('  1 本目のシャードを指す', /^IQ3_S\/.*-00001-of-00002\.gguf$/.test(DEFAULT_SPEC.modelFile), DEFAULT_SPEC.modelFile);
 check('  A100 80GB を先に、H100 80GB を次に', /^NVIDIA A100/.test(DEFAULT_SPEC.gpu[0]) &&
   DEFAULT_SPEC.gpu.findIndex((g) => /H100/.test(g)) > DEFAULT_SPEC.gpu.findLastIndex((g) => /A100/.test(g)), DEFAULT_SPEC.gpu.join(', '));
-check('  80GB 以外を含めない', DEFAULT_SPEC.gpu.every((g) => /A100.*80GB|H100 (80GB|PCIe)/.test(g)), DEFAULT_SPEC.gpu.join(', '));
+// Cheapest Serverless tier first: A100 $2.72 < RTX PRO 6000 $3.49 < H100 $4.79 < H200 $5.93 (per hour).
+const tierOf = (g) => (/A100/.test(g) ? 1 : /RTX PRO 6000/.test(g) ? 2 : /H100/.test(g) ? 3 : /H200/.test(g) ? 4 : 99);
+check('  安い順（A100 → RTX PRO 6000 → H100 → H200）', DEFAULT_SPEC.gpu.every((g, i, a) => i === 0 || tierOf(a[i - 1]) <= tierOf(g)), DEFAULT_SPEC.gpu.join(', '));
+check('  空きの多い RTX PRO 6000 Server を H100 より前に', DEFAULT_SPEC.gpu.indexOf('NVIDIA RTX PRO 6000 Blackwell Server Edition') < DEFAULT_SPEC.gpu.indexOf('NVIDIA H100 80GB HBM3'));
+check('  高い B200 と、載らない 48GB 以下は入れない', !DEFAULT_SPEC.gpu.some((g) => /B200|A6000|A40|L40|4090/.test(g)) && DEFAULT_SPEC.gpu.every((g) => tierOf(g) < 99));
+check('  どの候補でも 262K で 10 GiB 以上余る',
+  DEFAULT_SPEC.gpu.every((g) => GPU_MEMORY_GIB[g] && vramEstimate({ ctx: 262144, gpu: g }).spare >= 10),
+  DEFAULT_SPEC.gpu.map((g) => g.replace('NVIDIA ', '') + ' ' + vramEstimate({ ctx: 262144, gpu: g }).spare.toFixed(1)).join(', '));
+check('  CUDA 12.8 以上のホストだけ（A100/H100 は PTX を読み込み時に変換する）', DEFAULT_SPEC.minCudaVersion === '12.8' && endpointBody('t').minCudaVersion === '12.8');
+check('  以前の vLLM 構成には付けない', !('minCudaVersion' in endpointBody('t', VLLM_SPEC)));
 check('  RunPod のキャッシュを使う', DEFAULT_SPEC.cacheModel === true);
 check('  Model 欄に入れる値（使っているコミットに固定）',
   modelReference() === 'https://huggingface.co/SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF:eec4e10a2c29b440a2ae85591fa11569ce752963', modelReference());
@@ -597,6 +608,61 @@ check('  RunPod が読めなければ記録を出す', describeModelCache({ live
 check('  別のリポジトリなら、そう分かる', describeModelCache({ liveRefs: [SHA_REF], stored: null, expected: OWN_REF }).otherRepo === true);
 check('  何も無ければ未設定', describeModelCache({ liveRefs: [], stored: null, expected: OWN_REF }).ok === false &&
   describeModelCache({ liveRefs: null, stored: null, expected: OWN_REF }) === null);
+
+/* ------------- GPU choice on an existing endpoint (no recreate) ------------- */
+// A REST fake whose endpoint env and cache can be dropped by the PATCH, as
+// the docs leave possible.
+const gpuFake = ({ dropEnv = false, dropRefs = false, unreadable = false } = {}) => {
+  const state = { env: { MODEL_NAME: 'm', HF_TOKEN: TOKEN }, refs: [OWN_REF] };
+  const log = [];
+  globalThis.fetch = async (url, options = {}) => {
+    const u = String(url);
+    if (u === 'https://api.runpod.io/graphql') {
+      const b = JSON.parse(options.body);
+      const op = b.query.match(/(?:query|mutation) (\w+)/)[1];
+      log.push('GQL ' + op);
+      if (op === 'EndpointModels') return { ok: true, status: 200, json: async () => ({ data: { myself: { endpoint: { modelReferences: state.refs } } } }) };
+      if (op === 'EndpointConfig') return { ok: true, status: 200, json: async () => ({ data: { myself: { endpoint: GQL_ENDPOINT } } }) };
+      if (op === 'SaveEndpoint') {
+        log.saved = b.variables.input;
+        state.refs = b.variables.input.modelReferences;
+        state.env = asMap(b.variables.input.env);
+        return { ok: true, status: 200, json: async () => ({ data: { saveEndpoint: { id: 'ep_9', modelReferences: state.refs } } }) };
+      }
+    }
+    const method = options.method || 'GET';
+    log.push(method + ' ' + u.replace('https://rest.runpod.io/v1', ''));
+    if (method === 'PATCH') {
+      log.patch = JSON.parse(options.body);
+      if (dropEnv) state.env = {};
+      if (dropRefs) state.refs = [];
+      return { ok: true, status: 200, text: async () => '{}' };
+    }
+    if (unreadable) return { ok: false, status: 500, text: async () => 'boom' };
+    return { ok: true, status: 200, text: async () => JSON.stringify({ id: 'ep_9', env: state.env }) };
+  };
+  return { state, log };
+};
+
+let g = gpuFake();
+let applied = await applyGpuChoice('key', 'ep_9', { ownRepo: OWN });
+check('GPU の反映: 候補と CUDA の下限を PATCH する', JSON.stringify(g.log.patch.gpuTypeIds) === JSON.stringify(DEFAULT_SPEC.gpu) && g.log.patch.minCudaVersion === '12.8');
+check('  何も消えなければ、それ以上は触らない', !g.log.includes('GQL SaveEndpoint') && applied.restored === false, g.log.join(' → '));
+
+g = gpuFake({ dropEnv: true, dropRefs: true });
+applied = await applyGpuChoice('key', 'ep_9', { ownRepo: OWN });
+check('  消えた事前保存と env を戻す', g.state.refs[0] === OWN_REF && g.state.env.HF_TOKEN === TOKEN && g.state.env.MODEL_NAME === 'm' && applied.restored === true);
+check('  返す値に env の値を入れない', !JSON.stringify(applied).includes(TOKEN) && applied.lostEnvKeys.includes('HF_TOKEN'));
+
+g = gpuFake({ unreadable: true });
+let gpuErr = '';
+try {
+  await applyGpuChoice('key', 'ep_9', { ownRepo: OWN });
+} catch (e) {
+  gpuErr = e.message;
+}
+check('  今の設定が読めなければ変更しない', /変更しません/.test(gpuErr) && !g.log.some((x) => x.startsWith('PATCH')), g.log.join(' → '));
+globalThis.fetch = realFetch;
 
 const passed = results.filter(([ok]) => ok).length;
 console.log('\n' + passed + '/' + results.length + ' passed');

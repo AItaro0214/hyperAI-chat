@@ -59,6 +59,7 @@ import {
   cacheEnv,
   cachedModels,
   describeModelCache,
+  applyGpuChoice,
   OWN_JOBS_KEY,
   rememberOwnJob,
   DEFAULT_SPEC,
@@ -493,6 +494,21 @@ admin.post('/breakthrough/cache', async (c) => {
     .catch((e) => ({ ok: false, error: e.message, value }));
   await saveSettings(c.env, { runpodModelCache: { ...result, at: Date.now() } });
   return c.json(result, result.ok ? 200 : 502);
+});
+
+/* The spec's GPU candidates and minimum CUDA version, put on the existing
+ * endpoint — no recreating, so the model cache is not waited for again.
+ * Anything the update drops (cached model, endpoint env) is put back. */
+admin.post('/breakthrough/gpus', async (c) => {
+  const settings = await getSettings(c.env);
+  const key = await getApiKey(c.env, 'RUNPOD_API_KEY');
+  if (!key) return c.json({ error: 'RUNPOD_API_KEY が未登録です' }, 400);
+  if (!settings.runpodEndpointId) return c.json({ error: 'エンドポイントがありません' }, 400);
+  try {
+    return c.json({ ok: true, ...(await applyGpuChoice(key, settings.runpodEndpointId, appSpec(settings))) });
+  } catch (e) {
+    return c.json({ error: e.message }, 502);
+  }
 });
 
 admin.post('/breakthrough/diagnose', async (c) => {

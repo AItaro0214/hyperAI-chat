@@ -2347,6 +2347,7 @@ async function renderBreakthroughTab(body) {
           : '<button class="btn primary" id="bt-activate">有効化する</button>') +
         '<button class="btn" id="bt-reset">キューを空にする</button>' +
         '<button class="btn" id="bt-diag">診断</button>' +
+        '<button class="btn" id="bt-gpus" title="作り直さずに、今のエンドポイントへ GPU の候補を反映します">GPU の候補を反映</button>' +
         (bt.modelReference ? '<button class="btn" id="bt-cache">モデルのキャッシュを設定</button>' : '') +
         '<button class="btn danger" id="bt-destroy">破棄</button></div>' +
         modelCacheNote(bt) +
@@ -2434,6 +2435,22 @@ async function renderBreakthroughTab(body) {
       msg(err.message, 'warn');
       e.target.disabled = false;
     }
+  });
+
+  $('#bt-gpus')?.addEventListener('click', async (e) => {
+    e.target.disabled = true;
+    msg('GPU の候補を反映しています…');
+    try {
+      const r = await api('/api/admin/breakthrough/gpus', { method: 'POST', body: '{}' });
+      msg(
+        'GPU の候補を反映しました（' + r.gpuTypeIds.length + ' 種・CUDA ' + (r.minCudaVersion || '指定なし') + ' 以上）' +
+          (r.restored ? '。消えていた事前保存の設定・環境変数を戻しました' : ''),
+        'ok'
+      );
+    } catch (err) {
+      msg(err.message, 'warn');
+    }
+    e.target.disabled = false;
   });
 
   $('#bt-cache')?.addEventListener('click', async (e) => {
