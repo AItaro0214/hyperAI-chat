@@ -802,6 +802,10 @@ function messageNode(msg) {
   if (isRecoverable(msg)) wrap.appendChild(recoverRow(msg));
 
   const foot = el('div', 'foot');
+  // Breakthrough: whether this reply waited on a worker starting, and how.
+  if (msg.meta?.startup?.label) {
+    foot.appendChild(el('span', 'startup' + (msg.meta.startup.cold ? ' cold' : ''), msg.meta.startup.label));
+  }
   if (msg.promptTokens || msg.cost != null) {
     foot.appendChild(
       el(
@@ -1064,6 +1068,10 @@ function createStreamView(model) {
   who.appendChild(el('span', 'dot'));
   const modelName = el('span', null, model ? model.split('/').pop() : '');
   who.appendChild(modelName);
+  // Breakthrough only: filled in once the worker says how it started.
+  const startupTag = el('span', 'startup');
+  startupTag.hidden = true;
+  who.appendChild(startupTag);
   wrap.appendChild(who);
 
   const status = el('div', 'status');
@@ -1106,6 +1114,12 @@ function createStreamView(model) {
   return Object.assign(view, {
     node: wrap,
     setModel: (m) => (modelName.textContent = m ? m.split('/').pop() : ''),
+    setStartup: (s) => {
+      if (!s?.label) return;
+      startupTag.textContent = s.label;
+      startupTag.classList.toggle('cold', !!s.cold);
+      startupTag.hidden = false;
+    },
     setPhase: (p) => {
       if (p === current) return;
       const wait = stickyUntil - Date.now();
@@ -1279,6 +1293,8 @@ async function send({ content = '', attachments = [], regenerate = false }) {
             if (state.room) state.room.title = p.title;
           }
           if (p.notices?.length) toast(p.notices.join(' / '));
+        } else if (event === 'worker') {
+          view.setStartup(p);
         } else if (event === 'status') {
           view.setPhase(p.phase);
         } else if (event === 'delta') {

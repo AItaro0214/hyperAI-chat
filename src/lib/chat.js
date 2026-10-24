@@ -558,6 +558,8 @@ export async function consumeChatStream(response, handlers) {
       continue;
     }
     handlers.onRaw?.(json, payload);
+    // The llama.cpp worker's startup details (WORKER_META_KEY in runpod.js).
+    if (json.hyperai_worker) await handlers.onWorker?.(json.hyperai_worker);
     if (json.error) {
       await handlers.onError?.(json.error.message || JSON.stringify(json.error));
       continue;

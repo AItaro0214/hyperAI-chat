@@ -10,12 +10,16 @@ import {
   modelReference,
   attachModel,
   workerInfo,
+  describeStartup,
+  fmtDuration,
+  extractCompletion,
+  WORKER_META_KEY,
   DEFAULT_SPEC,
   VLLM_SPEC,
   VLLM_IMAGE,
   LLAMACPP_IMAGE,
 } from '../src/lib/runpod.js';
-import { buildRequest } from '../src/lib/chat.js';
+import { buildRequest, consumeChatStream } from '../src/lib/chat.js';
 import { readFileSync } from 'node:fs';
 
 const results = [];
@@ -134,6 +138,55 @@ check('  high はテンプレートの xhigh', req('high').chat_template_kwargs.
 check('ワーカーの起動元を読む', workerInfo({ choices: [], worker: { source: 'cache' } })?.source === 'cache');
 check('  ストリームの出力（配列）からも読む', workerInfo([{ worker: { source: 'download' } }])?.source === 'download');
 check('  vLLM の出力では null', workerInfo([{ choices: [] }]) === null && workerInfo(null) === null);
+
+/* ------------------------ startup, shown with replies --------------------- */
+check('時間の表記: 秒', fmtDuration(42) === '42秒' && fmtDuration(0) === '0秒');
+check('  分と秒', fmtDuration(125) === '2分5秒' && fmtDuration(120) === '2分', fmtDuration(125));
+check('  10分を超えたら分だけ', fmtDuration(1080) === '18分' && fmtDuration(1085) === '18分', fmtDuration(1080));
+
+const TURN = 1760000000;
+const cold = describeStartup({ source: 'cache', startupSeconds: 42, readyAt: TURN + 50 }, TURN);
+check('このターンで起動: 事前保存', cold?.cold === true && cold.label === '事前保存から起動（42秒）', cold?.label);
+const dl = describeStartup({ source: 'download', startupSeconds: 1080, readyAt: TURN + 1100 }, TURN);
+check('このターンで起動: ダウンロード', dl?.cold === true && dl.label === 'ダウンロードして起動（18分）', dl?.label);
+const warm = describeStartup({ source: 'cache', startupSeconds: 42, readyAt: TURN - 600 }, TURN);
+check('前から起きていたワーカー', warm?.cold === false && warm.label === '起動済みのワーカー', warm?.label);
+// Clock skew between RunPod and Cloudflare must not turn a cold start warm.
+check('  時計のずれ数秒は起動扱い', describeStartup({ source: 'cache', startupSeconds: 3, readyAt: TURN - 2 }, TURN)?.cold === true);
+check('  時間が無くても方式は出す', describeStartup({ source: 'download', readyAt: TURN + 1 }, TURN)?.label === 'ダウンロードして起動');
+check('情報が無ければ何も出さない', describeStartup(null, TURN) === null && describeStartup({ source: 'cache' }, TURN) === null);
+
+// The stream frame the worker sends first, read the way the chat route reads it.
+const sseResponse = (frames) =>
+  new Response(frames.map((f) => 'data: ' + (typeof f === 'string' ? f : JSON.stringify(f)) + '\n\n').join(''));
+const seen = { worker: [], text: '' };
+await consumeChatStream(
+  sseResponse([
+    { object: 'chat.completion.chunk', choices: [], [WORKER_META_KEY]: { source: 'cache', startupSeconds: 42, readyAt: TURN + 50 } },
+    { choices: [{ delta: { content: 'こんにちは' } }] },
+    '[DONE]',
+  ]),
+  { onWorker: (w) => seen.worker.push(w), onText: (t) => (seen.text += t) }
+);
+check('ストリームの起動情報を拾う', seen.worker.length === 1 && seen.worker[0].source === 'cache', JSON.stringify(seen.worker));
+check('  本文には混ざらない', seen.text === 'こんにちは', seen.text);
+
+// Recovery reads the same stored stream; the extra frame must not disturb it.
+const recovered = extractCompletion({
+  status: 'COMPLETED',
+  output: [
+    'data: ' + JSON.stringify({ object: 'chat.completion.chunk', choices: [], [WORKER_META_KEY]: { source: 'cache', readyAt: TURN } }) + '\n\n',
+    'data: ' + JSON.stringify({ id: 'c1', created: TURN + 3, choices: [{ delta: { content: '回収' } }] }) + '\n\n',
+  ],
+});
+check('回収: 起動情報のフレームを無視する', recovered.text === '回収' && recovered.created === TURN + 3 && recovered.chatId === 'c1', JSON.stringify(recovered));
+
+// The page: shown while streaming, and kept with the saved reply.
+const appSrc = readFileSync(new URL('../public/app.js', import.meta.url), 'utf8');
+check('画面: ストリーム中に表示する', /event === 'worker'[\s\S]{0,80}setStartup\(p\)/.test(appSrc));
+check('  保存された返答の下にも出す', /msg\.meta\?\.startup\?\.label/.test(appSrc));
+const routeSrc = readFileSync(new URL('../src/routes/chat.js', import.meta.url), 'utf8');
+check('  メッセージの meta に保存する', /base\.startup = startup/.test(routeSrc) && /emit\('worker', startup\)/.test(routeSrc));
 
 /* ------------------------------- lifecycle ------------------------------- */
 // Enough of the REST and GraphQL APIs to see the call sequence without

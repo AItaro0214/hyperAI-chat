@@ -79,5 +79,20 @@ with tempfile.TemporaryDirectory() as root:
         handler.INFO,
     )
 
+import json  # noqa: E402
+
+handler.INFO.update(source="cache", readyAt=1760000000.5, seconds={"startup": 42, "load": 40})
+meta = handler.worker_meta()
+check(
+    "返答に付ける起動情報",
+    meta["source"] == "cache" and meta["startupSeconds"] == 42 and meta["readyAt"] == 1760000000.5,
+    meta,
+)
+frame = handler.meta_chunk()
+check("  SSE の 1 フレームになる", frame.startswith("data: ") and frame.endswith("\n\n"), frame)
+body = json.loads(frame[len("data: "):])
+check("  本文を持たない（choices が空）", body["choices"] == [] and body["object"] == "chat.completion.chunk")
+check("  アプリが読むキーに入れる", body[handler.META_KEY] == meta and handler.META_KEY == "hyperai_worker")
+
 print(f"\n{sum(results)}/{len(results)} passed")
 sys.exit(0 if all(results) else 1)

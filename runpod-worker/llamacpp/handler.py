@@ -16,6 +16,7 @@ Configuration comes from the template's environment (see src/lib/runpod.js):
 
 import collections
 import glob
+import json
 import os
 import re
 import subprocess
@@ -39,6 +40,29 @@ LOG = collections.deque(maxlen=60)
 
 # How this worker started, for the app's 診断 button.
 INFO = {"version": os.environ.get("WORKER_VERSION"), "source": None, "path": None, "seconds": {}}
+# Startup is timed from here: the process starts once RunPod has the
+# container (and any cached model) in place.
+PROCESS_START = time.time()
+# The key the app reads startup details from, on a reply or a stream chunk.
+META_KEY = "hyperai_worker"
+
+
+def worker_meta():
+    """What the app shows under a reply: how this worker got its weights, how
+    long it took to become ready, and when — the app compares readyAt with the
+    turn's own start to tell a cold start from a worker that was already up."""
+    return {
+        "source": INFO["source"],
+        "startupSeconds": INFO["seconds"].get("startup"),
+        "readyAt": INFO.get("readyAt"),
+        "version": INFO["version"],
+    }
+
+
+def meta_chunk():
+    """One SSE frame carrying worker_meta(). It has no choices, which OpenAI
+    clients already expect of the usage frame, so it adds nothing to the text."""
+    return "data: " + json.dumps({"object": "chat.completion.chunk", "choices": [], META_KEY: worker_meta()}) + "\n\n"
 
 
 def env(name, default=""):
@@ -158,7 +182,9 @@ def start():
             raise RuntimeError(f"llama-server exited ({proc.returncode}):\n" + "\n".join(LOG))
         try:
             if httpx.get(BASE + "/health", timeout=5).status_code == 200:
-                INFO["seconds"]["load"] = round(time.time() - started)
+                INFO["readyAt"] = time.time()
+                INFO["seconds"]["load"] = round(INFO["readyAt"] - started)
+                INFO["seconds"]["startup"] = round(INFO["readyAt"] - PROCESS_START)
                 print(f"[worker] ready ({INFO['source']}) in {INFO['seconds']['load']}s", flush=True)
                 return
         except httpx.HTTPError:
@@ -190,12 +216,18 @@ async def handler(job):
                     if res.status_code != 200:
                         yield {"error": (await res.aread()).decode(errors="replace")[:2000], "status": res.status_code}
                         return
+                    # First, so the reader sees how the worker started as soon
+                    # as the reply does.
+                    yield meta_chunk()
                     async for line in res.aiter_lines():
                         if line:
                             yield line + "\n\n"
                 return
             res = await client.post(route, json=body)
-            yield res.json() if res.status_code == 200 else {"error": res.text[:2000], "status": res.status_code}
+            if res.status_code != 200:
+                yield {"error": res.text[:2000], "status": res.status_code}
+                return
+            yield {**res.json(), META_KEY: worker_meta()}
             return
 
         # The native shape, which the app's diagnosis sends:

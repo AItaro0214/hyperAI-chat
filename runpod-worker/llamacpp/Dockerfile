@@ -16,7 +16,7 @@ RUN apt-get update \
 
 # Bumped with every change to handler.py. The image tag is <build>-<this>, so
 # RunPod's hosts cannot keep running an older handler under an unchanged tag.
-ENV WORKER_VERSION=1 \
+ENV WORKER_VERSION=2 \
     LLAMA_SERVER=/app/llama-server \
     PYTHONUNBUFFERED=1
 

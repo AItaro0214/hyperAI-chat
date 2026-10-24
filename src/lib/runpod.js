@@ -27,7 +27,7 @@ export const VLLM_IMAGE = 'runpod/worker-v1-vllm:v2.27.1';
  * .github/workflows/llamacpp-worker.yml. The tag is the llama.cpp build it is
  * based on and the handler's WORKER_VERSION, pinned for the same reason as the
  * vLLM one; the workflow refuses to build if this does not match. */
-export const LLAMACPP_IMAGE = 'ghcr.io/aitaro0214/hyperai-llamacpp-worker:b11804-1';
+export const LLAMACPP_IMAGE = 'ghcr.io/aitaro0214/hyperai-llamacpp-worker:b11804-2';
 
 /* The previous model, on vLLM. Kept whole so going back is passing this as the
  * spec rather than reconstructing it from git. */
@@ -525,6 +525,54 @@ export async function warm(apiKey, endpointId, { onProgress, timeoutMs = DEFAULT
  * the reason. The job API keeps the verdict on the server, so "ran out of GPU
  * memory during startup" is actually readable.
  */
+/* ---------------------------------------------------------------------------
+ * How the worker that answered had started, shown under the reply.
+ *
+ * The llama.cpp worker puts this on every reply under WORKER_META_KEY — as
+ * the first frame of a stream, as a field of a single completion. It cannot
+ * tell for itself whether a reply woke it: the turn may have begun with a
+ * search round, or the admin tab may have warmed it a minute earlier. So it
+ * says when it became ready, and the turn compares that with its own start.
+ * ------------------------------------------------------------------------- */
+
+export const WORKER_META_KEY = 'hyperai_worker';
+
+/* RunPod's clock and Cloudflare's are both NTP-synced; this is slack for the
+ * difference, and for the moment between the turn starting and the request
+ * reaching RunPod. */
+const STARTUP_SKEW_SEC = 5;
+
+/** 42 → "42秒", 125 → "2分5秒", 1080 → "18分". */
+export function fmtDuration(seconds) {
+  const s = Math.max(0, Math.round(Number(seconds) || 0));
+  if (s < 60) return s + '秒';
+  const m = Math.floor(s / 60);
+  // Past ten minutes the seconds are noise.
+  if (m >= 10) return Math.round(s / 60) + '分';
+  return m + '分' + (s % 60 ? (s % 60) + '秒' : '');
+}
+
+/**
+ * The line shown with a breakthrough reply.
+ * @param {object} worker      what the worker reported (WORKER_META_KEY)
+ * @param {number} turnStarted the turn's start, in epoch seconds
+ * @returns {{cold: boolean, source: string|null, seconds: number|null, label: string}|null}
+ */
+export function describeStartup(worker, turnStarted) {
+  if (!worker || typeof worker !== 'object') return null;
+  const readyAt = Number(worker.readyAt);
+  // A worker that never said when it was ready cannot be placed either way.
+  if (!(readyAt > 0) || !(Number(turnStarted) > 0)) return null;
+  const source = worker.source === 'cache' || worker.source === 'download' ? worker.source : null;
+  const seconds = Number.isFinite(Number(worker.startupSeconds)) && worker.startupSeconds !== null ? Number(worker.startupSeconds) : null;
+
+  if (readyAt < Number(turnStarted) - STARTUP_SKEW_SEC) {
+    return { cold: false, source, seconds, label: '起動済みのワーカー' };
+  }
+  const how = source === 'cache' ? '事前保存から起動' : source === 'download' ? 'ダウンロードして起動' : '起動';
+  return { cold: true, source, seconds, label: how + (seconds !== null ? '（' + fmtDuration(seconds) + '）' : '') };
+}
+
 /* Where the llama.cpp worker got its weights — RunPod's cache or its own
  * download — as it reported it. A streamed job's output is a list. */
 export function workerInfo(output) {

@@ -4,7 +4,7 @@ import { now } from '../lib/auth.js';
 import { requireAuth } from '../lib/guard.js';
 import { getSettings, logUsage } from '../lib/store.js';
 import { getCatalog, findModel, estimateChatCost } from '../lib/models.js';
-import { openaiBase as runpodBase } from '../lib/runpod.js';
+import { openaiBase as runpodBase, describeStartup, DEFAULT_SPEC as RUNPOD_SPEC } from '../lib/runpod.js';
 import { webSearch as webSearch2, webFetch as webFetch2, formatResults } from '../lib/search.js';
 import { resolveTools, thinkingFor } from '../lib/chat-tools.js';
 import {
@@ -356,6 +356,8 @@ chat.post('/chat', async (c) => {
     let phase = 'connecting';
     let lastSaved = 0;
     let savedText = '';
+    // Breakthrough only: how the worker that answered had started.
+    let startup = null;
 
     // Once the browser goes away, keep draining the provider so the answer is
     // still saved to the room instead of being lost mid-flight.
@@ -411,6 +413,7 @@ chat.post('/chat', async (c) => {
         partial: !final,
         elapsed: now() - startedAt,
       };
+      if (startup) base.startup = startup;
       let json = JSON.stringify({ ...base, tools });
       if (json.length > MAX_META_BYTES) {
         json = JSON.stringify({ ...base, tools: tools.slice(0, 4), toolsTruncated: tools.length });
@@ -548,7 +551,7 @@ chat.post('/chat', async (c) => {
 
       // Matches the endpoint's own executionTimeoutMs; anything shorter gives
       // up on a cold start that the endpoint was still allowed to finish.
-      const upstreamTimeout = breakthroughOn ? 900000 : undefined;
+      const upstreamTimeout = breakthroughOn ? RUNPOD_SPEC.executionTimeoutMs : undefined;
       let upstream = await postJson(req.url, req.headers, req.body, upstreamTimeout).finally(() =>
         clearInterval(keepalive)
       );
@@ -631,6 +634,13 @@ chat.post('/chat', async (c) => {
           },
           onUsage: (u) => {
             usage = { ...(usage || {}), ...u };
+          },
+          // Its own event rather than 'meta', which the page reads as the
+          // full list of notices.
+          onWorker: async (w) => {
+            if (!breakthroughOn || startup) return;
+            startup = describeStartup(w, startedAt);
+            if (startup) await emit('worker', startup);
           },
           onImages: async (imgs) => {
             await setPhase('drawing');
